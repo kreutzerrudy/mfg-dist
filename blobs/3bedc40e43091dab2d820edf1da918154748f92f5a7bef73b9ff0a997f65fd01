@@ -1,0 +1,170 @@
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local app = require("mfg.hmi.app")
+
+local binding = {}
+
+
+binding.PRINT = {timeout = 30, attempts = 1}
+binding.ACT = {timeout = 10, attempts = 1}
+binding.FAST = 1
+
+local function has(list, value)
+for _, v in ipairs(list or {}) do if v == value then return true end end
+return false
+end
+
+
+
+
+
+function binding.methodRow(view, path, methods, pending, name, keep, many)
+if not methods or #methods == 0 or view.sending then return nil end
+
+
+if pending and many then
+local row = binding.methodRow(view, path, methods, false, name, keep)
+return row, doc.row({
+doc.text("   page out", {colour = "warn", keep = doc.REQUIRED,
+name = name .. "-out"}),
+doc.gap(1),
+doc.button("cancel", {colour = "dim", action = {kind = "bind-cancel",
+path = path}, keep = doc.REQUIRED, name = name .. "-cancel"}),
+}, {keep = keep or 30, name = name .. "-pending"})
+end
+local children = {}
+if pending then
+children[#children + 1] = doc.text("   page out", {colour = "warn",
+keep = doc.REQUIRED, name = name .. "-out"})
+children[#children + 1] = doc.text(": put it in the chest", {colour = "warn",
+truncate = doc.TRUNCATED, keep = 3, name = name .. "-where"})
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = doc.button("cancel", {colour = "dim",
+action = {kind = "bind-cancel", path = path}, keep = doc.REQUIRED,
+name = name .. "-cancel"})
+else
+children[#children + 1] = doc.text("   bind:", {colour = "label",
+keep = doc.REQUIRED, name = name .. "-label"})
+end
+for _, method in ipairs(methods) do
+if not (pending and method == "page") then
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = doc.button(method == "page" and "page" or "show me", {
+colour = method == "page" and "action" or "good",
+action = {kind = method == "page" and "bind-page" or "bind-show", path = path},
+keep = doc.REQUIRED, name = ("%s-%s"):format(name, method)})
+end
+end
+return doc.row(children, {keep = keep or 30, name = name})
+end
+
+
+
+function binding.keepButton(view)
+local keep = view.keepPages ~= false
+return doc.button(keep and "keep page: yes" or "keep page: no", {
+colour = keep and "good" or "dim", action = {kind = "bind-keep"}, keep = 4,
+name = "bind-keep"})
+end
+
+
+
+
+function binding.showRows(view, status, rows, mine)
+local show = status and status.show
+if not show then return end
+if not mine(show.path) then
+rows[#rows + 1] = doc.text((" %s is being shown -- one at a time"):format(
+show.path), {colour = "dim", truncate = doc.TRUNCATED, keep = 50,
+name = "show-other"})
+return
+end
+local text
+if show.state == "watching" then
+text = ("SHOW ME %s (%ds): %s"):format(show.path, show.left or 0,
+tostring(show.instructions))
+else
+text = ("SHOW ME %s: hold on, learning what moves by itself.."):format(show.path)
+end
+rows[#rows + 1] = doc.text(" " .. text, {colour = "warn", wrap = true, keep = 61,
+name = "show"})
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("stop", {colour = "bad",
+action = {kind = "bind-stop"}, keep = doc.REQUIRED, name = "show-stop"})},
+{keep = 60, name = "show-actions"})
+end
+
+
+function binding.noteLast(view, status)
+local last = status and status.last
+if not last or last.id == view.lastShow then return end
+local first = view.lastShow == nil
+view.lastShow = last.id
+
+if first then return end
+view.result = {text = last.ok and last.text or ("not bound: " .. tostring(last.text)),
+colour = last.ok and "good" or "bad"}
+app.sound(view, last.ok and "done" or "refused")
+end
+
+
+function binding.showing(status)
+return status ~= nil and status.show ~= nil
+end
+
+
+function binding.act(view, action)
+local kind = action and action.kind
+if kind == "bind-keep" then
+view.keepPages = view.keepPages == false
+return true
+elseif kind == "bind-page" or kind == "bind-pages" then
+local paths = action.paths or {action.path}
+app.ask(view, {kind = "act", command = "print_bind_pages", opts = binding.PRINT,
+params = {paths = paths, keep = view.keepPages ~= false, count = action.count}})
+return true
+elseif kind == "bind-show" then
+app.ask(view, {kind = "act", command = "show_me", params = {path = action.path}})
+return true
+elseif kind == "bind-stop" then
+app.ask(view, {kind = "act", command = "show_me", params = {cancel = true}})
+return true
+elseif kind == "bind-cancel" then
+app.ask(view, {kind = "act", command = "cancel_bind_page",
+params = {path = action.path}})
+return true
+end
+return false
+end
+
+
+function binding.resultText(job, answer)
+local command = job.command
+if command == "print_bind_pages" then
+local n = answer.count or 0
+local text = ("printed %d page%s -- take %s from the tray"):format(n,
+n == 1 and "" or "s", n == 1 and "it" or "them")
+if answer.failed then text = text .. "; not all: " .. tostring(answer.failed) end
+return text, answer.failed and "warn" or "good"
+elseif command == "show_me" then
+if job.params.cancel then return "stopped showing", "text" end
+return ("watching for %s -- do it now"):format(tostring(answer.path)), "warn"
+elseif command == "cancel_bind_page" then
+return ("cancelled %d page%s"):format(answer.cancelled or 0,
+answer.cancelled == 1 and "" or "s"), "text"
+end
+return nil
+end
+
+
+function binding.takesPage(methods)
+return has(methods, "page")
+end
+
+return binding

@@ -1,0 +1,47 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "print_bind_pages",
+label       = "Print bind pages",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "paths", label = "Paths", type = "table", required = true,
+help = "The ports, doors or pool to print a page for."},
+{name = "keep", label = "Keep as marker", type = "flag", required = false},
+{name = "count", label = "Pages each", type = "number", integer = true,
+min = 1, max = 9, required = false},
+},
+
+returns = {printed = "table"},
+
+run = function(params, ctx)
+local paths = {}
+for _, path in ipairs(params.paths or {}) do
+for _ = 1, params.count or 1 do paths[#paths + 1] = path end
+end
+local results, why = binder.print(paths, {keep = params.keep ~= false,
+by = ctx.by})
+if not results then return rpc.REJECTED, {reason = tostring(why)} end
+local printed, failed = 0, nil
+for _, r in ipairs(results) do
+if r.ok then printed = printed + 1 else failed = failed or r.text end
+end
+if printed == 0 then
+return rpc.REJECTED, {reason = tostring(failed), printed = results}
+end
+return rpc.COMPLETED, {printed = results, count = printed, failed = failed}
+end,
+}

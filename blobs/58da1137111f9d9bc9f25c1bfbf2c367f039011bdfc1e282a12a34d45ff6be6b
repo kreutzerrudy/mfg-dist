@@ -1,0 +1,27 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+
+
+return {
+name        = "bind_pages",
+label       = "Bind pages and show-me",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "prefix", label = "Prefix", type = "text", required = false},
+},
+
+returns = {pages = "table", show = "table", last = "table", now = "number"},
+
+run = function(params)
+local out = binder.status(params.prefix)
+out.printBlocked = binder.printBlocked()
+out.doors = binder.doors()
+return rpc.COMPLETED, out
+end,
+}

@@ -1,0 +1,33 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+
+
+
+
+return {
+name        = "show_me",
+label       = "Bind by showing",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "path", label = "Path", type = "text", required = false},
+{name = "cancel", label = "Cancel", type = "flag", required = false},
+},
+
+returns = {instructions = "text", seconds = "number"},
+
+run = function(params, ctx)
+if params.cancel then
+return rpc.COMPLETED, {cancelled = binder.showCancel()}
+end
+local show, said = binder.showStart(params.path, ctx.by)
+if not show then return rpc.REJECTED, {reason = tostring(said)} end
+return rpc.COMPLETED, {path = show.path, instructions = said,
+seconds = binder.WAIT}
+end,
+}

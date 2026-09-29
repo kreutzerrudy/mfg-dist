@@ -1,0 +1,67 @@
+
+
+
+
+
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+local function call(dev, method, ...)
+if dev == "local" then return redstone[method](...) end
+return peripheral.call(dev, method, ...)
+end
+
+
+
+function backend.isPresent(dev)
+if dev == "local" then return true end
+if not peripheral.isPresent(dev) then return false end
+for _, method in ipairs(peripheral.getMethods(dev) or {}) do
+if method == "getAnalogInput" then return true end
+end
+return false
+end
+
+
+
+function backend.names()
+local out = {}
+for _, name in ipairs(peripheral.getNames()) do
+if backend.isPresent(name) then out[#out + 1] = name end
+end
+table.sort(out)
+table.insert(out, 1, "local")
+return out
+end
+
+function backend.getInput(dev, face)
+return call(dev, "getInput", face) == true
+end
+
+function backend.getAnalogInput(dev, face)
+return call(dev, "getAnalogInput", face) or 0
+end
+
+function backend.getOutput(dev, face)
+return call(dev, "getOutput", face) == true
+end
+
+function backend.getAnalogOutput(dev, face)
+return call(dev, "getAnalogOutput", face) or 0
+end
+
+function backend.setOutput(dev, face, on)
+call(dev, "setOutput", face, on and true or false)
+end
+
+function backend.setAnalogOutput(dev, face, level)
+call(dev, "setAnalogOutput", face, level)
+end
+
+return backend

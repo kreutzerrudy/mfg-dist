@@ -1,0 +1,21 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+return {
+name        = "cancel_bind_page",
+label       = "Cancel bind pages",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "path", label = "Path", type = "text", required = false},
+},
+
+returns = {cancelled = "number"},
+
+run = function(params)
+return rpc.COMPLETED, {cancelled = binder.cancel(params.path)}
+end,
+}
