@@ -1,0 +1,187 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local clauses = {}
+
+
+clauses.OPS = {
+{op = "<", words = "is below"},
+{op = "<=", words = "is at most"},
+{op = ">", words = "is above"},
+{op = ">=", words = "is at least"},
+{op = "=", words = "is"},
+{op = "!=", words = "is not"},
+}
+local WORDS = {}
+for _, o in ipairs(clauses.OPS) do WORDS[o.op] = o.words end
+
+
+local FLAG_OPS = {["="] = true, ["!="] = true}
+
+
+local FLIP = {["<"] = ">", ["<="] = ">=", [">"] = "<", [">="] = "<=", ["="] = "=", ["!="] = "!="}
+
+function clauses.words(op) return WORDS[op] end
+
+
+function clauses.opsFor(t)
+local out = {}
+for _, o in ipairs(clauses.OPS) do
+if t ~= "flag" or FLAG_OPS[o.op] then out[#out + 1] = o end
+end
+return out
+end
+
+
+
+function clauses.typeOf(left, ports)
+if not left then return nil end
+if left.kind == "count" or left.kind == "free" then return "count" end
+for _, port in ipairs(ports or {}) do
+if port.name == left.name then
+if port.type == "level" or port.type == "flag" then return port.type end
+return nil
+end
+end
+return nil
+end
+
+
+
+local function unwrap(e)
+while e and e.kind == "paren" do e = e.expr end
+return e
+end
+
+local function reading(e)
+if not e then return nil end
+if e.kind == "name" then return {kind = "name", name = e.name} end
+if e.kind == "count" then return {kind = "count", port = e.port, item = e.item} end
+if e.kind == "free" then return {kind = "free", item = e.item} end
+return nil
+end
+
+local function literal(e)
+if not e then return nil, true end
+if e.kind == "num" then return e.value, true end
+if e.kind == "onoff" then return e.value, true end
+return nil, false
+end
+
+
+local function clauseOf(e)
+e = unwrap(e)
+local neg = false
+if e and e.kind == "not" then
+neg = true
+e = unwrap(e.expr)
+end
+if not e or e.kind ~= "cmp" then return nil end
+local left, op, rightNode = reading(e.left), e.op, e.right
+if not left and e.left then
+
+left, op, rightNode = reading(e.right), FLIP[e.op], e.left
+if not left then return nil end
+end
+local right, isLiteral = literal(rightNode)
+if not isLiteral then return nil end
+return {neg = neg, left = left, op = op, right = right}
+end
+
+local function flatten(e, join, out)
+e = unwrap(e)
+if e and e.kind == join then
+return flatten(e.left, join, out) and flatten(e.right, join, out)
+end
+local c = clauseOf(e)
+if not c then return false end
+out[#out + 1] = c
+return true
+end
+
+
+
+function clauses.fromTree(e)
+if e == nil then return {join = "and", list = {}} end
+local top = unwrap(e)
+local join = (top and top.kind == "or") and "or" or "and"
+local out = {}
+if not flatten(e, join, out) then return nil end
+return {join = join, list = out}
+end
+
+
+
+
+
+function clauses.toTree(c, nextId)
+local function node(kind, fields)
+fields.kind, fields.id, fields.span = kind, nextId(), {}
+return fields
+end
+local tree = nil
+for _, clause in ipairs(c.list) do
+local left = nil
+local l = clause.left
+if l and l.kind == "name" then left = node("name", {name = l.name})
+elseif l and l.kind == "count" then left = node("count", {port = l.port, item = l.item})
+elseif l and l.kind == "free" then left = node("free", {item = l.item}) end
+local right = nil
+if type(clause.right) == "number" then right = node("num", {value = clause.right})
+elseif type(clause.right) == "boolean" then right = node("onoff", {value = clause.right}) end
+local e = node("cmp", {op = clause.op or "=", left = left, right = right})
+if clause.neg then e = node("not", {expr = e}) end
+tree = tree and node(c.join, {left = tree, right = e}) or e
+end
+return tree
+end
+
+
+
+
+function clauses.readingText(left, itemName)
+if not left then return nil end
+local name = function(item) return item and (itemName and itemName(item) or item) or "an item" end
+if left.kind == "name" then return left.name end
+if left.kind == "count" then return ("%s in %s"):format(name(left.item), left.port or "?") end
+if left.kind == "free" then return ("free %s"):format(name(left.item)) end
+return nil
+end
+
+function clauses.valueText(right)
+if right == nil then return nil end
+if type(right) == "boolean" then return right and "on" or "off" end
+return tostring(right)
+end
+
+
+function clauses.describe(clause, itemName)
+local text = ("%s %s %s"):format(clauses.readingText(clause.left, itemName) or "?",
+WORDS[clause.op] or "?", clauses.valueText(clause.right) or "?")
+if clause.neg then text = "not: " .. text end
+return text
+end
+
+return clauses
