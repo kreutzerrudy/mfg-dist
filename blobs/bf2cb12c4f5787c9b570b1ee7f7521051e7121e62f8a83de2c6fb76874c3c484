@@ -1,0 +1,110 @@
+
+
+
+
+
+
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+function backend.isPresent(name)
+return peripheral.isPresent(name) and peripheral.hasType(name, "inventory") == true
+end
+
+
+local function wrap(name)
+local inv = peripheral.wrap(name)
+if not inv then return nil, "no inventory named " .. tostring(name) end
+return inv
+end
+
+function backend.size(name)
+local inv, why = wrap(name)
+if not inv then return nil, why end
+return inv.size()
+end
+
+
+
+
+
+
+
+
+
+
+function backend.names()
+local found = {}
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.hasType(name, "inventory") == true then
+found[#found + 1] = name
+end
+end
+return found
+end
+
+
+
+
+
+function backend.kind(name)
+if not peripheral.isPresent(name) then return nil end
+return (peripheral.getType(name))
+end
+
+
+
+
+
+
+
+function backend.list(name)
+local inv, why = wrap(name)
+if not inv then return nil, why end
+return inv.list()
+end
+
+
+
+
+
+
+
+
+
+
+
+function backend.detail(name, slot)
+local inv, why = wrap(name)
+if not inv then return nil, why end
+local ok, detail = pcall(inv.getItemDetail, slot)
+if not ok then return nil, tostring(detail) end
+return detail
+end
+
+
+
+
+function backend.push(from, to, fromSlot, limit, toSlot)
+local inv, why = wrap(from)
+if not inv then return nil, why end
+local ok, moved = pcall(inv.pushItems, to, fromSlot, limit, toSlot)
+if not ok then return nil, tostring(moved) end
+return moved
+end
+
+function backend.pull(to, from, fromSlot, limit, toSlot)
+local inv, why = wrap(to)
+if not inv then return nil, why end
+local ok, moved = pcall(inv.pullItems, from, fromSlot, limit, toSlot)
+if not ok then return nil, tostring(moved) end
+return moved
+end
+
+return backend

@@ -1,0 +1,152 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local pattern = require("mfg.common.pattern")
+local recipes = require("mfg.controller.recipes")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function outputOf(produced, named)
+local names = {}
+for item in pairs(produced) do names[#names + 1] = item end
+table.sort(names)
+if #names == 0 then return nil, names end
+
+local best = names[1]
+if #names > 1 then
+if not named or not produced[named] then return nil, names end
+best = named
+end
+
+local byproducts = nil
+for _, item in ipairs(names) do
+if item ~= best then
+byproducts = byproducts or {}
+byproducts[item] = produced[item]
+end
+end
+return best, byproducts
+end
+
+return {
+name        = "register_recipe",
+label       = "Register a recipe",
+role        = "turtle",
+tier        = "orchestrated",
+uses        = {"run_batch"},
+
+manual      = true,
+destructive = true,
+
+parameters = {
+{name = "target", label = "Node", type = "node", required = true,
+choices = {source = "nodes"},
+help = "The turtle that crafts the test set. It needs one set's worth "
+.. "in the pool."},
+
+{name = "pattern", label = "Slots", type = "pattern", required = true,
+help = "Slot to item -- the arrangement to prove. Its output is not "
+.. "stated; it is whatever one craft makes."},
+
+{name = "label", label = "Name", type = "text", required = false,
+maxLength = 24,
+help = "What the recipe is called. Defaults to the output's name."},
+
+{name = "output", label = "Output", type = "item", required = false,
+help = "Only when one craft makes more than one kind of item: which of "
+.. "them the recipe is for. The rest are byproducts."},
+},
+
+returns = {recipe = "table", produced = "items"},
+
+run = function(params, ctx)
+local slots = params.pattern
+
+
+
+local inGrid, outside = pattern.inGrid(slots)
+if not inGrid then return rpc.REJECTED, {reason = outside} end
+
+local id = pattern.id(slots)
+local known = recipes.get(id)
+if known then
+return rpc.REJECTED, {reason = ("that pattern is already registered, "
+.. "as %s"):format(known.label), recipe = known}
+end
+
+
+
+local sent = {}
+for slot, item in pairs(slots) do sent[slot] = item end
+local status, batch = actions.invoke("run_batch", {
+target = params.target, pattern_id = id, pattern = sent, amount = 1,
+}, ctx)
+if status ~= rpc.COMPLETED then
+local reason = tostring(batch.reason)
+if batch.short then
+reason = "put one set in the pool first -- " .. reason
+end
+return status == rpc.TIMED_OUT and rpc.TIMED_OUT or rpc.REJECTED, {
+reason = reason, short = batch.short, step = batch.step,
+}
+end
+
+local produced = batch.produced or {}
+local item, extra = outputOf(produced, params.output)
+if not item and #extra == 0 then
+return rpc.REJECTED, {reason = ("the turtle crafted nothing from that "
+.. "arrangement -- it is not a recipe"), produced = produced}
+end
+if not item then
+
+
+return rpc.REJECTED, {reason = ("one craft made %s -- say which is the "
+.. "output and register again"):format(table.concat(extra, ", ")),
+produced = produced, ambiguous = true}
+end
+
+
+
+
+
+local depth = math.max(tonumber(batch.depth) or 1, 1)
+local perSet = function(count) return math.floor(count / depth) end
+local byproducts = extra
+if byproducts then
+for name, count in pairs(byproducts) do byproducts[name] = perSet(count) end
+end
+
+local recipe, why = recipes.add({
+pattern = slots,
+label = params.label,
+output = {item = item, count = perSet(produced[item])},
+byproducts = byproducts,
+registered = {at = os.epoch("utc"), by = ctx.by, node = params.target},
+})
+if not recipe then return rpc.REJECTED, {reason = why, produced = produced} end
+
+return rpc.COMPLETED, {recipe = recipe, produced = produced}
+end,
+}

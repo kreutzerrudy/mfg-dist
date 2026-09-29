@@ -1,0 +1,48 @@
+
+
+
+
+
+local acknet = require("acknet")
+local ip = require("ip")
+
+local PROTOCOL = "chat"
+local RETRIES = 3
+
+local WATCH = 10
+
+local args = {...}
+
+local peer = ip.parse(args[1] or "")
+local id = tonumber(args[1])
+if not peer and id and id >= 0 and id < 65536 and id == math.floor(id) then
+peer = ip.linkLocal(id)
+end
+if not peer then
+print("usage: acksend <address|computer id> <message...>")
+return
+end
+local body = table.concat(args, " ", 2)
+
+if not acknet.isRunning() then
+printError("acknet daemon is not running -- start 'netstart' in another tab")
+return
+end
+
+
+local sent = acknet.send(peer, body, PROTOCOL, RETRIES)
+print(("sent id %d to %s"):format(sent, ip.format(peer)))
+
+
+
+local timer = os.startTimer(WATCH)
+while true do
+local event, p1 = os.pullEvent()
+if event == "acknet_transport_failed" and p1 == sent then
+printError(("id %d: undeliverable"):format(sent))
+return
+elseif event == "timer" and p1 == timer then
+print(("id %d: no failure reported in %ds"):format(sent, WATCH))
+return
+end
+end

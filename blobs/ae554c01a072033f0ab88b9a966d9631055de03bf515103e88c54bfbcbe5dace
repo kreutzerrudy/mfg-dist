@@ -1,0 +1,73 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local store = require("mfg.storage")
+local machines = require("mfg.controller.machines")
+local supervisor = require("mfg.controller.supervisor")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "supply",
+label       = "Supply a machine",
+tier        = "orchestrated",
+uses        = {"move"},
+policy      = true,
+destructive = false,
+
+parameters = {
+{name = "port", label = "Port", type = "path", required = true,
+choices = {source = "ports"}, help = "A machine's input volume."},
+{name = "item", label = "Item", type = "item", required = true},
+{name = "count", label = "Count", type = "number", integer = true,
+min = 1, max = 3456, required = true},
+{name = "upto", label = "Top up to count", type = "flag", default = false},
+},
+
+returns = {moved = "number", short = "number"},
+
+run = function(params, ctx)
+local _, bad = machines.volume(params.port, "input")
+if bad then return rpc.REJECTED, {reason = bad} end
+
+local want = params.count
+if params.upto then
+local have, why = store.count(params.port, params.item)
+if not have then return rpc.REJECTED, {reason = tostring(why)} end
+want = params.count - have
+if want <= 0 then return rpc.COMPLETED, {moved = 0} end
+end
+
+local pool = require("mfg.common.config").setting("source")
+local available, breakdown = supervisor.available(pool)
+if not available then return rpc.REJECTED, {reason = tostring(breakdown)} end
+local free = available[params.item] or 0
+local take = math.min(want, free)
+if take <= 0 then
+return rpc.COMPLETED, {moved = 0, short = want,
+reason = ("no %s free in %s"):format(params.item, pool)}
+end
+
+local status, fields = actions.invoke("move", {from = pool, to = params.port,
+item = params.item, count = take}, ctx)
+local moved = status == rpc.COMPLETED and (fields.moved or 0) or 0
+local short = want - moved
+return rpc.COMPLETED, {moved = moved, short = short > 0 and short or nil,
+reason = short > 0 and ("%d of %d supplied: %s"):format(moved, want,
+moved < take and tostring(fields.reason or "the port is full")
+or "the rest is not free") or nil}
+end,
+}

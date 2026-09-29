@@ -1,0 +1,80 @@
+
+
+
+
+
+
+
+local ip = require("ip")
+
+local TIMEOUT = 2
+
+os.queueEvent("ipnet_status")
+local timer = os.startTimer(TIMEOUT)
+
+local function show(snapshot)
+print("link-local " .. ip.format(snapshot.linkLocal))
+
+local interfaces = snapshot.interfaces or {}
+if #interfaces == 0 then
+print("no address assigned yet")
+end
+for _, iface in ipairs(interfaces) do
+print(("%-18s %s"):format(
+ip.formatCidr(iface.address, iface.prefix),
+iface.modem or "(all modems)"))
+end
+
+print(("gateway %s   forwarding %s"):format(
+snapshot.gateway and ip.format(snapshot.gateway) or "none",
+snapshot.forwarding and "ON" or "off"))
+
+local routes = snapshot.routes or {}
+if #routes > 0 then
+print()
+print("routes")
+for _, route in ipairs(routes) do
+print(("  %-18s via %s"):format(
+ip.formatCidr(route.network, route.prefix), ip.format(route.via)))
+end
+end
+
+
+
+
+local neighbours = snapshot.neighbours or {}
+print()
+if #neighbours == 0 then
+print("no neighbours resolved")
+else
+print("neighbours")
+table.sort(neighbours, function(a, b) return a.address < b.address end)
+for _, entry in ipairs(neighbours) do
+print(("  %-18s computer %-4d %s"):format(
+ip.format(entry.address), entry.id, entry.modem or ""))
+end
+end
+
+local stats = snapshot.stats or {}
+print()
+
+
+
+print(("delivered %d   forwarded %d   pending %d"):format(
+stats.delivered or 0, stats.forwarded or 0, stats.pending or 0))
+print(("dropped %d   ttl expired %d   arp sent %d"):format(
+stats.dropped or 0, stats.expired or 0, stats.arp or 0))
+end
+
+while true do
+local event, p1 = os.pullEvent()
+
+if event == "ipnet_status_reply" then
+show(p1)
+return
+
+elseif event == "timer" and p1 == timer then
+printError("no reply from the ipnet daemon -- is netstart running?")
+return
+end
+end

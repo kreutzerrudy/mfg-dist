@@ -1,0 +1,308 @@
+
+
+
+
+
+
+
+
+
+
+local hal = require("mfg.common.hal")
+local schematic = require("mfg.turtle.schematic")
+local odometry = require("mfg.turtle.odometry")
+local nav = require("mfg.turtle.nav")
+local rpc = require("mfg.common.rpc")
+
+local builder = {}
+
+local MAP = "/mfg/schematic"
+
+builder.IDLE = "idle"
+builder.TRAVELLING = "travelling"
+builder.WORKING = "working"
+builder.RETURNING = "returning"
+builder.STUCK = "stuck"
+
+local home = nil
+
+function builder.load(opts)
+opts = opts or {}
+local map, err = schematic.load(opts.path or MAP)
+if not map then return nil, err end
+nav.use(map)
+
+
+
+home = opts.home
+if not home then
+for name, entry in pairs(map.places) do
+if entry.builder then home = name end
+end
+end
+if not home then
+return nil, "no bay in the schematic is marked as the builder's"
+end
+return map, home
+end
+
+function builder.home()
+return home
+end
+
+
+
+
+
+
+
+
+function builder.ready(opts)
+if odometry.trusted() then return true end
+
+local fixed, how = nav.relocalise(opts)
+if fixed then return true, how end
+return false, how
+end
+
+
+
+
+
+
+
+
+function builder.confirm(label)
+local peer = hal.turtle().peer("front")
+if not peer then
+return false, "nothing in front to confirm"
+end
+if not peer.label then
+return false, ("the thing in front is unlabelled -- cannot tell whether it "
+.. "is %s"):format(tostring(label))
+end
+if peer.label ~= label then
+return false, ("in front is %s, not %s -- refusing to act on the wrong node")
+:format(peer.label, tostring(label))
+end
+return true, peer
+end
+
+
+
+
+
+function builder.recover(target, opts)
+opts = opts or {}
+local report = {target = target, stages = {}}
+
+local function stage(name, ok, detail)
+report.stages[#report.stages + 1] = {stage = name, ok = ok, detail = detail}
+return ok
+end
+
+if not nav.map() then
+return nil, "no schematic loaded"
+end
+
+local label = opts.label or target
+
+
+local located, how = builder.ready(opts)
+if not stage("locate", located, how) then
+report.state = builder.STUCK
+return report, "could not establish position: " .. tostring(how)
+end
+
+
+report.state = builder.TRAVELLING
+local arrived, travelWhy = nav.approach(target)
+if not stage("travel", arrived, travelWhy) then
+report.state = builder.STUCK
+return report, "could not reach " .. tostring(target) .. ": "
+.. tostring(travelWhy)
+end
+
+
+report.state = builder.WORKING
+local isRight, confirmWhy = builder.confirm(label)
+if not stage("confirm", isRight, confirmWhy) then
+
+
+builder.goHome(report)
+report.state = builder.STUCK
+return report, tostring(confirmWhy)
+end
+
+
+local rebooted, rebootWhy = hal.turtle().rebootPeer("front")
+if not stage("reboot", rebooted, rebootWhy) then
+builder.goHome(report)
+report.state = builder.STUCK
+return report, "could not reboot " .. tostring(label) .. ": "
+.. tostring(rebootWhy)
+end
+
+
+
+builder.goHome(report)
+report.state = (report.state == builder.STUCK) and builder.STUCK or builder.IDLE
+report.fixed = label
+return report
+end
+
+
+
+
+function builder.goHome(report)
+if not home then return false, "no home bay" end
+
+local wasState = report and report.state
+if report then report.state = builder.RETURNING end
+
+local arrived, why = nav.goto(home)
+if report then
+report.stages[#report.stages + 1] = {stage = "return", ok = arrived,
+detail = why}
+if not arrived then
+report.state = builder.STUCK
+report.strandedAt = odometry.position()
+else
+report.state = wasState
+end
+end
+return arrived, why
+end
+
+
+
+
+function builder.explain(report)
+if not report then return "no report" end
+local parts = {}
+for _, stage in ipairs(report.stages or {}) do
+parts[#parts + 1] = ("%s %s"):format(stage.stage, stage.ok and "ok" or "FAILED")
+if not stage.ok and stage.detail then
+parts[#parts] = parts[#parts] .. " (" .. tostring(stage.detail) .. ")"
+end
+end
+return ("%s: %s"):format(tostring(report.target), table.concat(parts, ", "))
+end
+
+
+
+
+
+
+
+
+
+
+
+local pending = nil
+
+local COMMANDS = {}
+
+function COMMANDS.recover(body, packet)
+if pending then
+return rpc.REJECTED, {reason = "already on a job: " .. tostring(pending.target)}
+end
+local target = body.target or body.label
+if not target then return rpc.REJECTED, {reason = "a target is required"} end
+if not nav.map() then
+return rpc.REJECTED, {reason = "no schematic loaded -- this builder has no map"}
+end
+if not schematic.place(nav.map(), target) then
+
+
+
+return rpc.REJECTED, {reason = ("no such place in the schematic: %s")
+:format(tostring(target))}
+end
+
+pending = {kind = "recover", target = target, label = body.label,
+rpc = body.rpc, src = packet and packet.src}
+return rpc.ACCEPTED, {target = target}
+end
+
+function COMMANDS.go_home(body, packet)
+if pending then
+return rpc.REJECTED, {reason = "already on a job: " .. tostring(pending.target)}
+end
+if not home then return rpc.REJECTED, {reason = "no bay in the schematic is mine"} end
+pending = {kind = "home", target = home, rpc = body.rpc,
+src = packet and packet.src}
+return rpc.ACCEPTED, {target = home}
+end
+
+
+
+function COMMANDS.where()
+local at = nav.map() and nav.at() or nil
+return rpc.COMPLETED, {
+position = odometry.position(),
+facing = odometry.facing(),
+trusted = odometry.trusted(),
+pending = odometry.pending(),
+at = at,
+home = home,
+busy = pending ~= nil,
+}
+end
+
+function builder.handle(body, packet)
+local handler = COMMANDS[body.command]
+if not handler then
+
+print(("rejected unknown command '%s' from %s"):format(
+tostring(body.command), tostring(packet and packet.src)))
+return rpc.REJECTED, {reason = "unknown command: " .. tostring(body.command)}
+end
+return handler(body, packet)
+end
+
+
+
+
+
+
+function builder.pump()
+if not pending then return false end
+
+local job = pending
+local report, why, done
+
+if job.kind == "home" then
+report = {target = job.target, stages = {}}
+local arrived, homeWhy = builder.goHome(report)
+report.state = arrived and builder.IDLE or builder.STUCK
+done, why = arrived, homeWhy
+else
+report, why = builder.recover(job.target, {label = job.label})
+
+
+
+done = report ~= nil and report.fixed ~= nil
+end
+
+pending = nil
+
+if job.src then
+require("net").send(job.src, "mfg-report", {
+rpc = job.rpc,
+command = job.kind == "home" and "go_home" or "recover",
+status = done and rpc.COMPLETED or rpc.REJECTED,
+reason = (not done) and tostring(why) or nil,
+stranded = report and report.strandedAt or nil,
+report = report,
+account = builder.explain(report),
+})
+end
+return true
+end
+
+function builder.busy()
+return pending ~= nil
+end
+
+return builder

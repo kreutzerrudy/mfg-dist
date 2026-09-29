@@ -1,0 +1,34 @@
+local rpc = require("mfg.common.rpc")
+local signals = require("mfg.controller.signals")
+
+
+
+
+
+
+return {
+name        = "pulse",
+label       = "Pulse a signal",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "signal", label = "Signal", type = "path", required = true,
+choices = {source = "signals"}},
+{name = "level", label = "Level", type = "number", integer = true,
+min = 1, max = 15, default = 15},
+{name = "length", label = "Ticks", type = "number", integer = true,
+min = 1, max = 200, required = true,
+help = "How long, in game ticks: 20 to a second."},
+},
+
+returns = {was = "number"},
+
+run = function(params, ctx)
+local was, why = signals.pulse(params.signal, params.level, params.length,
+ctx.policy or "operator")
+if not was then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {was = was}
+end,
+}

@@ -1,0 +1,87 @@
+
+
+
+
+
+local ITERATIONS = 5
+
+local YIELD_BUDGET_MS = 7000
+
+local ok, random = pcall(require, "ccryptolib.random")
+if not ok then
+printError("ccryptolib not found")
+print("copy the 'ccryptolib' folder to this computer's root, so that")
+print("/ccryptolib/x25519.lua exists")
+return
+end
+local x25519 = require("ccryptolib.x25519")
+
+local function ms()
+return os.epoch("utc")
+end
+
+local function report(label, elapsed, note)
+local pct = elapsed / YIELD_BUDGET_MS * 100
+print(("%-22s %6dms  %5.1f%%%s"):format(label, elapsed, pct, note or ""))
+end
+
+print("acknet crypto bench")
+print(("yield budget assumed ~%dms"):format(YIELD_BUDGET_MS))
+print()
+
+
+
+if random.isInit() then
+print("generator already initialised this boot")
+else
+local t = ms()
+
+random.initWithTiming()
+report("initWithTiming", ms() - t, "  (collects 512ms by design)")
+end
+
+
+local t = ms()
+local sk = random.random(32)
+report("random(32)", ms() - t)
+
+
+t = ms()
+local pk = x25519.publicKey(sk)
+report("publicKey", ms() - t)
+
+
+local peerSk = random.random(32)
+local peerPk = x25519.publicKey(peerSk)
+
+local total, worst = 0, 0
+for _ = 1, ITERATIONS do
+t = ms()
+x25519.exchange(sk, peerPk)
+local e = ms() - t
+total = total + e
+if e > worst then worst = e end
+end
+report("exchange (avg)", math.floor(total / ITERATIONS))
+report("exchange (worst)", worst)
+
+
+local a = x25519.exchange(sk, peerPk)
+local b = x25519.exchange(peerSk, pk)
+print()
+if a == b then
+print("shared secrets agree -- exchange is correct")
+else
+printError("MISMATCH -- exchange is wrong, timings are meaningless")
+return
+end
+
+print()
+if worst > YIELD_BUDGET_MS * 0.5 then
+printError("too close to the yield limit; a handshake does several of these")
+elseif worst > 500 then
+print("workable, but a multi-exchange handshake will be noticeably slow")
+else
+print("comfortable -- go ahead with M1.1")
+print("(this fast almost certainly means hardware acceleration is active)")
+end

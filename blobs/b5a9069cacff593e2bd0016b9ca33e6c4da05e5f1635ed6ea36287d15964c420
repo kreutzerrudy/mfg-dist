@@ -1,0 +1,28 @@
+local rpc = require("mfg.common.rpc")
+local dispatch = require("mfg.controller.dispatch")
+
+
+
+
+
+
+return {
+name        = "cancel_job",
+label       = "Cancel a job",
+tier        = "node",
+destructive = true,
+
+parameters = {
+{name = "job", label = "Job", type = "number", integer = true, min = 1,
+required = true},
+},
+
+returns = {job = "table"},
+
+run = function(params, ctx)
+local job, why = dispatch.cancel(params.job,
+("cancelled by %s"):format(tostring(ctx.by or "an operator")))
+if not job then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, {job = {id = job.id, state = job.state, label = job.label}}
+end,
+}

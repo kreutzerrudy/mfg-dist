@@ -1,0 +1,155 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local actions = require("mfg.common.actions")
+
+local schedules = {}
+
+local STORE = "schedules"
+local OPTS = {schema = 1}
+
+
+
+schedules.POLL = 5
+
+local function load()
+local data, why = state.read(STORE, {entries = {}}, OPTS)
+if why then error("the schedule store is unreadable: " .. why, 0) end
+if type(data) ~= "table" or type(data.entries) ~= "table" then data = {entries = {}} end
+return data
+end
+
+local function save(data)
+return state.write(STORE, data, OPTS)
+end
+
+function schedules.get(id)
+return load().entries[id]
+end
+
+function schedules.all()
+local out = {}
+for _, entry in pairs(load().entries) do out[#out + 1] = entry end
+table.sort(out, function(a, b) return a.id < b.id end)
+return out
+end
+
+
+
+
+function schedules.put(entry, now)
+now = now or os.epoch("utc")
+local data = load()
+data.entries[entry.id] = {
+id = entry.id,
+action = entry.action,
+params = entry.params or {},
+every = entry.every,
+enabled = entry.enabled ~= false,
+next = now + entry.every * 60000,
+last = data.entries[entry.id] and data.entries[entry.id].last or nil,
+by = entry.by,
+}
+save(data)
+return data.entries[entry.id]
+end
+
+function schedules.remove(id)
+local data = load()
+local entry = data.entries[id]
+if not entry then return nil, "no such schedule: " .. tostring(id) end
+data.entries[id] = nil
+save(data)
+return entry
+end
+
+
+function schedules.nextDue()
+local soonest = nil
+for _, entry in pairs(load().entries) do
+if entry.enabled and (not soonest or entry.next < soonest) then
+soonest = entry.next
+end
+end
+return soonest
+end
+
+local function copy(t)
+local out = {}
+for k, v in pairs(t) do out[k] = v end
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+function schedules.tick(opts)
+opts = opts or {}
+local invoke = opts.invoke or actions.invoke
+local now = opts.now or os.epoch("utc")
+
+local due = {}
+for _, entry in pairs(load().entries) do
+if entry.enabled and entry.next <= now then due[#due + 1] = entry end
+end
+table.sort(due, function(a, b)
+if a.next ~= b.next then return a.next < b.next end
+return a.id < b.id
+end)
+
+local fired = {}
+for _, entry in ipairs(due) do
+
+
+local lived, status, fields = pcall(invoke, entry.action, copy(entry.params),
+{by = "scheduler", policy = "schedule:" .. entry.id})
+if not lived then status, fields = "rejected", {reason = tostring(status)} end
+fields = fields or {}
+
+
+
+local data = load()
+local stored = data.entries[entry.id]
+if stored then
+stored.last = {at = now, status = status, reason = fields.reason,
+job = fields.job}
+stored.next = now + stored.every * 60000
+save(data)
+end
+fired[#fired + 1] = entry.id
+end
+return fired
+end
+
+
+function schedules.run(opts)
+while true do
+local ok, why = pcall(schedules.tick, opts)
+if not ok then print("scheduler: " .. tostring(why)) end
+local wake = schedules.nextDue()
+local wait = schedules.POLL
+if wake then wait = math.min(wait, (wake - os.epoch("utc")) / 1000) end
+sleep(math.max(0.05, wait))
+end
+end
+
+return schedules

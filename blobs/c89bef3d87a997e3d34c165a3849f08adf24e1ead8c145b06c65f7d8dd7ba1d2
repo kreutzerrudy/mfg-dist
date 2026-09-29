@@ -1,0 +1,151 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local args = {...}
+local quick = false
+for _, a in ipairs(args) do
+if a == "--quick" then quick = true end
+end
+
+local OUT = "/moncheck-results.txt"
+local lines = {}
+
+local function say(fmt, ...)
+local line = select("#", ...) > 0 and fmt:format(...) or fmt
+print(line)
+lines[#lines + 1] = line
+end
+
+local function assumed(what, value)
+say("    ASSUMED BY THE CODE: %s = %s", what, tostring(value))
+end
+
+say("moncheck -- %s", os.date and os.date("%Y-%m-%d %H:%M:%S") or "no clock")
+say("computer %d (%s), label %s", os.getComputerID(),
+term.isColour() and "advanced" or "standard",
+tostring(os.getComputerLabel()))
+
+
+
+local monitors = {}
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.getType(name) == "monitor" then
+monitors[#monitors + 1] = name
+end
+end
+
+say("")
+say("monitors attached: %d", #monitors)
+if #monitors == 0 then
+say("  none. The HMI falls back to this terminal (H6.6), which is %d x %d.",
+select(1, term.getSize()), select(2, term.getSize()))
+say("  Attach one and run again -- the terminal's size tells you nothing about")
+say("  a monitor's, and the whole point of this tool is the monitor's numbers.")
+end
+
+
+
+local tw, th = term.getSize()
+say("")
+say("this computer's own terminal: %d x %d cells", tw, th)
+say("  colour: %s", tostring(term.isColour()))
+assumed("HMI compact layout below width", 44)
+if tw < 44 then
+say("    -> this terminal WOULD use the compact layout")
+else
+say("    -> this terminal would use the full layout")
+end
+
+
+
+for _, name in ipairs(monitors) do
+local mon = peripheral.wrap(name)
+say("")
+say("== %s ==", name)
+
+local isColour = mon.isColour and mon.isColour() or false
+say("  colour: %s  (advanced monitors do 16 colours and monitor_touch;", tostring(isColour))
+say("           standard ones are black and white and report no touches)")
+say("  setPaletteColour: %s", tostring(mon.setPaletteColour ~= nil))
+say("  blit: %s", tostring(mon.blit ~= nil))
+
+local original = mon.getTextScale and mon.getTextScale() or nil
+say("  current text scale: %s", tostring(original))
+
+local w, h = mon.getSize()
+say("  current size: %d x %d cells  (= %d x %d sub-cell pixels via the 2x3 glyphs)",
+w, h, w * 2, h * 3)
+
+if quick or not (mon.setTextScale and mon.getTextScale) then
+if not mon.setTextScale then
+say("  no setTextScale on this peripheral -- cannot sweep")
+else
+say("  --quick: not sweeping scales")
+end
+else
+say("")
+say("  scale   cells      sub-cell px   compact?   fits 51x19 terminal doc?")
+for step = 1, 10 do
+local scale = step * 0.5
+local ok = pcall(mon.setTextScale, scale)
+if ok then
+local sw, sh = mon.getSize()
+say("  %4.1f    %3d x %-3d   %3d x %-3d     %-8s   %s",
+scale, sw, sh, sw * 2, sh * 3,
+(sw < 44) and "yes" or "no",
+(sw >= 51 and sh >= 19) and "yes" or "no")
+else
+say("  %4.1f    refused", scale)
+end
+end
+if original then pcall(mon.setTextScale, original) end
+say("  text scale put back to %s", tostring(original))
+end
+
+
+local sw, sh = mon.getSize()
+say("")
+say("  at the current scale the HMI would:")
+say("    layout: %s (H6.5 switches below width 44)",
+(sw < 44) and "COMPACT" or "full")
+say("    colour: %s", isColour and "palette as designed"
+or "MONOCHROME -- state shown with ! * ~ markers instead of colour")
+if sh < 8 then
+say("    WARNING: %d rows is very short -- the tab bar and header alone", sh)
+say("             take 3, leaving %d for content", math.max(0, sh - 3))
+end
+end
+
+
+
+say("")
+say("WHAT THIS IS FOR: a layout engine has to be told the truth about size, and")
+say("getSize() is the only thing that knows it -- it depends on how many blocks were")
+say("placed AND the text scale, neither of which the software chooses. Paste this")
+say("file back so the layout work is sized against a real build rather than a guess.")
+say("")
+say("Written to %s", OUT)
+
+local handle = fs.open(OUT, "w")
+if handle then
+handle.write(table.concat(lines, "\n") .. "\n")
+handle.close()
+end

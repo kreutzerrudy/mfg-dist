@@ -1,0 +1,85 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local blake3 = require("ccryptolib.blake3")
+local ccutil = require("ccryptolib.util")
+
+local enrollment = {}
+
+enrollment.PROTOCOL = "mfg_enroll"
+
+
+
+
+local MAC_CONTEXT = "mfg enrollment v1"
+
+enrollment.SECRET_BYTES = 32
+enrollment.DEFAULT_LEASE_SECONDS = 60 * 60
+
+local toHex = ccutil.toHex
+
+
+
+function enrollment.fromHex(h)
+if type(h) ~= "string" or #h % 2 ~= 0 or h:find("%X") then return nil end
+return ccutil.fromHex(h)
+end
+
+enrollment.toHex = toHex
+
+
+
+
+
+
+
+
+
+function enrollment.mac(secret, instanceId, publicKeyHex)
+if type(secret) ~= "string" or #secret ~= enrollment.SECRET_BYTES then
+return nil, "secret must be 32 bytes"
+end
+local message = ("%s|%s|%s"):format(MAC_CONTEXT, tostring(instanceId),
+tostring(publicKeyHex))
+return toHex(blake3.digestKeyed(secret, message))
+end
+
+
+
+
+
+function enrollment.macEquals(a, b)
+if type(a) ~= "string" or type(b) ~= "string" or #a ~= #b then return false end
+local diff = 0
+for i = 1, #a do
+diff = bit32.bor(diff, bit32.bxor(a:byte(i), b:byte(i)))
+end
+return diff == 0
+end
+
+return enrollment

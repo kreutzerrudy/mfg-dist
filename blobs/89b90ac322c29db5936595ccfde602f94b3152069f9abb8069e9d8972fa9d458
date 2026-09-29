@@ -1,0 +1,413 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local acknet = require("acknet")
+local netkeys = require("netkeys")
+local handshake = require("handshake")
+local routing = require("routing")
+local blake3 = require("ccryptolib.blake3")
+
+local peersession = {}
+
+local PROTOCOL = "acknet_peer"
+local RESEND = 3
+local ATTEMPTS = 4
+local PENDING_TTL = 60
+
+
+
+local pending = {}
+local sessions = {}
+
+local ourVoucher = nil
+local ourChain = nil
+
+function peersession.setVoucher(hex)
+ourVoucher = hex
+end
+
+
+
+
+function peersession.setChain(hexList)
+ourChain = hexList
+end
+
+
+
+
+local function credentials()
+return textutils.serialize({v = ourVoucher, c = ourChain})
+end
+
+local function openCredentials(payload)
+if type(payload) ~= "string" then return nil end
+local ok, parsed = pcall(textutils.unserialize, payload)
+if not ok or type(parsed) ~= "table" then return nil end
+
+local voucher = netkeys.fromHex(type(parsed.v) == "string" and parsed.v or "")
+if not voucher then return nil end
+return voucher, netkeys.decodeChain(parsed.c)
+end
+
+
+
+
+
+local function fingerprint(k1, k2)
+return netkeys.toHex(blake3.digest(k1 .. k2, 8))
+end
+
+
+
+
+
+
+
+
+
+
+
+
+local RACE_WINDOW = 15000
+
+local function install(address, session)
+local existing = sessions[address]
+
+
+
+
+
+if existing
+and (session.at - existing.at) < RACE_WINDOW
+and existing.initiator <= session.initiator then
+return existing
+end
+
+sessions[address] = session
+return session
+end
+
+
+function peersession.forget(address)
+sessions[address] = nil
+end
+
+function peersession.get(address)
+return sessions[address]
+end
+
+
+
+
+
+
+function peersession.linkSecrets()
+local map = {}
+for _, session in pairs(sessions) do
+if session.link then map[session.peerAddress] = session.link end
+end
+return map
+end
+
+
+
+
+
+
+
+
+
+local REPLAY_WINDOW = 64
+
+function peersession.seal(address, plaintext)
+local session = sessions[address]
+if not session then return nil, "no session with that address" end
+
+session.txCounter = (session.txCounter or 0) + 1
+return handshake.seal(session.tx, session.txCounter, plaintext), session.txCounter
+end
+
+function peersession.open(address, counter, ciphertext)
+local session = sessions[address]
+if not session then return nil, "no session with that address" end
+if type(counter) ~= "number" or counter < 1 then return nil, "bad counter" end
+
+session.rxSeen = session.rxSeen or {}
+session.rxHigh = session.rxHigh or 0
+
+if session.rxSeen[counter] then return nil, "replayed counter" end
+if counter <= session.rxHigh - REPLAY_WINDOW then
+return nil, "counter too old"
+end
+
+
+
+local plaintext = handshake.open(session.rx, counter, ciphertext)
+if not plaintext then return nil, "failed authentication" end
+
+session.rxSeen[counter] = true
+if counter > session.rxHigh then
+session.rxHigh = counter
+for seen in pairs(session.rxSeen) do
+if seen <= counter - REPLAY_WINDOW then session.rxSeen[seen] = nil end
+end
+end
+
+return plaintext
+end
+
+
+
+function peersession.nameOf(address)
+local session = sessions[address]
+return session and session.name or nil
+end
+
+function peersession.fingerprintOf(address)
+local s = sessions[address]
+return s and s.fp or nil
+end
+
+local function frame(peer, t, ephHex, data)
+acknet.send(peer, {t = t, e = ephHex, d = netkeys.toHex(data)}, PROTOCOL)
+end
+
+local function sweep()
+local now = os.epoch("utc")
+for k, p in pairs(pending) do
+if now > p.expires then pending[k] = nil end
+end
+end
+
+
+
+local function handleMsg1(sender, ephHex, msg1)
+local p = pending[ephHex]
+if p then
+frame(sender, 2, ephHex, p.msg2)
+return
+end
+
+local st = handshake.startResponder(netkeys.publicKey())
+if not handshake.responderReadMsg1(st, msg1, netkeys.exchange) then
+return "message 1 failed authentication"
+end
+
+local msg2 = handshake.responderWriteMsg2(st, "")
+pending[ephHex] = {
+st = st, msg2 = msg2, sender = sender,
+expires = os.epoch("utc") + PENDING_TTL * 1000,
+}
+frame(sender, 2, ephHex, msg2)
+end
+
+local function handleMsg3(sender, ephHex, msg3)
+local p = pending[ephHex]
+if not p then return "message 3 for an unknown session" end
+if p.reply then
+frame(sender, 4, ephHex, p.reply)
+return
+end
+
+local peerPk, payload, tx, rx = handshake.responderReadMsg3(p.st, msg3)
+if not peerPk then
+pending[ephHex] = nil
+return "message 3 failed authentication"
+end
+
+
+
+
+
+local peerVoucher, peerChain = openCredentials(payload)
+local address, vouchedPk, vouchedName
+if peerVoucher then
+address, vouchedPk, vouchedName = netkeys.verifyVoucher(peerVoucher, peerChain)
+else
+vouchedPk = "malformed credentials"
+end
+
+local reply
+if not address then
+reply = textutils.serialize({ok = false, reason = "no valid voucher"})
+print(("peer %d: rejected, %s"):format(sender, tostring(vouchedPk)))
+elseif vouchedPk ~= peerPk then
+
+
+
+reply = textutils.serialize({ok = false, reason = "voucher does not match key"})
+print(("peer %d: rejected, voucher is for another key"):format(sender))
+else
+
+
+local session = install(address, {
+address = address, tx = tx, rx = rx, peerAddress = sender,
+fp = fingerprint(rx, tx),
+
+link = handshake.linkSecret(rx, tx),
+initiator = address,
+at = os.epoch("utc"),
+
+
+name = vouchedName ~= "" and vouchedName or nil,
+})
+os.queueEvent("net_link_changed")
+reply = textutils.serialize({ok = true, voucher = ourVoucher})
+print(("peer session with address %d  fp %s"):format(address, session.fp))
+end
+
+p.reply = handshake.seal(tx, 0, reply)
+p.expires = os.epoch("utc") + PENDING_TTL * 1000
+frame(sender, 4, ephHex, p.reply)
+end
+
+local function responderLoop()
+while true do
+local packet = acknet.receive(PROTOCOL)
+sweep()
+
+local body = packet.body
+if type(body) == "table" and type(body.d) == "string"
+and type(body.e) == "string" then
+local data = netkeys.fromHex(body.d)
+local err
+if data and body.t == 1 then
+err = handleMsg1(packet.sender_id, body.e, data)
+elseif data and body.t == 3 then
+err = handleMsg3(packet.sender_id, body.e, data)
+end
+if err then print(("peer %d: %s"):format(packet.sender_id, err)) end
+end
+end
+end
+
+
+
+local function request(peer, t, ephHex, data, expect)
+for _ = 1, ATTEMPTS do
+frame(peer, t, ephHex, data)
+
+local deadline = os.epoch("utc") + RESEND * 1000
+while true do
+local remaining = (deadline - os.epoch("utc")) / 1000
+if remaining <= 0 then break end
+
+local packet = acknet.receive(PROTOCOL, remaining)
+if packet and packet.sender_id == peer
+and type(packet.body) == "table"
+and packet.body.t == expect
+and packet.body.e == ephHex then
+return netkeys.fromHex(packet.body.d)
+end
+end
+end
+return nil
+end
+
+
+function peersession.connect(address)
+
+
+
+if sessions[address] then return sessions[address].fp, true end
+if not ourVoucher then return nil, "no voucher -- not admitted yet" end
+
+local record, err = routing.lookup(address)
+if not record then return nil, err end
+if not record.voucher then return nil, "directory gave no voucher" end
+
+
+
+local peerVoucher = netkeys.fromHex(record.voucher)
+if not peerVoucher then return nil, "malformed voucher" end
+
+
+
+
+local vouchedAddress, peerPk, vouchedName = netkeys.verifyVoucher(
+peerVoucher, netkeys.decodeChain(record.chain))
+if not vouchedAddress then
+return nil, "voucher rejected: " .. tostring(peerPk)
+end
+if vouchedAddress ~= address then
+return nil, "voucher is for a different address"
+end
+
+local st, msg1 = handshake.startInitiator(peerPk, "")
+local ephHex = netkeys.toHex(msg1:sub(1, 32))
+
+local msg2 = request(address, 1, ephHex, msg1, 2)
+if not msg2 then return nil, "no reply to message 1" end
+if not handshake.initiatorReadMsg2(st, msg2) then
+return nil, "message 2 failed authentication -- wrong peer key?"
+end
+
+
+local msg3, tx, rx = handshake.initiatorFinish(
+st, netkeys.publicKey(), netkeys.exchange, credentials())
+
+local msg4 = request(address, 3, ephHex, msg3, 4)
+if not msg4 then return nil, "no reply to message 3" end
+
+local plain = handshake.open(rx, 0, msg4)
+if not plain then return nil, "reply failed authentication" end
+
+local ok, result = pcall(textutils.unserialize, plain)
+if not ok or type(result) ~= "table" then return nil, "reply was malformed" end
+if not result.ok then return nil, result.reason or "refused by peer" end
+
+
+
+local session = install(address, {
+address = address, tx = tx, rx = rx, peerAddress = address,
+fp = fingerprint(tx, rx),
+
+link = handshake.linkSecret(tx, rx),
+initiator = routing.address(),
+at = os.epoch("utc"),
+name = vouchedName ~= "" and vouchedName or nil,
+})
+os.queueEvent("net_link_changed")
+return session.fp, false
+end
+
+
+local function initiatorLoop()
+while true do
+local _, address = os.pullEvent("peer_connect")
+if type(address) == "number" then
+local fp, reusedOrErr = peersession.connect(address)
+os.queueEvent("peer_session", address, fp ~= nil,
+fp or tostring(reusedOrErr), fp and reusedOrErr or false)
+end
+end
+end
+
+
+local function forgetLoop()
+while true do
+local _, address = os.pullEvent("peer_forget")
+if type(address) == "number" then
+peersession.forget(address)
+end
+end
+end
+
+function peersession.runtime()
+parallel.waitForAny(responderLoop, initiatorLoop, forgetLoop)
+end
+
+return peersession

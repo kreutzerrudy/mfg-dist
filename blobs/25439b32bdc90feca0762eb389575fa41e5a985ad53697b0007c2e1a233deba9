@@ -1,0 +1,67 @@
+
+
+
+
+
+
+
+local net = require("net")
+local netcrypt = require("netcrypt")
+local routing = require("routing")
+
+local args = {...}
+local target = args[1]
+
+if not target then
+local names = {}
+for name in pairs(net.services()) do names[#names + 1] = name end
+table.sort(names)
+
+print("usage: netrecv <service|port>")
+print("services: " .. (#names > 0 and table.concat(names, " ") or "none"))
+return
+end
+
+if not net.ready() then
+printError("network is not up")
+return
+end
+
+
+
+local service = not tonumber(target) and target or nil
+local port, ok, err
+
+if service then
+ok, err = net.serve(service)
+port = net.port(service)
+else
+port = tonumber(target)
+ok, err = routing.bind(port)
+end
+
+if not ok then
+printError(tostring(err))
+return
+end
+
+local sealed = service and net.isEncrypted(service) or netcrypt.isEncrypted(port)
+print(("%s %s %s"):format(net.whoami(), target, sealed and "sealed" or "plain"))
+
+local function listen()
+while true do
+local packet = service and net.receive(service) or netcrypt.receive(port)
+
+
+local who = packet.from or packet.name
+or (type(packet.src) == "number" and net.formatAddress(packet.src))
+or tostring(packet.src)
+print(("%s%s> %s"):format(
+packet.encrypted and "*" or "", who, tostring(packet.body)))
+end
+end
+
+local held, failure = pcall(listen)
+routing.unbind(port)
+
+if not held then error(failure, 0) end

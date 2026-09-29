@@ -1,0 +1,235 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local random = require("ccryptolib.random")
+local x25519 = require("ccryptolib.x25519")
+local blake3 = require("ccryptolib.blake3")
+local aead = require("ccryptolib.aead")
+
+local handshake = {}
+
+
+
+local PROTOCOL_NAME = "acknet handshake XK 25519 ChaChaPoly BLAKE3 v1"
+
+local TAG = 16
+local KEY = 32
+
+
+
+local function nonce(n)
+local b = {}
+for i = 1, 8 do
+b[i] = string.char(n % 256)
+n = math.floor(n / 256)
+end
+return ("\0"):rep(4) .. table.concat(b)
+end
+
+
+local function kdf2(ck, ikm)
+local temp = blake3.digestKeyed(ck, ikm)
+local o1 = blake3.digestKeyed(temp, "\1")
+local o2 = blake3.digestKeyed(temp, o1 .. "\2")
+return o1, o2
+end
+
+
+
+
+local function mixHash(st, data)
+st.h = blake3.digest(st.h .. data)
+end
+
+local function mixKey(st, ikm)
+st.ck, st.k = kdf2(st.ck, ikm)
+st.n = 0
+end
+
+local function encryptAndHash(st, plaintext)
+local out
+if st.k then
+local ct, tag = aead.encrypt(st.k, nonce(st.n), plaintext, st.h)
+st.n = st.n + 1
+out = ct .. tag
+else
+out = plaintext
+end
+mixHash(st, out)
+return out
+end
+
+local function decryptAndHash(st, data)
+local pt
+if st.k then
+if #data < TAG then return nil end
+local ct = data:sub(1, #data - TAG)
+local tag = data:sub(#data - TAG + 1)
+pt = aead.decrypt(st.k, nonce(st.n), tag, ct, st.h)
+if not pt then return nil end
+st.n = st.n + 1
+else
+pt = data
+end
+mixHash(st, data)
+return pt
+end
+
+local function newEphemeral()
+local sk = random.random(32)
+return {sk = sk, pk = x25519.publicKey(sk)}
+end
+
+local function newState(responderStaticPk)
+local st = {
+h = blake3.digest(PROTOCOL_NAME),
+k = nil,
+n = 0,
+}
+st.ck = st.h
+
+
+mixHash(st, responderStaticPk)
+return st
+end
+
+
+
+local function split(st)
+local k1, k2 = kdf2(st.ck, "")
+return k1, k2
+end
+
+
+
+
+function handshake.startInitiator(serverStaticPk, payload)
+local st = newState(serverStaticPk)
+st.rs = serverStaticPk
+st.e = newEphemeral()
+
+mixHash(st, st.e.pk)
+mixKey(st, x25519.exchange(st.e.sk, serverStaticPk))
+
+local body = encryptAndHash(st, payload or "")
+return st, st.e.pk .. body
+end
+
+
+function handshake.initiatorReadMsg2(st, msg2)
+if #msg2 < KEY then return nil end
+st.re = msg2:sub(1, KEY)
+
+mixHash(st, st.re)
+mixKey(st, x25519.exchange(st.e.sk, st.re))
+
+return decryptAndHash(st, msg2:sub(KEY + 1))
+end
+
+
+function handshake.initiatorFinish(st, ourStaticPk, staticExchange, payload)
+local encStatic = encryptAndHash(st, ourStaticPk)
+mixKey(st, staticExchange(st.re))
+
+local body = encryptAndHash(st, payload or "")
+local k1, k2 = split(st)
+return encStatic .. body, k1, k2
+end
+
+
+
+function handshake.startResponder(ourStaticPk)
+local st = newState(ourStaticPk)
+return st
+end
+
+
+function handshake.responderReadMsg1(st, msg1, staticExchange)
+if #msg1 < KEY then return nil end
+st.re = msg1:sub(1, KEY)
+
+mixHash(st, st.re)
+mixKey(st, staticExchange(st.re))
+
+return decryptAndHash(st, msg1:sub(KEY + 1))
+end
+
+
+function handshake.responderWriteMsg2(st, payload)
+st.e = newEphemeral()
+
+mixHash(st, st.e.pk)
+mixKey(st, x25519.exchange(st.e.sk, st.re))
+
+local body = encryptAndHash(st, payload or "")
+return st.e.pk .. body
+end
+
+
+function handshake.responderReadMsg3(st, msg3)
+local encLen = KEY + TAG
+if #msg3 < encLen then return nil, "message 3 too short" end
+
+local peerStatic = decryptAndHash(st, msg3:sub(1, encLen))
+if not peerStatic or #peerStatic ~= KEY then
+return nil, "static key failed authentication"
+end
+
+mixKey(st, x25519.exchange(st.e.sk, peerStatic))
+
+local payload = decryptAndHash(st, msg3:sub(encLen + 1))
+if not payload then return nil, "payload failed authentication" end
+
+local k1, k2 = split(st)
+
+return peerStatic, payload, k2, k1
+end
+
+
+
+
+
+
+
+
+
+
+
+local LINK_CONTEXT = "acknet hopnet link secret v1"
+
+function handshake.linkSecret(k1, k2)
+return blake3.deriveKey(LINK_CONTEXT)(k1 .. k2, 32)
+end
+
+
+
+
+
+function handshake.seal(key, counter, plaintext)
+local ct, tag = aead.encrypt(key, nonce(counter), plaintext, "")
+return ct .. tag
+end
+
+function handshake.open(key, counter, data)
+if #data < TAG then return nil end
+local ct = data:sub(1, #data - TAG)
+local tag = data:sub(#data - TAG + 1)
+return aead.decrypt(key, nonce(counter), tag, ct, "")
+end
+
+return handshake

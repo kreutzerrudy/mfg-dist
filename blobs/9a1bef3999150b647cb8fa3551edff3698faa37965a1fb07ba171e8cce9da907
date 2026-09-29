@@ -1,0 +1,184 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local sha256 = require("ccryptolib.sha256")
+local ccutil = require("ccryptolib.util")
+local signed = require("mfg.common.signed")
+local state = require("mfg.common.state")
+
+local firmware = {}
+
+firmware.VERSION = 2
+firmware.CONTEXT = "mfg-firmware-v1|"
+
+
+
+
+
+firmware.MAX_FILE = 131072
+
+
+
+
+firmware.PROTECTED = {"net", "mfg/state", "boot", "startup.lua", "mfg/enroll.cfg"}
+
+function firmware.isProtected(path)
+local p = fs.combine(path)
+for _, guard in ipairs(firmware.PROTECTED) do
+if p == guard or p:sub(1, #guard + 1) == guard .. "/" then return true end
+end
+return false
+end
+
+local function fileLine(f)
+return ("file %s %d %s"):format(f.path, f.size, f.sha256)
+end
+
+
+function firmware.idOf(files)
+local lines = {}
+for i, f in ipairs(files) do lines[i] = fileLine(f) .. "\n" end
+return ccutil.toHex(sha256.digest(table.concat(lines)))
+end
+
+
+
+
+function firmware.parse(text)
+if type(text) ~= "string" then return nil, "no manifest" end
+local m = {files = {}}
+local seen = {}
+local n = 0
+for line in text:gmatch("[^\r\n]+") do
+n = n + 1
+local key, rest = line:match("^(%S+)%s*(.*)$")
+if n == 1 then
+if key ~= "manifest" then return nil, "not a manifest" end
+local v = tonumber(rest)
+if v ~= firmware.VERSION then
+return nil, ("manifest version %s; this software understands %d"):format(
+tostring(rest), firmware.VERSION)
+end
+m.version = v
+elseif key == "file" then
+local path, size, sum = rest:match("^(%S+)%s+(%d+)%s+(%x+)$")
+if not path or #sum ~= 64 then return nil, "malformed file line: " .. line end
+if firmware.isProtected(path) then return nil, "manifest names a protected path: " .. path end
+if seen[path] then return nil, "manifest names a file twice: " .. path end
+seen[path] = true
+m.files[#m.files + 1] = {path = path, size = tonumber(size), sha256 = sum:lower()}
+elseif key == "role" or key == "source" or key == "built" or key == "id"
+or key == "signer" or key == "sig" then
+if m[key] then return nil, "manifest repeats `" .. key .. "`" end
+m[key] = rest
+elseif key then
+return nil, "manifest line this software does not understand: " .. line
+end
+end
+if not m.version then return nil, "empty manifest" end
+if not m.role or m.role == "" then return nil, "manifest names no role" end
+if not m.id or #m.id ~= 64 then return nil, "manifest carries no id" end
+local computed = firmware.idOf(m.files)
+if computed ~= m.id:lower() then
+return nil, ("manifest id %s does not match its files (%s)"):format(m.id, computed)
+end
+m.id = computed
+return m
+end
+
+function firmware.render(m)
+local out = {
+"manifest " .. firmware.VERSION,
+"role " .. m.role,
+}
+if m.source then out[#out + 1] = "source " .. m.source end
+if m.built then out[#out + 1] = "built " .. m.built end
+out[#out + 1] = "id " .. m.id
+for _, f in ipairs(m.files) do out[#out + 1] = fileLine(f) end
+if m.signer then out[#out + 1] = "signer " .. m.signer end
+if m.sig then out[#out + 1] = "sig " .. m.sig end
+return table.concat(out, "\n") .. "\n"
+end
+
+function firmware.read(path)
+local text, why = state.readText(path)
+if not text then return nil, why or ("no manifest at " .. path) end
+return firmware.parse(text)
+end
+
+function firmware.write(path, m)
+return state.writeText(path, firmware.render(m))
+end
+
+
+
+
+local function signable(m)
+return m.role .. "|" .. m.id
+end
+
+
+function firmware.sign(m)
+m.signer, m.sig = signed.sign(firmware.CONTEXT, signable(m))
+return m
+end
+
+
+function firmware.verify(m, anchors)
+if not m.sig then return nil, "manifest is not signed -- it has not been published" end
+return signed.verify(firmware.CONTEXT, signable(m), m.signer, m.sig, anchors)
+end
+
+
+
+function firmware.hashFile(path)
+if not fs.exists(path) or fs.isDir(path) then return nil, "missing" end
+local data = state.readText(path, true)
+if not data then return nil, "unreadable" end
+return firmware.hashBytes(data), #data
+end
+
+
+function firmware.hashBytes(data)
+return ccutil.toHex(sha256.digest(data))
+end
+
+
+
+
+
+function firmware.yielder()
+local last = os.epoch("utc")
+return function()
+if os.epoch("utc") - last > 250 then
+sleep(0)
+last = os.epoch("utc")
+end
+end
+end
+
+return firmware

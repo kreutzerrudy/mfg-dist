@@ -1,0 +1,45 @@
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+
+local bootinfo = {}
+
+bootinfo.DIR = "/boot"
+bootinfo.RECORD = "/boot/record"
+
+function bootinfo.record()
+local record = state.readFile(bootinfo.RECORD)
+if type(record) == "table" then return record end
+return nil
+end
+
+
+
+
+function bootinfo.points()
+local record = bootinfo.record()
+if not record then return {boot_state = "unmanaged"} end
+
+
+
+
+
+local missing, bootState = nil, record.state
+if type(record.equipment_missing) == "table" and #record.equipment_missing > 0 then
+missing = table.concat(record.equipment_missing, ",")
+bootState = "unequipped"
+end
+return {
+firmware = record.active,
+config_rev = record.rev,
+boot_state = bootState,
+equipment_missing = missing,
+}
+end
+
+return bootinfo

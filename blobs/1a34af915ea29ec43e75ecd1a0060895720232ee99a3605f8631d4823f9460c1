@@ -1,0 +1,53 @@
+# Service registry: what name maps to which port.
+#
+# Applications name a service and never handle a port number. This file is the
+# translation, and because sync pushes one tree to every computer it is
+# effectively global by construction -- there is nothing to keep in step.
+#
+# Ports below 100 are reserved for OS services and cannot be bound by an
+# application, so user services start at 100.
+#
+#   name        port
+
+chat            100
+echo            101
+
+# Manufacturer node (spec/manufacturer-controller.md, spec/node-software.md).
+# Both are marked encrypted with `netadmin encrypt`.
+mfg-control     110
+mfg-report      111
+
+# 112 and 113 are FREE. They held `mfg-enroll` and `icmp-echo`, and neither was ever
+# resolved by name:
+#
+#   enrollment runs before the turtle has been admitted, so it has no session and no
+#   route -- it rides acknet with its own protocol name and its own MAC
+#   (scada-design.md R9.11a), never a routed service port;
+#   icmp is a layer of its own and dispatches on a message field, not a port.
+#
+# Both were registered on the assumption they would be needed and never were. Left
+# free deliberately rather than backfilled, so the next service takes a number nobody
+# has old policy for -- a stale `/net/ports` entry marking 112 encrypted would refuse
+# plaintext on whatever landed there next.
+
+# Supervisory and contract traffic. TWO services rather than one, deliberately
+# (mfg/controller/orders.lua): they answer to different actors.
+#
+#   mfg-scada   a local OPERATOR at an HMI -- supervisory actions on our own plant
+#   mfg-order   a STATION across the boundary -- the contract between two ledgers
+#
+# Collapsing them would give a station an operator's reach into the queue. Both
+# should be encrypted on BOTH ends (`netadmin encrypt mfg-scada`); a port marked
+# encrypted refuses plaintext, and one end marking it alone is how an HMI ends up
+# showing NO CONTROLLER with nothing obviously wrong.
+mfg-scada       114
+mfg-order       115
+
+# Alarms are PUSHED to an HMI rather than waiting for its poll (H3.1, H3.5), so an
+# HMI binds this and keeps it bound -- a push that finds nobody listening is lost.
+#
+# NOTE: nothing sends to it yet. The controller raises and stores alarms, and an HMI
+# picks them up on its next `mfg-scada` poll, so alarms work with up to one poll
+# interval of latency. Registering the name is what lets the HMI bind it at all; the
+# sender is still to be written.
+mfg-alarm       116

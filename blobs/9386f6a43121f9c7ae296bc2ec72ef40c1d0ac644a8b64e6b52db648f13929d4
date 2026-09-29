@@ -1,0 +1,160 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local config = require("mfg.common.config")
+
+local configs = {}
+
+local STORE = "configs"
+local OPTS = {schema = 1}
+
+local function load()
+local data, why = state.read(STORE, {nodes = {}}, OPTS)
+if why then error("the config store is unreadable: " .. why, 0) end
+if type(data) ~= "table" or type(data.nodes) ~= "table" then data = {nodes = {}} end
+return data
+end
+
+local function save(data)
+return state.write(STORE, data, OPTS)
+end
+
+
+
+
+configs.checkProfile = config.checkProfile
+
+
+function configs.get(node)
+return load().nodes[node]
+end
+
+
+
+
+function configs.assign(node, role, opts)
+opts = opts or {}
+local roles = opts.roles or require("mfg.common.roles")
+if type(node) ~= "string" or node == "" then return nil, "no node named" end
+local ok, why = configs.checkProfile(role, roles[role])
+if not ok then return nil, why end
+
+local data = load()
+local record = data.nodes[node] or {overrides = {}, rev = 0}
+local takes = {}
+for _, name in ipairs(roles[role].settings or {}) do takes[name] = true end
+for name in pairs(record.overrides) do
+if not takes[name] then record.overrides[name] = nil end
+end
+record.role = role
+record.rev = record.rev + 1
+data.nodes[node] = record
+save(data)
+return record
+end
+
+
+
+function configs.set(node, name, value, opts)
+opts = opts or {}
+local roles = opts.roles or require("mfg.common.roles")
+if not config.declared(name) then return nil, ("no setting called %s"):format(tostring(name)) end
+local data = load()
+local record = data.nodes[node]
+if not record then return nil, ("%s has no role yet -- assign one first"):format(tostring(node)) end
+
+local overrides = {}
+for k, v in pairs(record.overrides) do overrides[k] = v end
+overrides[name] = value
+local _, why = config.settingsFor(roles[record.role].settings, overrides)
+if why then return nil, why end
+
+
+if value ~= nil then
+local checked = config.settingsFor({name}, {[name] = value})
+overrides[name] = checked[name]
+end
+record.overrides = overrides
+record.rev = record.rev + 1
+save(data)
+return record
+end
+
+
+
+
+
+
+function configs.resolve(node, opts)
+opts = opts or {}
+local roles = opts.roles or require("mfg.common.roles")
+local record = opts.record or load().nodes[node]
+if not record then return nil, ("no intent recorded for %s"):format(tostring(node)) end
+
+local fw = opts.firmware
+if fw == nil then
+
+
+local ok, published = pcall(require("mfg.controller.repository").published, record.role)
+fw = ok and published and published.id or nil
+end
+
+return config.resolve({roles = roles, node = node, role = record.role,
+rev = record.rev, overrides = record.overrides, firmware = fw})
+end
+
+
+
+function configs.issue(node, opts)
+local doc, why = configs.resolve(node, opts)
+if not doc then return nil, why end
+if not doc.firmware then
+return nil, ("the %s firmware has not been published -- run publish first"):format(doc.role)
+end
+return config.seal(doc), doc
+end
+
+
+
+
+
+
+
+local OBSERVED = {"node", "role", "firmware", "config_rev", "boot_state", "committed",
+"equipment_missing", "degraded", "last_error"}
+
+
+function configs.observe(name, report, opts)
+opts = opts or {}
+if type(name) ~= "string" or name == "" then return nil, "no node named" end
+if type(report) ~= "table" then return nil, "no report" end
+local seen = {}
+for _, field in ipairs(OBSERVED) do seen[field] = report[field] end
+seen.verified = opts.verified and true or false
+seen.at = os.epoch("utc")
+
+local data = load()
+data.observed = data.observed or {}
+data.observed[name] = seen
+save(data)
+return seen
+end
+
+
+function configs.observed(name)
+local observed = load().observed or {}
+if name == nil then return observed end
+return observed[name]
+end
+
+return configs

@@ -1,0 +1,123 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local services = require("mfg.common.services")
+
+local console = {}
+
+local function usage()
+print("svc                 list services")
+print("svc log <name>      recent output from one")
+print("svc stop|start <name>")
+print("anything else runs as a program, e.g. mfgctl stock")
+end
+
+
+local function svc(manager, args)
+local action = args[2]
+
+if not action then
+for _, entry in ipairs(services.status(manager)) do
+local line = ("%-10s %-11s"):format(entry.name, entry.state)
+if entry.restarts > 0 then
+line = line .. ("x%d"):format(entry.restarts)
+end
+if entry.blockedOn then
+line = line .. "  " .. entry.blockedOn
+end
+print(line)
+
+
+
+if entry.lastError then
+printError("           last: " .. entry.lastError)
+end
+end
+local halted = services.halted(manager)
+if halted then printError("NODE HALTED: " .. halted) end
+return
+end
+
+if action == "log" then
+local name = args[3]
+if not name then printError("usage: svc log <name>") return end
+local lines = services.logs(manager, name, 30)
+if #lines == 0 then print("(nothing logged)") return end
+for _, line in ipairs(lines) do
+print(("%s  %s"):format(
+os.date("%H:%M:%S", math.floor(line.at / 1000)), line.text))
+end
+return
+end
+
+if action == "stop" or action == "start" then
+local fn = (action == "stop") and services.stop or services.start
+local ok, err = fn(manager, args[3] or "")
+if not ok then printError(tostring(err)) return end
+print(action .. "ed " .. tostring(args[3]))
+return
+end
+
+printError("unknown: svc " .. tostring(action))
+usage()
+end
+
+
+
+
+function console.run(manager, opts)
+opts = opts or {}
+local prompt = (opts.prompt or manager.name) .. "> "
+
+print("console ready -- 'svc' for services, 'exit' to leave")
+
+while true do
+write(prompt)
+local line = read()
+if line == nil then return end
+
+local args = {}
+for word in tostring(line):gmatch("%S+") do args[#args + 1] = word end
+
+if #args == 0 then
+
+elseif args[1] == "exit" then
+return
+elseif args[1] == "help" then
+usage()
+elseif args[1] == "svc" then
+local ok, err = pcall(svc, manager, args)
+
+
+if not ok then printError(tostring(err)) end
+else
+local ok, err = pcall(shell.run, line)
+if not ok then printError(tostring(err)) end
+end
+end
+end
+
+
+function console.declare(manager, opts)
+return services.declare(manager, {
+name = "console",
+critical = false,
+start = function() console.run(manager, opts) end,
+restart = true,
+})
+end
+
+return console

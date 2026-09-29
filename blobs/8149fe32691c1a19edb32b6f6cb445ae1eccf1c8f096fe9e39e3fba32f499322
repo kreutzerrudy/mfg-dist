@@ -1,0 +1,125 @@
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local args = {...}
+
+local services = require("mfg.common.services")
+local join = require("mfg.common.join")
+local console = require("mfg.common.console")
+local broker = require("mfg.station.broker")
+
+print("station starting")
+
+local manager = services.new({name = "station"})
+
+
+
+
+
+
+
+
+
+
+services.declare(manager, {
+name = "netstack",
+critical = true,
+start = function()
+shell.run("/netstart", args[1] or join.bootstrapPeer())
+end,
+})
+
+
+
+
+
+
+
+
+
+
+
+
+services.declare(manager, {
+name = "enroll",
+requires = {"netstack"},
+restart = false,
+ready = function()
+local acknet = require("acknet")
+if acknet.isRunning() then return true end
+return false, "waiting for acknet, which enrollment rides"
+end,
+start = function()
+local admitted, why = join.bootstrap()
+print(("enrollment: %s"):format(tostring(why)))
+if not admitted then
+printError("not admitted -- no counterparty will be reachable")
+end
+end,
+})
+
+
+
+
+
+
+
+
+
+services.declare(manager, {
+name = "contracts",
+requires = {"netstack"},
+ready = function()
+local net = require("net")
+if net.ready() then return true end
+return false, "the netstack has not come up"
+end,
+start = function()
+local rpc = require("mfg.common.rpc")
+local link = {
+request = function(node, body)
+return rpc.request(node, "mfg-order", body,
+{timeout = 4, attempts = 2})
+end,
+}
+
+print("working contracts")
+while true do
+local acted = broker.step(link)
+for _, entry in ipairs(acted) do
+
+
+
+if entry.did == "DISAGREES" then
+printError(("%s: the ledgers disagree"):format(entry.order))
+for _, finding in ipairs(entry.detail or {}) do
+printError(("  %s %s: we say %d, they say %d"):format(
+finding.what, finding.item, finding.ours,
+finding.theirs))
+end
+elseif entry.did ~= "unreachable" then
+print(("%s %s"):format(entry.order, entry.did))
+end
+end
+sleep(5)
+end
+end,
+})
+
+console.declare(manager, {prompt = "station"})
+
+local halted = services.run(manager)
+if halted then
+printError(halted)
+else
+print("station stopped")
+end

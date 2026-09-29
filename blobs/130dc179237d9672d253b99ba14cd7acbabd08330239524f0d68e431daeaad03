@@ -1,0 +1,103 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local band = {}
+
+
+
+
+
+band.FLOOR = 1024
+
+
+
+
+band.CEILING = 65532
+
+band.ROOT = {base = band.FLOOR, size = band.CEILING - band.FLOOR + 1}
+
+function band.isValid(b)
+return type(b) == "table"
+and type(b.base) == "number" and type(b.size) == "number"
+and b.base == math.floor(b.base) and b.size == math.floor(b.size)
+and b.size >= 1
+and b.base >= band.FLOOR
+and b.base + b.size - 1 <= band.CEILING
+end
+
+function band.parse(base, size)
+base, size = tonumber(base), tonumber(size)
+if not base or not size then return nil, "band needs a base and a size" end
+local b = {base = base, size = size}
+if not band.isValid(b) then
+return nil, ("a band must sit within %d..%d"):format(band.FLOOR, band.CEILING)
+end
+return b
+end
+
+function band.format(b)
+if not b then return "unbounded" end
+return ("%d..%d (%d wide)"):format(b.base, b.base + b.size - 1, b.size)
+end
+
+
+
+
+
+
+
+
+
+
+function band.contains(parent, child)
+if not parent then return true end
+if not band.isValid(child) then return false end
+return child.base >= parent.base
+and child.base + child.size <= parent.base + parent.size
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function band.suggestedSize(links)
+local channels = 3 * math.max(links, 1)
+local wanted = channels * channels * 8
+local size = 1024
+while size < wanted and size < 65536 do size = size * 2 end
+return size
+end
+
+return band

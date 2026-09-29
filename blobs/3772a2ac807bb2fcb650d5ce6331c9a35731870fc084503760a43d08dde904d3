@@ -1,0 +1,116 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+local ports = require("mfg.controller.ports")
+local supervisor = require("mfg.controller.supervisor")
+local holds = require("mfg.controller.holds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local EPOCH = os.epoch("utc")
+local counter = 0
+local sent = {}
+local MAX_HOLDERS = 32
+
+local function same(a, b)
+return a.held == b.held and a.promised == b.promised and a.free == b.free
+and a.holds == b.holds and a.mine == b.mine
+end
+
+local function remember(holder, version, items, names)
+sent[holder] = {version = version, items = items, names = names,
+at = os.epoch("utc")}
+local count, oldest = 0, nil
+for name, entry in pairs(sent) do
+count = count + 1
+if not oldest or entry.at < sent[oldest].at then oldest = name end
+end
+if count > MAX_HOLDERS and oldest then sent[oldest] = nil end
+end
+
+return {
+name        = "available",
+label       = "What is free to take",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "since", label = "Version held", type = "text", required = false,
+help = "The version the caller already holds: the reply is then only "
+.. "what changed since (storage-ui-draft U10)."},
+},
+
+
+
+
+
+returns = {items = "table", pending = "items", waiting = "items", names = "table",
+version = "text", full = "flag", changed = "table", removed = "table",
+holding = "flag"},
+
+run = function(params, ctx)
+local pool = require("mfg.common.config").setting("source")
+local available, breakdown = supervisor.available(pool)
+if not available then return rpc.REJECTED, {reason = tostring(breakdown)} end
+
+local holder = ctx and ctx.by
+holds.touch(holder)
+local mine = (holder and breakdown.byHolder[holder]) or {}
+local items = {}
+for item, held in pairs(breakdown.stock) do
+items[item] = {held = held, free = available[item] or 0,
+promised = math.min(held, math.floor(breakdown.claims[item] or 0)),
+holds = breakdown.held[item] or 0, mine = mine[item] or 0}
+end
+local names = store.describe(pool) or {}
+
+counter = counter + 1
+local version = ("%d:%d"):format(EPOCH, counter)
+local reply = {pool = pool, version = version, holding = true,
+pending = ports.contents(ports.IN), waiting = ports.contents(ports.OUT),
+bound = {input = store.isBound(ports.IN), output = store.isBound(ports.OUT)}}
+
+local last = holder and sent[holder]
+if last and params and params.since and params.since == last.version then
+local changed, removed, learned = {}, {}, {}
+for item, record in pairs(items) do
+local before = last.items[item]
+if not before or not same(before, record) then changed[item] = record end
+end
+for item in pairs(last.items) do
+if not items[item] then removed[#removed + 1] = item end
+end
+for item, known in pairs(names) do
+local before = last.names[item]
+if not before or before.name ~= known.name then learned[item] = known end
+end
+reply.full, reply.changed, reply.removed, reply.names =
+false, changed, removed, learned
+else
+reply.full, reply.items, reply.names = true, items, names
+end
+
+if holder then remember(holder, version, items, names) end
+return rpc.COMPLETED, reply
+end,
+}

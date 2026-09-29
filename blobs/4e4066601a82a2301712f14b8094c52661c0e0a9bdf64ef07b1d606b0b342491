@@ -1,0 +1,241 @@
+
+
+
+
+
+
+
+
+local mount = require("mfg.storage.mount")
+local hal = require("mfg.common.hal")
+
+local machines = {}
+
+
+function machines.ports(machine)
+local out = {}
+for _, path in ipairs(mount.list("/" .. machine)) do
+local record = mount.get(path)
+if record and record.machine == machine then out[#out + 1] = record end
+end
+return out
+end
+
+
+function machines.all()
+local seen, out = {}, {}
+for _, record in pairs(mount.all()) do
+if record.machine and not seen[record.machine] then
+seen[record.machine] = true
+out[#out + 1] = record.machine
+end
+end
+table.sort(out)
+return out
+end
+
+
+
+
+function machines.volume(path, direction)
+local record = mount.get(path)
+if not record or not record.machine then
+return nil, ("%s is not a machine's port"):format(tostring(path))
+end
+if mount.kindOf(record) ~= mount.VOLUME then
+return nil, ("%s is a signal, not a volume"):format(path)
+end
+if direction and record.direction ~= direction then
+return nil, ("%s is an %s, not an %s"):format(path,
+tostring(record.direction), direction)
+end
+if #(record.devices or {}) == 0 then
+return nil, ("%s is declared but UNBOUND -- mfgctl bind %s <device>")
+:format(path, path)
+end
+local present, missing = mount.devices(path)
+if not present or #present == 0 then
+return nil, ("%s: %s is not on the network"):format(path,
+table.concat(missing or {}, ", "))
+end
+return record
+end
+
+
+
+
+
+
+
+
+function machines.declare(machine, ports, script)
+local base = "/" .. machine
+if not mount.valid(base) then
+return nil, ("not a valid machine name: %s"):format(tostring(machine))
+end
+local existing = mount.get(base)
+if existing then
+return nil, ("%s is already a volume, so it cannot be a machine"):format(base)
+end
+for _, path in ipairs(mount.list(base)) do
+local record = mount.get(path)
+if record and record.machine ~= machine then
+return nil, ("%s is already bound, and not as %s's port"):format(path,
+machine)
+end
+end
+
+local wanted = {}
+for _, port in ipairs(ports) do
+local path = base .. "/" .. port.name
+wanted[path] = true
+local ok, why = mount.declare(path, {kind = port.kind,
+direction = port.direction, safe = port.safe, machine = machine,
+script = script})
+if not ok then return nil, why end
+end
+
+
+
+
+for _, record in ipairs(machines.ports(machine)) do
+if not wanted[record.path] and #(record.devices or {}) == 0 then
+mount.forget(record.path)
+end
+end
+return true
+end
+
+
+
+
+
+
+
+
+
+function machines.attach(machine, device, ports, chests)
+local base = "/" .. machine
+local wanted, highest = {}, 0
+for _, port in ipairs(ports) do
+if port.kind == mount.VOLUME and port.slots and not (chests or {})[port.name] then
+wanted[#wanted + 1] = {path = base .. "/" .. port.name, slots = port.slots}
+for _, slot in ipairs(port.slots) do highest = math.max(highest, slot) end
+end
+end
+if #wanted == 0 then return {} end
+
+local inv = hal.inventory()
+if not inv.isPresent(device) then
+return nil, ("%s is not on the network -- is its modem activated?")
+:format(tostring(device))
+end
+local size = inv.size(device) or 0
+if highest > size then
+return nil, ("%s has %d slots, and the script names slot %d"):format(device,
+size, highest)
+end
+for _, holder in ipairs(mount.holders(device)) do
+if holder:sub(1, #base + 1) ~= base .. "/" then
+return nil, ("%s is already bound to %s"):format(device, holder)
+end
+end
+
+
+
+for _, record in ipairs(machines.ports(machine)) do
+for _, held in ipairs(record.devices or {}) do
+if held == device then mount.unbind(record.path) end
+end
+end
+
+local bound = {}
+for _, want in ipairs(wanted) do
+local ok, why = mount.bind(want.path, {device}, {slots = want.slots})
+if not ok then return nil, why end
+bound[#bound + 1] = want.path
+end
+return bound
+end
+
+
+
+
+
+
+
+
+function machines.checkChests(machine, chests, ports, inventory)
+local base = "/" .. machine
+local volumes = {}
+for _, port in ipairs(ports) do
+if port.kind == mount.VOLUME then volumes[port.name] = true end
+end
+local inv = hal.inventory()
+local named = {}
+for name, device in pairs(chests) do
+if not volumes[name] then
+return nil, ("%s is not an item port of this script"):format(tostring(name))
+end
+if type(device) ~= "string" or device == "" then
+return nil, ("%s needs a device"):format(name)
+end
+if device == inventory then
+return nil, ("%s is the machine's own inventory -- give %s slots in the "
+.. "script instead"):format(device, name)
+end
+if named[device] then
+return nil, ("%s is named for both %s and %s"):format(device, named[device], name)
+end
+named[device] = name
+if not inv.isPresent(device) then
+return nil, ("%s is not on the network -- is its modem activated?")
+:format(device)
+end
+for _, holder in ipairs(mount.holders(device)) do
+if holder ~= base .. "/" .. name then
+return nil, ("%s is already bound to %s"):format(device, holder)
+end
+end
+end
+return true
+end
+
+
+
+function machines.bindChests(machine, chests)
+local names = {}
+for name in pairs(chests) do names[#names + 1] = name end
+table.sort(names)
+local bound = {}
+for _, name in ipairs(names) do
+local path = "/" .. machine .. "/" .. name
+local ok, why = mount.bind(path, {chests[name]}, {via = "interface"})
+if not ok then return nil, why end
+bound[#bound + 1] = path
+end
+return bound
+end
+
+
+function machines.unbound(machine)
+local out = {}
+for _, record in ipairs(machines.ports(machine)) do
+if #(record.devices or {}) == 0 then out[#out + 1] = record end
+end
+return out
+end
+
+
+
+
+function machines.forget(machine)
+local unbound = {}
+for _, record in ipairs(machines.ports(machine)) do
+if #(record.devices or {}) > 0 then unbound[#unbound + 1] = record.path end
+mount.forget(record.path)
+end
+return unbound
+end
+
+return machines

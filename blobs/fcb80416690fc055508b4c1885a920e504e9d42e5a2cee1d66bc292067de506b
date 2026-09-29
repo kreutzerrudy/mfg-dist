@@ -1,0 +1,21 @@
+
+
+local acknet = require("acknet")
+local ipnet = require("ipnet")
+local ip = require("ip")
+
+local args = {...}
+local PROTOCOL = args[1] or "chat"
+
+if not acknet.isRunning() then
+printError("acknet daemon is not running -- start 'netstart' in another tab")
+return
+end
+
+print(("listening on '%s' as %s -- ctrl+t to stop"):format(
+PROTOCOL, ip.format(ipnet.localAddress())))
+
+while true do
+local packet = acknet.receive(PROTOCOL)
+print(("<%s> %s"):format(ip.format(packet.sender_id), tostring(packet.body)))
+end

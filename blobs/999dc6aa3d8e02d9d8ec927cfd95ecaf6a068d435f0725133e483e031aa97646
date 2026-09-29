@@ -1,0 +1,25 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+return {
+name        = "forget_machine",
+label       = "Forget a machine",
+tier        = "node",
+manual      = true,
+destructive = true,
+
+parameters = {
+{name = "machine", label = "Machine", type = "text", required = true},
+},
+
+returns = {unbound = "table"},
+
+run = function(params)
+local unbound, why = scripts.forgetMachine(params.machine)
+if not unbound then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {unbound = unbound}
+end,
+}

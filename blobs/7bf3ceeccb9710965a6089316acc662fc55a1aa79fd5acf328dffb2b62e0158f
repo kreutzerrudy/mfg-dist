@@ -1,0 +1,42 @@
+local rpc = require("mfg.common.rpc")
+local roles = require("mfg.common.roles")
+local repository = require("mfg.controller.repository")
+
+
+
+
+
+
+
+
+
+
+
+
+local names = {}
+for name in pairs(roles) do names[#names + 1] = name end
+table.sort(names)
+
+return {
+name        = "publish",
+label       = "Publish a role's firmware",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "role", label = "Role", type = "choice", required = true,
+choices = names,
+help = "Whose firmware. From /mfg/firmware when this controller carries "
+.. "it, else from the dist repo (spec/delivery-draft.md GD3.2)."},
+},
+
+returns = {role = "text", firmware = "text", files = "number", bytes = "number"},
+
+run = function(params)
+local m, why = repository.publish(params.role)
+if not m then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {role = m.role, firmware = m.id, files = #m.files,
+bytes = m.bytes, source = m.source}
+end,
+}

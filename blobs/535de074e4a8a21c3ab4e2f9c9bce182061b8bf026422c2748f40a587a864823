@@ -1,0 +1,202 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+
+local holds = {}
+
+holds.STATE = "holds"
+holds.SCHEMA = 1
+holds.EXPIRES = 15 * 60 * 1000
+holds.MAX_LINES = 16
+holds.TOUCH_EVERY = 60 * 1000
+
+
+function holds.clock() return os.epoch("utc") end
+
+
+
+local function load()
+local saved = state.read(holds.STATE, nil, {schema = holds.SCHEMA})
+if type(saved) ~= "table" or type(saved.holders) ~= "table" then
+saved = {holders = {}}
+end
+local now, lapsed = holds.clock(), false
+for name, holder in pairs(saved.holders) do
+if type(holder) ~= "table" or type(holder.lines) ~= "table"
+or now - (tonumber(holder.touched) or 0) >= holds.EXPIRES then
+saved.holders[name] = nil
+lapsed = true
+end
+end
+if lapsed then state.write(holds.STATE, saved, {schema = holds.SCHEMA}) end
+return saved
+end
+
+local function save(saved)
+state.write(holds.STATE, saved, {schema = holds.SCHEMA})
+end
+
+
+
+local function ordered(saved, except)
+local lines = {}
+for name, holder in pairs(saved.holders) do
+if name ~= except then
+for item, line in pairs(holder.lines) do
+lines[#lines + 1] = {holder = name, item = item,
+count = tonumber(line.count) or 0, at = tonumber(line.at) or 0}
+end
+end
+end
+table.sort(lines, function(a, b)
+if a.at ~= b.at then return a.at < b.at end
+if a.holder ~= b.holder then return a.holder < b.holder end
+return a.item < b.item
+end)
+return lines
+end
+
+
+
+
+local function worth(saved, stock, claims, except)
+local total, byHolder = {}, {}
+for _, line in ipairs(ordered(saved, except)) do
+local room = (stock[line.item] or 0) - math.floor(claims[line.item] or 0)
+- (total[line.item] or 0)
+local held = math.max(0, math.min(line.count, room))
+if held > 0 then
+total[line.item] = (total[line.item] or 0) + held
+byHolder[line.holder] = byHolder[line.holder] or {}
+byHolder[line.holder][line.item] = held
+end
+end
+return total, byHolder
+end
+
+function holds.effective(stock, claims)
+return worth(load(), stock or {}, claims or {})
+end
+
+
+
+
+
+function holds.set(holder, lines, stock, claims)
+stock, claims = stock or {}, claims or {}
+local wanted, n = {}, 0
+for item, count in pairs(lines or {}) do
+count = math.floor(tonumber(count) or 0)
+if count > 0 then
+wanted[item] = count
+n = n + 1
+end
+end
+if n > holds.MAX_LINES then
+return nil, ("a cart may hold %d lines at most, and this one has %d")
+:format(holds.MAX_LINES, n)
+end
+
+local saved = load()
+local before = saved.holders[holder]
+local others = worth(saved, stock, claims, holder)
+local now = holds.clock()
+local kept, held, short = {}, {}, {}
+for item, count in pairs(wanted) do
+local room = math.max(0, (stock[item] or 0) - math.floor(claims[item] or 0)
+- (others[item] or 0))
+local take = math.min(count, room)
+if take > 0 then
+
+local old = before and before.lines[item]
+kept[item] = {count = take, at = (old and old.at) or now}
+held[item] = take
+end
+if take < count then short[item] = count - take end
+end
+
+if next(kept) then
+saved.holders[holder] = {touched = now, lines = kept}
+else
+saved.holders[holder] = nil
+end
+save(saved)
+return held, short
+end
+
+
+
+
+function holds.touch(holder)
+if not holder then return end
+local saved = load()
+local entry = saved.holders[holder]
+if not entry then return end
+local now = holds.clock()
+if now - (tonumber(entry.touched) or 0) < holds.TOUCH_EVERY then return end
+entry.touched = now
+save(saved)
+end
+
+
+
+function holds.take(holder, item, n)
+if not holder or (n or 0) <= 0 then return end
+local saved = load()
+local entry = saved.holders[holder]
+local line = entry and entry.lines[item]
+if not line then return end
+line.count = (tonumber(line.count) or 0) - n
+if line.count <= 0 then entry.lines[item] = nil end
+if not next(entry.lines) then saved.holders[holder] = nil end
+save(saved)
+end
+
+
+function holds.release(holder)
+local saved = load()
+local entry = saved.holders[holder]
+if not entry then return 0 end
+local n = 0
+for _ in pairs(entry.lines) do n = n + 1 end
+saved.holders[holder] = nil
+save(saved)
+return n
+end
+
+
+function holds.list()
+local out = {}
+for name, entry in pairs(load().holders) do
+local lines = {}
+for item, line in pairs(entry.lines) do lines[item] = line.count end
+out[#out + 1] = {holder = name, touched = entry.touched, lines = lines}
+end
+table.sort(out, function(a, b) return a.touched < b.touched end)
+return out
+end
+
+return holds

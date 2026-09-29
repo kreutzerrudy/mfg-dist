@@ -1,0 +1,37 @@
+local rpc = require("mfg.common.rpc")
+local node = require("mfg.turtle.node")
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "fill",
+label       = "Fill from input",
+role        = "turtle",
+tier        = "node",
+
+
+
+
+
+manual      = true,
+destructive = false,
+requires    = {state = "idle"},
+parameters  = {},
+returns     = {held = "items", pulled = "number"},
+
+run = function()
+local ok, result = node.fill()
+if not ok then return rpc.REJECTED, {reason = tostring(result)} end
+return rpc.COMPLETED, result
+end,
+}

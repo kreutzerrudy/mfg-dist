@@ -1,0 +1,301 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local pattern = {}
+
+
+pattern.MAX_DEPTH = 64
+
+
+
+
+
+
+
+
+
+
+
+
+pattern.GRID = {1, 2, 3, 5, 6, 7, 9, 10, 11}
+
+local GRID_SET = {}
+for _, slot in ipairs(pattern.GRID) do GRID_SET[slot] = true end
+
+
+
+function pattern.inGrid(want)
+local outside = nil
+for slot in pairs(want) do
+if not GRID_SET[slot] and (not outside or slot < outside) then outside = slot end
+end
+if outside then
+return false, ("slot %d is outside the 3x3 crafting grid"):format(outside)
+end
+return true
+end
+
+
+
+
+
+function pattern.id(want)
+local slots = {}
+for slot in pairs(want) do slots[#slots + 1] = slot end
+table.sort(slots)
+local parts = {}
+for _, slot in ipairs(slots) do
+parts[#parts + 1] = ("%d=%s"):format(slot, want[slot])
+end
+return table.concat(parts, ",")
+end
+
+
+
+
+
+
+
+
+
+
+
+function pattern.occurrences(want)
+local counts = {}
+for _, item in pairs(want) do
+counts[item] = (counts[item] or 0) + 1
+end
+return counts
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function pattern.depth(held, want, limits)
+limits = limits or {}
+local ceiling = math.min(limits.depth or pattern.MAX_DEPTH,
+limits.stack or pattern.MAX_DEPTH)
+
+local occurrences = pattern.occurrences(want)
+if next(occurrences) == nil then
+return 0, {reason = "the pattern is empty"}
+end
+
+local depth, short = ceiling, nil
+for item, slots in pairs(occurrences) do
+local have = held[item] or 0
+local possible = math.floor(have / slots)
+if possible < depth then
+depth = possible
+short = {item = item, have = have, perSet = slots,
+needed = (possible + 1) * slots}
+end
+end
+
+if depth >= ceiling then return ceiling, nil end
+return depth, short
+end
+
+
+
+
+
+function pattern.target(want, depth)
+local target = {}
+for slot, item in pairs(want) do
+target[slot] = {name = item, count = depth}
+end
+return target
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function pattern.plan(current, target, opts)
+opts = opts or {}
+
+local keeps, spare = {}, {}
+
+for slot, stack in pairs(current) do
+local wanted = target[slot]
+if wanted and wanted.name == stack.name then
+local kept = math.min(stack.count, wanted.count)
+keeps[slot] = kept
+if stack.count > kept then
+spare[#spare + 1] = {slot = slot, name = stack.name,
+count = stack.count - kept}
+end
+else
+
+
+
+
+spare[#spare + 1] = {slot = slot, name = stack.name,
+count = stack.count, wrongSlot = target[slot] ~= nil}
+end
+end
+
+
+local wants = {}
+for slot, wanted in pairs(target) do
+local have = keeps[slot] or 0
+if have < wanted.count then
+wants[#wants + 1] = {slot = slot, name = wanted.name,
+count = wanted.count - have}
+end
+end
+
+
+
+table.sort(wants, function(a, b) return a.slot < b.slot end)
+table.sort(spare, function(a, b) return a.slot < b.slot end)
+
+local moves, evict = {}, {}
+
+
+
+
+
+local staging = {}
+for _, slot in ipairs(opts.staging or {}) do
+if not target[slot] then staging[#staging + 1] = slot end
+end
+
+for _, chunk in ipairs(spare) do
+if chunk.wrongSlot then
+local parked = table.remove(staging, 1)
+if parked then
+moves[#moves + 1] = {from = chunk.slot, to = parked,
+count = chunk.count, name = chunk.name, why = "evict"}
+chunk.slot = parked
+else
+
+
+
+evict[#evict + 1] = {slot = chunk.slot, name = chunk.name,
+count = chunk.count}
+chunk.count = 0
+end
+end
+end
+
+
+local missing = {}
+for _, want in ipairs(wants) do
+local outstanding = want.count
+for _, chunk in ipairs(spare) do
+if outstanding <= 0 then break end
+if chunk.count > 0 and chunk.name == want.name
+and chunk.slot ~= want.slot then
+local moved = math.min(chunk.count, outstanding)
+moves[#moves + 1] = {from = chunk.slot, to = want.slot,
+count = moved, name = want.name, why = "place"}
+chunk.count = chunk.count - moved
+outstanding = outstanding - moved
+end
+end
+if outstanding > 0 then
+missing[want.name] = (missing[want.name] or 0) + outstanding
+end
+end
+
+
+for _, chunk in ipairs(spare) do
+if chunk.count > 0 then
+evict[#evict + 1] = {slot = chunk.slot, name = chunk.name,
+count = chunk.count}
+end
+end
+
+return {moves = moves, evict = evict, missing = missing, keeps = keeps}
+end
+
+
+
+
+
+
+
+function pattern.matches(current, target)
+for slot, wanted in pairs(target) do
+local stack = current[slot]
+if not stack then
+return false, ("slot %d is empty, wants %d %s"):format(
+slot, wanted.count, wanted.name)
+end
+if stack.name ~= wanted.name then
+return false, ("slot %d holds %s, wants %s"):format(
+slot, stack.name, wanted.name)
+end
+if stack.count ~= wanted.count then
+return false, ("slot %d holds %d %s, wants %d"):format(
+slot, stack.count, stack.name, wanted.count)
+end
+end
+for slot, stack in pairs(current) do
+if not target[slot] then
+return false, ("slot %d holds %d %s and nothing wants it"):format(
+slot, stack.count, stack.name)
+end
+end
+return true
+end
+
+
+
+function pattern.totals(current)
+local held = {}
+for _, stack in pairs(current) do
+held[stack.name] = (held[stack.name] or 0) + stack.count
+end
+return held
+end
+
+return pattern

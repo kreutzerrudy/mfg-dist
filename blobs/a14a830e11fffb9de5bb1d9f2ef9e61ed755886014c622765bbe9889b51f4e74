@@ -1,0 +1,316 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local parse = require("mfg.common.script.parse")
+
+local interp = {}
+
+interp.BUDGET = 500
+interp.POLL = 1
+
+local OK = "completed"
+local FAULTED = "faulted"
+local ABORTED = "aborted"
+
+local Run = {}
+Run.__index = Run
+
+
+
+function interp.new(tree, host, name)
+local self = setmetatable({tree = tree, host = host, ports = {}, handlers = {},
+budget = 0}, Run)
+local base = "/" .. (name or tree.machine)
+for _, port in ipairs(tree.ports or {}) do
+self.ports[port.name] = {path = base .. "/" .. port.name,
+type = port.type, direction = port.direction}
+end
+for index, node in ipairs(tree.handlers or {}) do
+self.handlers[index] = {index = index, node = node, pending = false,
+prev = false, nextAt = nil}
+end
+return self
+end
+
+
+
+local function fault(node, reason)
+error({script = FAULTED, reason = reason, line = node and node.span and node.span.line},
+0)
+end
+
+local function stepOn(self, node)
+self.budget = self.budget + 1
+if self.budget > interp.BUDGET then
+fault(node, ("ran %d steps without waiting -- the step budget (X6.2)")
+:format(interp.BUDGET))
+end
+end
+
+local function yielded(self)
+self.budget = 0
+if self.host.stopping() then error({script = ABORTED}, 0) end
+end
+
+
+
+local eval
+
+local function compare(op, a, b)
+if op == "=" then return a == b
+elseif op == "!=" then return a ~= b
+elseif op == "<" then return a < b
+elseif op == "<=" then return a <= b
+elseif op == ">" then return a > b
+elseif op == ">=" then return a >= b end
+end
+
+eval = function(self, e, scope)
+stepOn(self, e)
+local k = e.kind
+if k == "num" then return e.value
+elseif k == "onoff" then return e.value
+elseif k == "paren" then return eval(self, e.expr, scope)
+elseif k == "name" then
+local s = scope
+while s do
+if s.values[e.name] ~= nil then return s.values[e.name] end
+s = s.parent
+end
+local port = self.ports[e.name]
+local value, why = self.host.read(port.path, port.type)
+if value == nil then fault(e, why or ("could not read " .. port.path)) end
+return value
+elseif k == "count" then
+local port = self.ports[e.port]
+local n, why = self.host.count(port.path, e.item)
+if n == nil then fault(e, why or ("could not read " .. port.path)) end
+return n
+elseif k == "free" then
+local n, why = self.host.free(e.item)
+if n == nil then fault(e, why or "could not read the pool") end
+return n
+elseif k == "cmp" then
+return compare(e.op, eval(self, e.left, scope), eval(self, e.right, scope))
+elseif k == "and" then
+return eval(self, e.left, scope) and eval(self, e.right, scope)
+elseif k == "or" then
+return eval(self, e.left, scope) or eval(self, e.right, scope)
+elseif k == "not" then
+return not eval(self, e.expr, scope)
+end
+fault(e, "cannot evaluate " .. tostring(k))
+end
+
+
+
+
+
+local function waitUntil(self, deadline, until_)
+while true do
+if until_ and until_() then return true end
+local now = self.host.now()
+if now >= deadline then return false end
+self.host.sleep(math.min(interp.POLL, (deadline - now) / 1000))
+yielded(self)
+self:watch()
+end
+end
+
+
+
+local exec
+
+local function invoke(self, s, action, params)
+local status, fields = self.host.invoke(action, params)
+yielded(self)
+if status ~= OK then
+fault(s, ("%s: %s"):format(s.kind, tostring(fields and fields.reason or status)))
+end
+return fields
+end
+
+local function statement(self, s, scope)
+stepOn(self, s)
+local k = s.kind
+local port = s.port and self.ports[s.port]
+if k == "if" then
+if eval(self, s.cond, scope) then
+exec(self, s.body, scope)
+elseif s.orelse then
+exec(self, s.orelse, scope)
+end
+elseif k == "repeat" then
+for _ = 1, s.n do exec(self, s.body, scope) end
+elseif k == "supply" or k == "stock" then
+invoke(self, s, "supply", {port = port.path, item = s.item, count = s.n,
+upto = k == "stock"})
+elseif k == "collect" then
+invoke(self, s, "collect", {port = port.path})
+elseif k == "move" then
+invoke(self, s, "move", {from = self.ports[s.from].path,
+to = self.ports[s.to].path, item = s.item, count = s.n})
+elseif k == "set" then
+local level = s.value.kind == "onoff" and (s.value.value and 15 or 0)
+or s.value.value
+invoke(self, s, "set_signal", {signal = port.path, level = level})
+elseif k == "pulse" then
+invoke(self, s, "pulse", {signal = port.path, length = parse.ticks(s.length)})
+elseif k == "wait" then
+waitUntil(self, self.host.now() + parse.ticks(s.length) * 50)
+elseif k == "waituntil" then
+local within = parse.ticks(s.within) * 50
+local met = waitUntil(self, self.host.now() + within,
+function() return eval(self, s.cond, scope) end)
+if not met then
+fault(s, ("waited %s and it did not happen"):format(
+tostring(s.within.n) .. s.within.unit))
+end
+elseif k == "let" then
+scope.values[s.name] = eval(self, s.value, scope)
+elseif k == "alarm" then
+self.host.alarm(s.text)
+elseif k == "clearalarm" then
+self.host.clearAlarm()
+elseif k == "stop" then
+error({script = OK, stopped = true}, 0)
+else
+fault(s, "cannot run " .. tostring(k))
+end
+end
+
+exec = function(self, list, parent)
+local scope = {values = {}, parent = parent}
+for _, s in ipairs(list or {}) do statement(self, s, scope) end
+end
+
+
+
+
+
+
+function interp.beat(now, period)
+return (math.floor(now / period) + 1) * period
+end
+
+
+function Run:start(now)
+for _, h in ipairs(self.handlers) do
+if h.node.kind == "every" then
+h.nextAt = interp.beat(now, parse.ticks(h.node.every) * 50)
+end
+end
+end
+
+
+
+
+function Run:skip(now)
+for _, h in ipairs(self.handlers) do
+h.pending = false
+if h.node.kind == "every" and h.nextAt and h.nextAt <= now then
+h.nextAt = interp.beat(now, parse.ticks(h.node.every) * 50)
+end
+end
+end
+
+
+function Run:on(event)
+for _, h in ipairs(self.handlers) do
+if h.node.kind == "on" and h.node.event == event then return h end
+end
+end
+
+
+
+
+function Run:watch()
+local faults = {}
+for _, h in ipairs(self.handlers) do
+if h.node.kind == "when" and not self.watching then
+self.watching = true
+local saved = self.budget
+self.budget = 0
+local ok, result = pcall(eval, self, h.node.cond, nil)
+self.budget = saved
+self.watching = false
+if ok then
+local now = result and true or false
+if now and not h.prev then h.pending = true end
+h.prev = now
+elseif type(result) == "table" and result.script == ABORTED then
+error(result, 0)
+else
+faults[#faults + 1] = {handler = h,
+reason = type(result) == "table" and result.reason or tostring(result)}
+end
+end
+end
+return faults
+end
+
+
+
+function Run:due(now)
+for _, h in ipairs(self.handlers) do
+if h.pending then return h end
+if h.node.kind == "every" and h.nextAt and h.nextAt <= now then return h end
+end
+end
+
+
+function Run:nextAt()
+local soonest = nil
+for _, h in ipairs(self.handlers) do
+if h.nextAt and (not soonest or h.nextAt < soonest) then soonest = h.nextAt end
+end
+return soonest
+end
+
+
+
+
+
+function Run:runHandler(h)
+local began = self.host.now()
+h.pending = false
+if h.node.kind == "every" then
+h.nextAt = interp.beat(began, parse.ticks(h.node.every) * 50)
+end
+self.budget = 0
+local ok, result = pcall(exec, self, h.node.body, nil)
+if ok then return {status = OK} end
+if type(result) == "table" and result.script then
+return {status = result.script, reason = result.reason, line = result.line,
+stopped = result.stopped}
+end
+return {status = FAULTED, reason = tostring(result)}
+end
+
+interp.COMPLETED = OK
+interp.FAULTED = FAULTED
+interp.ABORTED = ABORTED
+
+return interp

@@ -1,0 +1,62 @@
+
+
+
+
+
+
+local net = require("net")
+local netcrypt = require("netcrypt")
+
+local args = {...}
+local peer = args[1]
+local target = args[2]
+
+if not peer or not target then
+local names = {}
+for name in pairs(net.services()) do names[#names + 1] = name end
+table.sort(names)
+
+print("usage: netsend <address|hostname> <service|port> <message...>")
+print("services: " .. (#names > 0 and table.concat(names, " ") or "none"))
+return
+end
+
+if not net.ready() then
+printError("network is not up")
+return
+end
+
+local body = table.concat(args, " ", 3)
+
+local port = tonumber(target)
+local sealed
+if port then
+sealed = netcrypt.isEncrypted(port)
+else
+port = net.port(target)
+if not port then
+printError(("unknown service: %s"):format(target))
+return
+end
+sealed = net.isEncrypted(target)
+end
+
+
+local dotted, err = net.resolve(peer)
+if not dotted then
+printError(("%s: %s"):format(tostring(peer), tostring(err)))
+return
+end
+local address = net.parseAddress(dotted)
+
+local ok
+ok, err = netcrypt.send(address, port, body, port)
+if not ok then
+printError(tostring(err))
+return
+end
+
+
+
+print(("-> %s (%s) %s %s"):format(
+tostring(peer), dotted, target, sealed and "sealed" or "plain"))

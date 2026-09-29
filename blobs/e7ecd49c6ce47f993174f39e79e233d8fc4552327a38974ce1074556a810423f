@@ -1,0 +1,312 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local hal = require("mfg.common.hal")
+local schematic = require("mfg.turtle.schematic")
+local state = require("mfg.common.state")
+
+local odometry = {}
+
+
+
+
+
+local FILE = "/mfg/odometry"
+
+local model = nil
+
+
+
+local function blank()
+return {x = 0, y = 0, z = 0, facing = "north", pending = nil, trusted = false}
+end
+
+
+
+local function write()
+return state.writeFile(FILE, model)
+end
+
+function odometry.load()
+local parsed, why = state.readFile(FILE)
+if parsed == nil and not why then
+model = blank()
+return model
+end
+
+if type(parsed) ~= "table" then
+
+
+
+
+model = blank()
+return model, "unreadable odometry -- position is untrusted"
+end
+
+model = parsed
+
+
+
+
+if model.pending then
+model.trusted = false
+end
+return model
+end
+
+local function ensure()
+if not model then odometry.load() end
+return model
+end
+
+
+
+function odometry.position()
+local m = ensure()
+return {x = m.x, y = m.y, z = m.z}
+end
+
+function odometry.facing()
+return ensure().facing
+end
+
+function odometry.trusted()
+local m = ensure()
+return m.trusted and not m.pending
+end
+
+function odometry.pending()
+return ensure().pending
+end
+
+
+
+function odometry.ambiguity()
+local m = ensure()
+if not m.pending then return nil end
+return {direction = m.pending, from = {x = m.x, y = m.y, z = m.z}}
+end
+
+
+
+
+
+
+
+
+
+function odometry.fix(position, facing, why)
+local m = ensure()
+if not position or not schematic.CARDINALS[facing] then
+return false, "a fix needs a position and a cardinal facing"
+end
+m.x, m.y, m.z = position.x, position.y, position.z
+m.facing = facing
+m.pending = nil
+m.trusted = true
+m.fixedBy = why
+write()
+return true
+end
+
+
+
+
+function odometry.distrust(why)
+local m = ensure()
+m.trusted = false
+m.why = why
+write()
+return true
+end
+
+
+
+
+
+
+
+
+function odometry.face(direction)
+local m = ensure()
+if not schematic.CARDINALS[direction] then
+return false, ("not a cardinal direction: %s"):format(tostring(direction))
+end
+if m.facing == direction then return true end
+
+local turns = schematic.turnsBetween(m.facing, direction)
+local hw = hal.turtle()
+
+if turns == -1 then
+if not hw.turnLeft() then return false, "turnLeft failed" end
+m.facing = schematic.left(m.facing)
+else
+for _ = 1, turns do
+if not hw.turnRight() then return false, "turnRight failed" end
+m.facing = schematic.right(m.facing)
+end
+end
+
+write()
+return m.facing == direction
+end
+
+
+
+
+
+
+
+
+
+function odometry.go(direction)
+local m = ensure()
+local hw = hal.turtle()
+
+local vertical = (direction == "up" or direction == "down")
+if not vertical then
+local turned, why = odometry.face(direction)
+if not turned then return false, why end
+elseif not schematic.STEP[direction] then
+return false, ("not a direction: %s"):format(tostring(direction))
+end
+
+
+m.pending = direction
+write()
+
+local moved
+if vertical then
+moved = (direction == "up") and hw.up() or hw.down()
+else
+moved = hw.forward()
+end
+
+if moved then
+local delta = schematic.STEP[direction]
+m.x = m.x + delta.x
+m.y = m.y + delta.y
+m.z = m.z + delta.z
+end
+
+
+
+m.pending = nil
+write()
+
+if not moved then
+return false, ("blocked going %s"):format(direction)
+end
+return true
+end
+
+
+
+
+function odometry.reverse()
+local m = ensure()
+local behind = schematic.opposite(m.facing)
+
+m.pending = behind
+write()
+
+local moved = hal.turtle().back()
+if moved then
+local delta = schematic.STEP[behind]
+m.x = m.x + delta.x
+m.y = m.y + delta.y
+m.z = m.z + delta.z
+end
+
+m.pending = nil
+write()
+
+if not moved then return false, "blocked going backwards" end
+return true
+end
+
+
+
+
+
+
+
+
+function odometry.floor()
+local seen = hal.turtle().inspectDown()
+if not seen then return nil end
+return seen.name
+end
+
+
+
+
+
+function odometry.neighbours()
+local hw = hal.turtle()
+local found = {}
+for _, side in ipairs({"front", "left", "right", "top", "bottom"}) do
+local peer = hw.peer and hw.peer(side)
+if peer and peer.label then found[side] = peer end
+end
+return found
+end
+
+
+
+function odometry.sideCell(side)
+local m = ensure()
+local here = {x = m.x, y = m.y, z = m.z}
+
+if side == "front" then return schematic.step(here, m.facing) end
+if side == "top" then return schematic.step(here, "up") end
+if side == "bottom" then return schematic.step(here, "down") end
+if side == "left" then return schematic.step(here, schematic.left(m.facing)) end
+if side == "right" then return schematic.step(here, schematic.right(m.facing)) end
+return nil
+end
+
+
+
+
+
+function odometry.deduce(side, knownCell)
+if not knownCell then return nil end
+
+if side == "top" then
+return {position = schematic.step(knownCell, "down")}
+end
+if side == "bottom" then
+return {position = schematic.step(knownCell, "up")}
+end
+if side ~= "front" then return nil end
+
+
+
+
+local options = {}
+for _, direction in ipairs({"north", "east", "south", "west"}) do
+local from = schematic.step(knownCell, schematic.opposite(direction))
+options[#options + 1] = {position = from, facing = direction}
+end
+return options
+end
+
+function odometry.reset()
+model = blank()
+if fs.exists(FILE) then fs.delete(FILE) end
+return model
+end
+
+return odometry

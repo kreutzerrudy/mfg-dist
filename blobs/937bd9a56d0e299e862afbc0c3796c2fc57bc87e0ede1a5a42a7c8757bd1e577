@@ -1,0 +1,76 @@
+
+
+
+
+
+
+local netkeys = require("netkeys")
+
+local BROADCAST_CHANNEL = 65535
+local HOP_INTERVAL = 15
+
+local id = os.getComputerID()
+local substrate = netkeys.substrate()
+
+print(("computer %d   substrate: %s"):format(id, substrate))
+
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.getType(name) == "modem" then
+local wireless = peripheral.call(name, "isWireless")
+local own = peripheral.call(name, "isOpen", id)
+local bcast = peripheral.call(name, "isOpen", BROADCAST_CHANNEL)
+print(("%s (%s)  fallback %s  broadcast %s"):format(
+name, wireless and "wireless" or "wired",
+own and "open" or "CLOSED", bcast and "open" or "CLOSED"))
+end
+end
+
+if substrate ~= "hopnet" then
+print()
+print("not hopping -- every link uses channel = computer id")
+return
+end
+
+print()
+os.queueEvent("hopnet_status")
+
+local timer = os.startTimer(2)
+while true do
+local event, p1, p2, p3, p4, p5 = os.pullEvent()
+
+if event == "hopnet_status_reply" then
+local slot, linkCount, channels, bandBase, bandSize = p1, p2, p3, p4, p5
+
+
+
+print(("slot %d   %d link(s)   %d hop channel(s)"):format(
+slot, linkCount, #channels))
+
+
+
+
+
+if bandBase then
+print(("band %d..%d (%d wide)"):format(
+bandBase, bandBase + bandSize - 1, bandSize))
+else
+print("band: unbounded (whole channel space)")
+end
+print(("next hop in %.1fs"):format(
+(HOP_INTERVAL * 1000 - os.epoch("utc") % (HOP_INTERVAL * 1000)) / 1000))
+
+if #channels > 0 then
+print()
+
+print("listening on: " .. table.concat(channels, " "))
+elseif linkCount == 0 then
+print()
+print("no links yet -- nothing has a shared schedule to hop on")
+end
+return
+
+elseif event == "timer" and p1 == timer then
+printError("no reply from the hopnet daemon -- is netstart running?")
+return
+end
+end

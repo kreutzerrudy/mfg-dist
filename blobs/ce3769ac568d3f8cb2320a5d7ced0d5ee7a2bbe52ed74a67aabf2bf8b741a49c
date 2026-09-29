@@ -1,0 +1,28 @@
+local rpc = require("mfg.common.rpc")
+local recipes = require("mfg.controller.recipes")
+
+
+
+
+
+
+
+return {
+name        = "forget_recipe",
+label       = "Forget a recipe",
+tier        = "node",
+destructive = true,
+
+parameters = {
+{name = "recipe", label = "Recipe", type = "choice", required = true,
+choices = {source = "recipes"}},
+},
+
+returns = {recipe = "table"},
+
+run = function(params)
+local recipe, why = recipes.remove(params.recipe)
+if not recipe then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, {recipe = recipe}
+end,
+}

@@ -1,0 +1,266 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local tagsmod = require("mfg.controller.tags")
+local pointlist = require("mfg.common.points")
+
+local alarms = {}
+
+local STATE_FILE = "alarms"
+
+alarms.UNACKED = "active-unacked"
+alarms.ACKED = "active-acked"
+alarms.CLEARED = "cleared"
+
+
+local REARM_AFTER = 30 * 1000
+
+
+
+function alarms.all()
+local stored = state.read(STATE_FILE, {})
+if type(stored) ~= "table" then return {} end
+return stored
+end
+
+local function put(all)
+state.write(STATE_FILE, all)
+end
+
+
+
+
+
+function alarms.raise(key, message, opts)
+opts = opts or {}
+local all = alarms.all()
+local now = opts.now or os.epoch("utc")
+local existing = all[key]
+
+if existing and existing.state ~= alarms.CLEARED then
+existing.message = message
+existing.lastSeen = now
+existing.count = (existing.count or 1)
+put(all)
+return existing
+end
+
+if existing and existing.state == alarms.CLEARED then
+
+
+if (now - (existing.clearedAt or 0)) < (opts.rearm or REARM_AFTER) then
+existing.lastSeen = now
+existing.flapping = true
+put(all)
+return existing
+end
+existing.count = (existing.count or 1) + 1
+end
+
+all[key] = {
+key = key,
+message = message,
+severity = opts.severity or "fault",
+source = opts.source,
+state = alarms.UNACKED,
+firstSeen = (existing and existing.firstSeen) or now,
+lastSeen = now,
+clearedAt = nil,
+count = (existing and existing.count) or 1,
+flapping = existing and existing.flapping or false,
+}
+put(all)
+return all[key]
+end
+
+
+
+function alarms.clear(key, now)
+local all = alarms.all()
+local alarm = all[key]
+if not alarm then return false end
+if alarm.state == alarms.CLEARED then return false end
+
+alarm.clearedAt = now or os.epoch("utc")
+if alarm.state == alarms.ACKED then
+
+all[key] = nil
+else
+alarm.state = alarms.CLEARED
+end
+put(all)
+return true
+end
+
+function alarms.ack(key, now)
+local all = alarms.all()
+local alarm = all[key]
+if not alarm then return false, "no such alarm" end
+
+if alarm.state == alarms.CLEARED then
+
+all[key] = nil
+else
+alarm.state = alarms.ACKED
+alarm.ackedAt = now or os.epoch("utc")
+end
+put(all)
+return true
+end
+
+function alarms.ackAll(now)
+local acked = 0
+for key, alarm in pairs(alarms.all()) do
+if alarm.state ~= alarms.ACKED then
+alarms.ack(key, now)
+acked = acked + 1
+end
+end
+return acked
+end
+
+function alarms.unackedCount()
+local n = 0
+for _, alarm in pairs(alarms.all()) do
+if alarm.state == alarms.UNACKED or alarm.state == alarms.CLEARED then
+n = n + 1
+end
+end
+return n
+end
+
+
+function alarms.list()
+local out = {}
+for _, alarm in pairs(alarms.all()) do out[#out + 1] = alarm end
+local rank = {[alarms.UNACKED] = 1, [alarms.CLEARED] = 2, [alarms.ACKED] = 3}
+table.sort(out, function(a, b)
+if rank[a.state] ~= rank[b.state] then
+return (rank[a.state] or 9) < (rank[b.state] or 9)
+end
+return (a.lastSeen or 0) > (b.lastSeen or 0)
+end)
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+function alarms.evaluate(snapshot, opts)
+opts = opts or {}
+local now = opts.now or os.epoch("utc")
+local seen = {}
+
+local function condition(key, wrong, message, meta)
+seen[key] = true
+if wrong then
+alarms.raise(key, message, {
+now = now, source = meta and meta.source,
+severity = meta and meta.severity, rearm = opts.rearm,
+})
+else
+alarms.clear(key, now)
+end
+end
+
+for source, points in pairs(snapshot or {}) do
+
+if points.state then
+local faulted = points.state.value == "faulted"
+condition(("node.%s.faulted"):format(source), faulted,
+("%s faulted: %s"):format(source,
+tostring(points.fault and points.fault.value or "no reason given")),
+{source = source})
+end
+
+
+
+if points.comms then
+local condition_ = points.comms.value
+condition(("node.%s.comms"):format(source),
+condition_ ~= "ok" and condition_ ~= nil,
+("%s is %s -- the network cannot reach it or its program is not "
+.. "answering"):format(source, tostring(condition_)),
+{source = source})
+end
+
+
+
+
+
+if points.points_version then
+local version = points.points_version.value or 1
+condition(("node.%s.outdated"):format(source),
+pointlist.outdated(version),
+("%s runs point list v%s -- older than this controller, so probe "
+.. "and confirmed-arrival delivery are unavailable to it")
+:format(source, tostring(version)),
+{source = source, severity = "version"})
+end
+
+
+
+if points.degraded then
+condition(("volume.%s.degraded"):format(source),
+points.degraded.value == true,
+("%s DEGRADED, missing %s -- stock is counted from present devices "
+.. "only"):format(source,
+tostring(points.missing and points.missing.value or "a device")),
+{source = source})
+end
+
+
+
+if points.offManifest then
+condition(("order.%s.offmanifest"):format(source),
+(points.offManifest.value or 0) > 0,
+("%s OFF MANIFEST: %s held and unspendable"):format(source,
+tostring(points.offManifestDetail
+and points.offManifestDetail.value
+or points.offManifest.value)),
+{source = source, severity = "discrepancy"})
+
+
+condition(("order.%s.blocked"):format(source),
+points.state and points.state.value == "blocked",
+("%s blocked -- awaiting declared material"):format(source),
+{source = source, severity = "hold"})
+end
+end
+
+
+
+
+return alarms.list()
+end
+
+function alarms.reset()
+state.clear(STATE_FILE)
+end
+
+return alarms

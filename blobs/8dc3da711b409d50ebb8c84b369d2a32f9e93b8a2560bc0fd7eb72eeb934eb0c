@@ -1,0 +1,38 @@
+local rpc = require("mfg.common.rpc")
+local node = require("mfg.turtle.node")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "deposit",
+label       = "Deposit output",
+role        = "turtle",
+tier        = "node",
+
+
+
+
+
+manual      = true,
+destructive = false,
+parameters  = {},
+returns     = {deposited = "items"},
+
+run = function()
+local ok, result = node.deposit()
+if not ok then return rpc.REJECTED, {reason = tostring(result)} end
+return rpc.COMPLETED, result
+end,
+}

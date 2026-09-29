@@ -1,0 +1,538 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local store = require("mfg.storage")
+local state = require("mfg.common.state")
+
+local custody = {}
+
+local ORDERS = "orders"
+
+
+
+custody.IN = "/in"
+custody.OUT = "/out"
+custody.POOL = "/pool"
+
+custody.ACCEPTED = "accepted"
+custody.RECEIVING = "receiving"
+custody.READY = "ready"
+custody.RUNNING = "running"
+custody.BLOCKED = "blocked"
+custody.FULFILLED = "fulfilled"
+custody.SETTLED = "settled"
+custody.RETURNED = "returned"
+custody.FAULTED = "faulted"
+
+
+
+
+local COMMIT_TTL = 15 * 60 * 1000
+
+
+
+function custody.orders()
+local all = state.read(ORDERS, {})
+if type(all) ~= "table" then return {} end
+return all
+end
+
+function custody.get(id)
+return custody.orders()[id]
+end
+
+local function put(order)
+local all = custody.orders()
+all[order.id] = order
+state.write(ORDERS, all)
+return order
+end
+
+
+
+local function transition(order, to, why)
+order.state = to
+order.history = order.history or {}
+order.history[#order.history + 1] = {
+state = to, why = why, at = os.epoch("utc"),
+}
+return put(order)
+end
+
+
+
+
+
+function custody.accept(spec)
+spec = spec or {}
+if not spec.id then return nil, "an order needs an id" end
+if custody.get(spec.id) then
+return nil, ("order %s already exists"):format(spec.id)
+end
+if type(spec.owed) ~= "table" or next(spec.owed) == nil then
+return nil, "an order must declare what it owes the station"
+end
+
+local order = {
+id = spec.id,
+from = spec.from,
+product = spec.product,
+quantity = spec.quantity,
+
+
+
+supplied = spec.supplied or {},
+owed = spec.owed,
+received = {},
+offManifest = {},
+committed = {},
+delivered = {},
+resolved = {},
+opened = os.epoch("utc"),
+state = custody.ACCEPTED,
+}
+return transition(order, custody.ACCEPTED, "manifest recorded")
+end
+
+
+
+
+
+
+
+function custody.classes()
+local consigned, owedTotal = {}, {}
+
+for id, order in pairs(custody.orders()) do
+local open = order.state ~= custody.SETTLED
+and order.state ~= custody.RETURNED
+
+if open then
+for item, count in pairs(order.received or {}) do
+local used = (order.consumed and order.consumed[item]) or 0
+local left = count - used
+if left > 0 then
+consigned[item] = consigned[item] or {}
+consigned[item][id] = (consigned[item][id] or 0) + left
+end
+end
+
+
+
+for item, count in pairs(order.owed or {}) do
+local delivered = (order.delivered and order.delivered[item]) or 0
+local produced = (order.produced and order.produced[item]) or 0
+local holding = math.min(produced - delivered, count - delivered)
+if holding > 0 then
+owedTotal[item] = (owedTotal[item] or 0) + holding
+end
+end
+end
+end
+
+return consigned, owedTotal
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function custody.available(item, orderId)
+local physical = store.count(custody.POOL, item) or 0
+local consigned, owed = custody.classes()
+
+local consignedTotal = 0
+for _, count in pairs(consigned[item] or {}) do
+consignedTotal = consignedTotal + count
+end
+
+local free = physical - consignedTotal - (owed[item] or 0)
+if free < 0 then
+
+
+
+free = 0
+end
+
+if not orderId then return free end
+
+local mine = (consigned[item] or {})[orderId] or 0
+local order = custody.get(orderId)
+local committed = order and order.committed and order.committed[item] or 0
+local usable = free + mine - committed
+if usable < 0 then usable = 0 end
+return usable
+end
+
+
+function custody.explain(item)
+local consigned, owed = custody.classes()
+local byOrder = {}
+local consignedTotal = 0
+for id, count in pairs(consigned[item] or {}) do
+byOrder[id] = count
+consignedTotal = consignedTotal + count
+end
+local physical = store.count(custody.POOL, item) or 0
+return {
+item = item,
+physical = physical,
+consigned = consignedTotal,
+consignedBy = byOrder,
+owed = owed[item] or 0,
+localFree = custody.available(item, nil),
+}
+end
+
+
+
+
+
+
+
+
+
+function custody.receive(orderId)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+
+if not store.isBound(custody.IN) then
+return nil, ("%s is not bound -- the station's inbound point is where a "
+.. "manifest is reconciled (K2.1)"):format(custody.IN)
+end
+
+local arriving = store.manifest(custody.IN)
+if not arriving then return nil, "cannot read " .. custody.IN end
+
+local statement = {order = orderId, took = {}, offManifest = {}, short = {}}
+
+for selector, declared in pairs(order.supplied) do
+
+
+
+local item = selector
+if type(selector) == "string" and selector:sub(1, 1) == "#" then
+local resolvedKey = store.resolve(custody.IN, selector)
+if resolvedKey then
+item = resolvedKey
+order.resolved[selector] = resolvedKey
+end
+end
+
+local already = order.received[item] or 0
+local outstanding = declared - already
+
+if outstanding > 0 then
+local present = store.count(custody.IN, item) or 0
+local take = math.min(outstanding, present)
+if take > 0 then
+local moved = store.move(custody.IN, custody.POOL, item, take)
+if moved and moved > 0 then
+order.received[item] = already + moved
+statement.took[item] = moved
+end
+end
+local nowHave = order.received[item] or 0
+if nowHave < declared then
+statement.short[item] = declared - nowHave
+end
+end
+end
+
+
+
+local leftover = store.manifest(custody.IN) or {}
+for item, count in pairs(leftover) do
+statement.offManifest[item] = count
+order.offManifest[item] = count
+end
+
+local complete = true
+for selector, declared in pairs(order.supplied) do
+local item = order.resolved[selector] or selector
+if (order.received[item] or 0) < declared then complete = false end
+end
+
+
+
+
+if complete then
+transition(order, custody.READY, "all declared material received")
+else
+transition(order, custody.RECEIVING, "awaiting the remainder")
+end
+
+statement.state = order.state
+statement.complete = complete
+return statement
+end
+
+
+
+
+
+
+
+
+
+function custody.commit(orderId, requirements, opts)
+opts = opts or {}
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+
+local short = {}
+for item, wanted in pairs(requirements) do
+local usable = custody.available(item, orderId)
+if usable < wanted then
+short[item] = {wanted = wanted, available = usable}
+end
+end
+if next(short) then return nil, short end
+
+order.committed = order.committed or {}
+local lines = {}
+for item, wanted in pairs(requirements) do
+order.committed[item] = (order.committed[item] or 0) + wanted
+lines[item] = wanted
+end
+
+order.commitments = order.commitments or {}
+local handle = ("%s-%d"):format(orderId, os.epoch("utc"))
+order.commitments[handle] = {
+handle = handle,
+lines = lines,
+expires = os.epoch("utc") + (opts.ttl or COMMIT_TTL),
+}
+put(order)
+return handle
+end
+
+
+
+
+
+function custody.consume(orderId, handle, actual)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+local commitment = order.commitments and order.commitments[handle]
+if not commitment then return nil, "no such commitment: " .. tostring(handle) end
+
+order.consumed = order.consumed or {}
+for item, committed in pairs(commitment.lines) do
+local used = (actual and actual[item]) or 0
+if used > committed then used = committed end
+order.consumed[item] = (order.consumed[item] or 0) + used
+order.committed[item] = math.max(0, (order.committed[item] or 0) - committed)
+end
+
+order.commitments[handle] = nil
+put(order)
+return true
+end
+
+
+
+
+
+function custody.release(orderId, handle)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+local commitment = order.commitments and order.commitments[handle]
+if not commitment then return false end
+
+for item, committed in pairs(commitment.lines) do
+order.committed[item] = math.max(0, (order.committed[item] or 0) - committed)
+end
+order.commitments[handle] = nil
+put(order)
+return true
+end
+
+
+function custody.sweep(now)
+now = now or os.epoch("utc")
+local swept = {}
+for id, order in pairs(custody.orders()) do
+for handle, commitment in pairs(order.commitments or {}) do
+if commitment.expires and now >= commitment.expires then
+custody.release(id, handle)
+swept[#swept + 1] = {order = id, handle = handle}
+end
+end
+end
+return swept
+end
+
+
+
+
+function custody.produced(orderId, items)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+order.produced = order.produced or {}
+for item, count in pairs(items or {}) do
+order.produced[item] = (order.produced[item] or 0) + count
+end
+return put(order)
+end
+
+
+
+
+
+
+function custody.deliver(orderId)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+if not store.isBound(custody.OUT) then
+return nil, ("%s is not bound -- it is where the station collects (K2.1)")
+:format(custody.OUT)
+end
+
+local sent = {}
+for item, owed in pairs(order.owed) do
+local already = (order.delivered and order.delivered[item]) or 0
+local outstanding = owed - already
+if outstanding > 0 then
+local moved = store.move(custody.POOL, custody.OUT, item, outstanding)
+if moved and moved > 0 then
+order.delivered = order.delivered or {}
+order.delivered[item] = already + moved
+sent[item] = moved
+end
+end
+end
+
+local complete = true
+for item, owed in pairs(order.owed) do
+if ((order.delivered or {})[item] or 0) < owed then complete = false end
+end
+
+
+
+if complete then
+transition(order, custody.FULFILLED, "all owed output is in " .. custody.OUT)
+end
+
+order.deliveries = order.deliveries or {}
+if next(sent) then
+order.deliveries[#order.deliveries + 1] = {at = os.epoch("utc"), sent = sent}
+end
+put(order)
+
+return {sent = sent, complete = complete, state = order.state}
+end
+
+
+function custody.settle(orderId)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+if order.state ~= custody.FULFILLED then
+return nil, ("order %s is %s, not fulfilled"):format(orderId, order.state)
+end
+
+for item in pairs(order.owed) do
+local left = store.count(custody.OUT, item) or 0
+if left > 0 then
+return nil, ("%d %s is still in %s -- the station has not collected")
+:format(left, item, custody.OUT)
+end
+end
+
+
+
+
+
+local released = {}
+for item, received in pairs(order.received) do
+local used = (order.consumed or {})[item] or 0
+local leftover = received - used
+if leftover > 0 then released[item] = leftover end
+end
+order.releasedToLocal = released
+
+transition(order, custody.SETTLED, "station collected")
+return {released = released, state = order.state}
+end
+
+
+
+
+
+function custody.cancel(orderId, why)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+
+local returned = {}
+if store.isBound(custody.OUT) then
+for item, received in pairs(order.received) do
+local used = (order.consumed or {})[item] or 0
+local leftover = received - used
+if leftover > 0 then
+local moved = store.move(custody.POOL, custody.OUT, item, leftover)
+if moved and moved > 0 then returned[item] = moved end
+end
+end
+end
+
+for handle in pairs(order.commitments or {}) do
+custody.release(orderId, handle)
+end
+
+order = custody.get(orderId)
+order.returnedToStation = returned
+transition(order, custody.RETURNED, why or "cancelled")
+return {returned = returned, state = order.state}
+end
+
+
+
+
+
+
+function custody.statement(orderId)
+local order = custody.get(orderId)
+if not order then return nil, "no such order: " .. tostring(orderId) end
+
+return {
+id = order.id,
+from = order.from,
+state = order.state,
+supplied = order.supplied,
+received = order.received,
+offManifest = order.offManifest,
+owed = order.owed,
+produced = order.produced or {},
+delivered = order.delivered or {},
+consumed = order.consumed or {},
+committed = order.committed or {},
+deliveries = order.deliveries or {},
+releasedToLocal = order.releasedToLocal,
+returnedToStation = order.returnedToStation,
+history = order.history,
+}
+end
+
+return custody

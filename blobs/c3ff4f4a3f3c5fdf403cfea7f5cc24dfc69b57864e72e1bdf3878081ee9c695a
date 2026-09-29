@@ -1,0 +1,322 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+local roles = require("mfg.common.roles")
+local validate = require("mfg.common.actions.validate")
+local requires = require("mfg.common.actions.requires")
+local journal = require("mfg.common.actions.journal")
+local equipment = require("mfg.common.equipment")
+
+local actions = {}
+
+actions.journal = journal
+actions.requires = requires
+actions.validate = validate
+
+local registry = {}
+
+
+
+
+local function moduleName(path)
+return (path:gsub("%.lua$", ""):gsub("/", "."))
+end
+
+
+
+
+
+function actions.register(decl)
+local ok, errors = validate.declaration(decl)
+if not ok then
+return false, table.concat(errors, "; ")
+end
+if registry[decl.name] then
+
+
+return false, ("two actions are called %s"):format(decl.name)
+end
+registry[decl.name] = decl
+return true, decl
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function actions.load(roleOrList, opts)
+opts = opts or {}
+local list
+if type(roleOrList) == "table" then
+list = roleOrList
+elseif type(roleOrList) == "string" then
+local spec = roles[roleOrList]
+if not spec then
+return nil, ("unknown role: %s"):format(roleOrList)
+end
+list = spec.actions or {}
+else
+return nil, "actions.load needs a role or a list of action files"
+end
+
+local loaded, failed, withheld = {}, {}, {}
+
+for _, path in ipairs(list) do
+local name = moduleName(path)
+local ok, decl = pcall(require, name)
+local permitted, short = true, nil
+if ok and opts.fitted then permitted, short = equipment.permits(decl, opts.fitted) end
+if not ok then
+failed[#failed + 1] = ("%s: %s"):format(path, tostring(decl))
+elseif not permitted then
+withheld[#withheld + 1] = ("%s: needs %s"):format(tostring(decl.name), short)
+else
+local registered, why = actions.register(decl)
+if registered then
+loaded[#loaded + 1] = decl.name
+else
+failed[#failed + 1] = ("%s: %s"):format(path, tostring(why))
+end
+end
+end
+
+return loaded, failed, withheld
+end
+
+function actions.get(name)
+return registry[name]
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function actions.list(opts)
+opts = opts or {}
+local out = {}
+for _, decl in pairs(registry) do
+local wanted = opts.base or not decl.base
+if wanted and decl.tier == "service" and not opts.services then
+wanted = false
+end
+if wanted and opts.role and decl.role and decl.role ~= opts.role then
+wanted = false
+end
+if wanted and opts.tier and decl.tier ~= opts.tier then
+wanted = false
+end
+if wanted then out[#out + 1] = decl end
+end
+table.sort(out, function(a, b) return a.name < b.name end)
+return out
+end
+
+
+function actions.reset()
+registry = {}
+end
+
+
+
+
+
+
+
+
+
+function actions.finish(ctx, entry, status, fields)
+fields = fields or {}
+
+local record = {
+action = entry.action,
+params = entry.params,
+status = status,
+reason = fields.reason,
+by = ctx.by,
+at = os.epoch("utc"),
+steps = (entry.steps and #entry.steps > 0) and entry.steps or nil,
+}
+
+if type(ctx.steps) == "table" then
+ctx.steps[#ctx.steps + 1] = record
+elseif not entry.quiet then
+
+
+
+
+journal.record(record)
+end
+
+return status, fields
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function actions.invoke(name, params, ctx)
+ctx = ctx or {}
+
+local decl = registry[name]
+if not decl then
+
+
+print(("actions: rejected unknown action %s from %s"):format(
+tostring(name), tostring(ctx.by or "local")))
+return actions.finish(ctx, {action = name}, rpc.REJECTED,
+{reason = "unknown action: " .. tostring(name)})
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if decl.manual and not (ctx.operator or ctx.policy) then
+return actions.finish(ctx, {action = name, params = params}, rpc.REJECTED,
+{reason = ("%s is a manual action -- an operator or a policy wrapper "
+.. "must ask for it"):format(name), manual = true})
+end
+
+local checked, why, errors = validate.check(decl, params)
+if not checked then
+return actions.finish(ctx, {action = name, params = params, quiet = decl.quiet},
+rpc.REJECTED, {reason = why, errors = errors})
+end
+
+
+
+
+local available, blocked, evaluated = requires.evaluate(decl, ctx.snapshot)
+if evaluated and not available then
+return actions.finish(ctx, {action = name, params = checked, quiet = decl.quiet},
+rpc.REJECTED, {reason = blocked, blocked = true})
+end
+
+
+
+
+
+
+
+
+local children = {}
+local childCtx = {
+by = ctx.by, snapshot = ctx.snapshot, packet = ctx.packet,
+operator = ctx.operator,
+
+
+
+policy = (decl.policy and decl.name) or ctx.policy,
+
+
+
+legacy = ctx.legacy,
+steps = children,
+}
+
+local lived, status, fields = pcall(decl.run, checked, childCtx)
+
+if not lived then
+
+print(("actions: %s failed: %s"):format(name, tostring(status)))
+return actions.finish(ctx,
+{action = name, params = checked, steps = children, quiet = decl.quiet},
+rpc.REJECTED, {reason = tostring(status)})
+end
+
+if not status then
+
+
+
+return actions.finish(ctx,
+{action = name, params = checked, steps = children, quiet = decl.quiet},
+rpc.REJECTED, {reason = ("%s returned no status"):format(name)})
+end
+
+return actions.finish(ctx,
+{action = name, params = checked, steps = children, quiet = decl.quiet},
+status, fields)
+end
+
+return actions

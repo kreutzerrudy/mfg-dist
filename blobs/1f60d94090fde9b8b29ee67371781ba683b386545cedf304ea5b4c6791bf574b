@@ -1,0 +1,30 @@
+local rpc = require("mfg.common.rpc")
+local configs = require("mfg.controller.configs")
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "show_config",
+label       = "Show a node's config",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "node", label = "Node", type = "node", required = true},
+},
+
+returns = {config = "table", observed = "table"},
+
+run = function(params)
+local doc, why = configs.resolve(params.node)
+if not doc then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {config = doc, observed = configs.observed(params.node)}
+end,
+}

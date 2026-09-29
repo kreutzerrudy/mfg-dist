@@ -1,0 +1,69 @@
+
+
+
+
+
+
+
+local icmp = require("icmp")
+local ipnet = require("ipnet")
+local ip = require("ip")
+
+local args = {...}
+local target = args[1]
+local count = tonumber(args[2] or "4")
+
+if not target then
+print("usage: ping <address> [count]")
+print("  measures reachability and round trip time")
+return
+end
+
+if not ipnet.isRunning() then
+printError("ipnet is not running -- start netstart first")
+return
+end
+
+
+
+local address = ip.parse(target)
+if not address then
+local ok, net = pcall(require, "net")
+if ok then
+local resolved = net.resolve(target)
+if resolved then address = ip.parse(resolved) end
+end
+end
+
+if not address then
+printError("could not resolve " .. target)
+return
+end
+
+print(("pinging %s"):format(ip.format(address)))
+
+local sent, received = 0, 0
+local total, best, worst = 0, nil, nil
+
+for seq = 1, count do
+sent = sent + 1
+local rtt, err = icmp.ping(address, {seq = seq, timeout = 2})
+if rtt then
+received = received + 1
+total = total + rtt
+best = (not best or rtt < best) and rtt or best
+worst = (not worst or rtt > worst) and rtt or worst
+print(("  seq %d: %.3fs"):format(seq, rtt))
+else
+print(("  seq %d: %s"):format(seq, tostring(err)))
+end
+if seq < count then sleep(0.5) end
+end
+
+local lost = sent - received
+print(("%d sent, %d received, %d lost (%d%%)"):format(
+sent, received, lost, math.floor(lost / sent * 100)))
+if received > 0 then
+print(("rtt min %.3fs  avg %.3fs  max %.3fs"):format(
+best, total / received, worst))
+end

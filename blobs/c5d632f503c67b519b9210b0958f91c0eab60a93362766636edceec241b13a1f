@@ -1,0 +1,244 @@
+
+
+
+
+
+
+
+
+
+
+
+local turtles = require("mfg.controller.turtles")
+local dispatch = require("mfg.controller.dispatch")
+local store = require("mfg.storage")
+local custody = require("mfg.storage.custody")
+local pointlist = require("mfg.common.points")
+
+local tags = {}
+
+tags.OK = "ok"
+tags.STALE = "stale"
+tags.UNAVAILABLE = "unavailable"
+
+
+local STALE_AFTER = 10 * 1000
+
+
+
+local function set(snapshot, source, point, value, valid, at)
+snapshot[source] = snapshot[source] or {}
+snapshot[source][point] = {
+value = value,
+at = at or os.epoch("utc"),
+valid = valid or tags.OK,
+}
+end
+
+tags.set = set
+
+
+
+
+
+
+
+
+local function nodeTags(snapshot, turtle, opts, previous)
+local source = turtle.id
+local points, answer = turtles.points(turtle, opts)
+
+if not points then
+
+
+local was = previous and previous[source]
+if was then
+for point, tag in pairs(was) do
+set(snapshot, source, point, tag.value, tags.STALE, tag.at)
+end
+end
+
+
+
+
+
+
+
+
+local condition = turtles.condition(turtle,
+{timeout = 1, attempts = 1})
+set(snapshot, source, "comms", condition, tags.OK)
+set(snapshot, source, "state", (was and was.state and was.state.value)
+or "unknown", tags.STALE)
+return answer
+end
+
+set(snapshot, source, "comms", "ok")
+for point, value in pairs(points) do
+set(snapshot, source, point, value, tags.OK)
+end
+
+
+
+local version = points.points_version or 1
+if not pointlist.understood(version) then
+
+
+
+
+set(snapshot, source, "points_version", version, tags.UNAVAILABLE)
+else
+set(snapshot, source, "points_version", version, tags.OK)
+end
+return answer
+end
+
+
+
+
+
+
+
+
+
+
+local function volumeTags(snapshot, path)
+local source = path
+local summary = store.summary(path)
+if not summary then return end
+
+set(snapshot, source, "bound", summary.bound)
+set(snapshot, source, "coherence", summary.coherence)
+set(snapshot, source, "degraded", summary.degraded)
+if summary.degraded then
+set(snapshot, source, "missing", table.concat(summary.missing, ", "))
+end
+if not summary.bound then
+
+
+set(snapshot, source, "used", 0, tags.UNAVAILABLE)
+set(snapshot, source, "free", 0, tags.UNAVAILABLE)
+return
+end
+
+local slots = summary.slots
+if slots then
+set(snapshot, source, "slots", slots.total)
+set(snapshot, source, "used", slots.used)
+set(snapshot, source, "free", slots.free)
+set(snapshot, source, "keys", slots.keys)
+set(snapshot, source, "reclaimable", slots.reclaimable)
+end
+set(snapshot, source, "items", summary.items or 0)
+end
+
+
+
+local function orderTags(snapshot, id, order)
+local source = id
+set(snapshot, source, "state", order.state)
+set(snapshot, source, "product", order.product)
+set(snapshot, source, "quantity", order.quantity)
+set(snapshot, source, "from", order.from)
+
+local function total(tbl)
+local n = 0
+for _, count in pairs(tbl or {}) do n = n + count end
+return n
+end
+set(snapshot, source, "owed", total(order.owed))
+set(snapshot, source, "delivered", total(order.delivered))
+set(snapshot, source, "received", total(order.received))
+set(snapshot, source, "offManifest", total(order.offManifest))
+if next(order.offManifest or {}) then
+local parts = {}
+for item, count in pairs(order.offManifest) do
+parts[#parts + 1] = ("%d %s"):format(count, item)
+end
+set(snapshot, source, "offManifestDetail", table.concat(parts, ", "))
+end
+end
+
+
+
+
+
+function tags.snapshot(opts, previous)
+opts = opts or {timeout = 2, attempts = 2}
+local snapshot = {}
+
+set(snapshot, "cluster", "at", os.epoch("utc"))
+
+local nodeCount, faulted, idle = 0, 0, 0
+for _, turtle in pairs(turtles.all()) do
+nodeCount = nodeCount + 1
+nodeTags(snapshot, turtle, opts, previous)
+local node = snapshot[turtle.id]
+local state = node and node.state and node.state.value
+if state == "faulted" then faulted = faulted + 1 end
+if state == "idle" then idle = idle + 1 end
+end
+set(snapshot, "cluster", "nodes", nodeCount)
+set(snapshot, "cluster", "faulted", faulted)
+set(snapshot, "cluster", "idle", idle)
+
+
+
+volumeTags(snapshot, custody.POOL)
+volumeTags(snapshot, custody.IN)
+volumeTags(snapshot, custody.OUT)
+for _, path in ipairs(store.volumes()) do
+if snapshot[path] == nil then volumeTags(snapshot, path) end
+end
+
+local orderCount, openCount = 0, 0
+for id, order in pairs(custody.orders()) do
+orderCount = orderCount + 1
+if order.state ~= custody.SETTLED and order.state ~= custody.RETURNED then
+openCount = openCount + 1
+end
+orderTags(snapshot, id, order)
+end
+set(snapshot, "cluster", "orders", orderCount)
+set(snapshot, "cluster", "ordersOpen", openCount)
+
+local queue = dispatch.queue()
+set(snapshot, "queue", "jobs", #queue.jobs)
+local running = 0
+for _, job in ipairs(queue.jobs) do
+if job.state == "running" then running = running + 1 end
+end
+set(snapshot, "queue", "running", running)
+
+return snapshot
+end
+
+
+
+
+
+function tags.staleify(snapshot)
+if type(snapshot) ~= "table" then return {} end
+for _, points in pairs(snapshot) do
+for _, tag in pairs(points) do
+tag.valid = tags.STALE
+end
+end
+return snapshot
+end
+
+
+function tags.isStale(tag, now, after)
+if not tag then return true end
+if tag.valid == tags.STALE then return true end
+now = now or os.epoch("utc")
+return (now - (tag.at or 0)) > (after or STALE_AFTER)
+end
+
+function tags.value(snapshot, source, point, fallback)
+local tag = snapshot and snapshot[source] and snapshot[source][point]
+if not tag then return fallback end
+return tag.value
+end
+
+return tags

@@ -1,0 +1,35 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+
+
+
+return {
+name        = "limit_machine",
+label       = "Limit a machine by pool stock",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "machine", label = "Machine", type = "text", required = true},
+{name = "item", label = "Item", type = "item", required = false,
+help = "Omit to clear the limit."},
+{name = "at", label = "Pause at", type = "number", integer = true, min = 1,
+required = false},
+{name = "resume", label = "Resume below", type = "number", integer = true,
+min = 1, required = false},
+},
+
+returns = {limit = "table"},
+
+run = function(params)
+local record, why = scripts.setLimit(params.machine, params.item, params.at,
+params.resume)
+if not record then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {limit = record.limit}
+end,
+}

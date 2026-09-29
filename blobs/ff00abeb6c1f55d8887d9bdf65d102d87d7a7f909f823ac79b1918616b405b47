@@ -1,0 +1,417 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local acknet = require("acknet")
+
+local routing = {}
+
+local PROTOCOL = "acknet_route"
+
+local RESERVED_PORT_MAX = 99
+local PORT_DIRECTORY = 1
+
+local RESOLVE_TIMEOUT = 3
+local CACHE_TTL = 60
+
+
+
+local REFERRAL_MAX = 4
+
+local state = _G.__routing
+if not state then
+state = {running = false, debug = false}
+_G.__routing = state
+end
+
+
+
+
+local resolver = nil
+state.ports = state.ports or {}
+state.cache = state.cache or {}
+
+local function log(...)
+if state.debug then os.queueEvent("routing_debug", ...) end
+end
+
+function routing.setDebug(enabled)
+state.debug = enabled
+end
+
+routing.PORT_DIRECTORY = PORT_DIRECTORY
+
+
+
+
+function routing.serverAddress()
+return state.parentAddress
+end
+
+
+
+function routing.setLocal(address)
+state.address = address
+end
+
+
+
+
+
+
+
+
+function routing.setParent(address)
+state.parentAddress = address
+end
+
+function routing.parent()
+return state.parentAddress
+end
+
+function routing.address()
+return state.address
+end
+
+
+
+
+function routing.setName(name)
+state.name = name
+end
+
+function routing.localName()
+return state.name
+end
+
+
+
+
+
+
+
+function routing.bind(port, system)
+if type(port) ~= "number" or port < 1 then
+return false, "port must be a positive number"
+end
+if port <= RESERVED_PORT_MAX and not system then
+return false, ("port %d is reserved for system services"):format(port)
+end
+if state.ports[port] then
+return false, ("port %d is already bound"):format(port)
+end
+state.ports[port] = true
+return true
+end
+
+function routing.unbind(port)
+state.ports[port] = nil
+end
+
+function routing.bound()
+return state.ports
+end
+
+
+
+
+
+
+local function cacheGet(address)
+local hit = state.cache[address]
+if hit and os.epoch("utc") < hit.expires then return hit.record end
+return nil
+end
+
+local function cachePut(address, record)
+state.cache[address] = {
+record = record,
+expires = os.epoch("utc") + CACHE_TTL * 1000,
+}
+end
+
+local function envelope(dst, dport, body, sport)
+return {
+src = state.address,
+dst = dst,
+sport = sport,
+dport = dport,
+body = body,
+}
+end
+
+
+local function askOnce(query, directory)
+local key = query.address or query.name
+
+acknet.send(directory,
+envelope(directory, PORT_DIRECTORY,
+{op = "resolve", address = query.address, name = query.name},
+PORT_DIRECTORY),
+PROTOCOL)
+
+local deadline = os.epoch("utc") + RESOLVE_TIMEOUT * 1000
+while true do
+local remaining = (deadline - os.epoch("utc")) / 1000
+if remaining <= 0 then return nil, "directory timed out" end
+
+local packet = acknet.receive(PROTOCOL, remaining)
+if packet and type(packet.body) == "table"
+and type(packet.body.body) == "table" then
+local reply = packet.body.body
+if reply.key == key then return reply end
+end
+end
+end
+
+
+
+
+
+
+
+
+
+local function askDirectory(query, directory)
+if not directory then return nil, "no directory known" end
+
+for _ = 1, REFERRAL_MAX do
+local reply, err = askOnce(query, directory)
+if not reply then return nil, err end
+
+if reply.op == "resolve_ok" and type(reply.record) == "table" then
+return reply.record
+
+elseif reply.op == "resolve_refer" and type(reply.to) == "number" then
+directory = reply.to
+
+else
+return nil, reply.reason or "not found"
+end
+end
+
+return nil, "too many referrals"
+end
+
+
+
+
+
+function routing.lookup(address)
+local hit = cacheGet(address)
+if hit then return hit end
+
+
+
+
+
+local directory = state.parentAddress
+
+if resolver then
+local record, referral = resolver({address = address})
+if record then
+cachePut(address, record)
+return record
+end
+if referral then directory = referral end
+
+elseif state.directory then
+
+
+
+directory = state.address
+end
+
+if not directory then
+if address == state.address then return {address = address} end
+return nil, "not online"
+end
+
+local record, err = askDirectory({address = address}, directory)
+if not record then return nil, err end
+
+cachePut(address, record)
+return record
+end
+
+
+
+
+
+function routing.lookupName(name)
+if type(name) ~= "string" then return nil, "name must be a string" end
+
+local hit = cacheGet(name)
+if hit then return hit end
+
+local directory = state.parentAddress
+
+if resolver then
+local record, referral = resolver({name = name})
+if record then
+cachePut(name, record)
+return record
+end
+
+
+
+
+if referral then directory = referral end
+
+elseif state.directory then
+
+directory = state.address
+end
+
+if not directory then return nil, "no such name" end
+
+local record, err = askDirectory({name = name}, directory)
+if not record then return nil, err end
+
+cachePut(name, record)
+return record
+end
+
+function routing.forget(address)
+state.cache[address] = nil
+end
+
+
+
+function routing.send(dstAddress, dstPort, body, srcPort)
+if not state.address then
+return false, "no local address -- has the handshake completed?"
+end
+
+
+
+log("send", dstAddress, dstPort)
+acknet.send(dstAddress, envelope(dstAddress, dstPort, body, srcPort), PROTOCOL)
+return true
+end
+
+
+function routing.receive(port, timeout)
+local timer = nil
+local filter = nil
+if timeout then
+timer = os.startTimer(timeout)
+else
+filter = "net_message"
+end
+
+while true do
+local event, p1, p2, p3, p4 = os.pullEvent(filter)
+if event == "net_message" then
+local src, sport, dport, body = p1, p2, p3, p4
+if port == nil or dport == port then
+if timer then os.cancelTimer(timer) end
+return {src = src, sport = sport, dport = dport, body = body}
+end
+elseif event == "timer" and p1 == timer then
+return nil
+end
+end
+end
+
+
+
+
+
+
+
+
+
+function routing.setDirectory(fn)
+resolver = fn
+state.directory = fn ~= nil
+end
+
+local function answerDirectory(sender, env)
+if not resolver then return end
+local req = env.body
+if type(req) ~= "table" or req.op ~= "resolve" then return end
+
+local key = req.address or req.name
+local record, referral = resolver(req)
+local reply
+
+if record then
+reply = {op = "resolve_ok", key = key, record = record}
+log("directory", tostring(key), record.address)
+
+else
+
+
+
+
+local to = referral or state.parentAddress
+if to then
+reply = {op = "resolve_refer", key = key, to = to}
+log("directory", tostring(key), "refer")
+else
+reply = {op = "resolve_err", key = key, reason = "not online"}
+log("directory", tostring(key), "miss")
+end
+end
+
+acknet.send(sender, envelope(env.src, env.sport, reply, PORT_DIRECTORY), PROTOCOL)
+end
+
+local function daemonLoop()
+while true do
+local packet = acknet.receive(PROTOCOL)
+local env = packet.body
+
+if type(env) == "table" and type(env.dport) == "number" then
+if env.dport == PORT_DIRECTORY and resolver then
+answerDirectory(packet.sender_id, env)
+
+
+
+
+
+
+elseif state.ports[env.dport] then
+os.queueEvent("net_message", env.src, env.sport, env.dport, env.body)
+
+else
+log("unbound", env.dport, env.src)
+end
+end
+end
+end
+
+function routing.runtime()
+if state.running then
+error("routing: daemon already running", 0)
+end
+state.running = true
+
+local ok, err = pcall(daemonLoop)
+
+state.running = false
+if not ok then error(err, 0) end
+end
+
+function routing.isRunning()
+return state.running == true
+end
+
+
+
+function routing.shutdown()
+state.running = false
+end
+
+return routing

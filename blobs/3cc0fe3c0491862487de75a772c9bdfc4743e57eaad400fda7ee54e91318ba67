@@ -1,0 +1,110 @@
+
+
+
+
+
+
+
+
+
+
+
+local cart = {}
+
+cart.MAX_LINES = 16
+cart.STATE = "cart"
+cart.SCHEMA = 1
+
+
+
+local function diskStore()
+local state = require("mfg.common.state")
+return {
+read = function()
+local saved = state.read(cart.STATE, nil, {schema = cart.SCHEMA})
+return type(saved) == "table" and saved.lines or nil
+end,
+write = function(lines)
+state.write(cart.STATE, {lines = lines}, {schema = cart.SCHEMA})
+end,
+}
+end
+
+
+function cart.new(store)
+local c = {lines = {}, store = store or diskStore()}
+local ok, saved = pcall(c.store.read)
+if ok and type(saved) == "table" then
+for _, line in ipairs(saved) do
+if type(line.item) == "string" and tonumber(line.amount)
+and tonumber(line.amount) > 0 and #c.lines < cart.MAX_LINES then
+c.lines[#c.lines + 1] = {item = line.item,
+amount = math.floor(tonumber(line.amount))}
+end
+end
+end
+return c
+end
+
+
+function cart.save(c)
+local lines = {}
+for i, line in ipairs(c.lines) do lines[i] = {item = line.item, amount = line.amount} end
+pcall(c.store.write, lines)
+end
+
+function cart.find(c, item)
+for i, line in ipairs(c.lines) do
+if line.item == item then return i, line end
+end
+return nil
+end
+
+
+
+function cart.add(c, item, n)
+n = math.floor(tonumber(n) or 0)
+if n < 1 then return nil, "type how many" end
+local _, line = cart.find(c, item)
+if line then
+line.amount = line.amount + n
+else
+if #c.lines >= cart.MAX_LINES then
+return nil, ("the cart holds %d lines at most"):format(cart.MAX_LINES)
+end
+line = {item = item, amount = n}
+c.lines[#c.lines + 1] = line
+end
+cart.save(c)
+return line
+end
+
+
+function cart.set(c, item, n)
+local i, line = cart.find(c, item)
+if not i then return false end
+n = math.floor(tonumber(n) or 0)
+if n < 1 then
+table.remove(c.lines, i)
+else
+line.amount = n
+end
+cart.save(c)
+return true
+end
+
+function cart.remove(c, item) return cart.set(c, item, 0) end
+
+function cart.clear(c)
+c.lines = {}
+cart.save(c)
+end
+
+
+function cart.total(c)
+local n = 0
+for _, line in ipairs(c.lines) do n = n + line.amount end
+return n
+end
+
+return cart

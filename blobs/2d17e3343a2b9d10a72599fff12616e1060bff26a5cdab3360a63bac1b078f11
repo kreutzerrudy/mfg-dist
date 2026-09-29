@@ -1,0 +1,556 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local parse = require("mfg.common.script.parse")
+local validate = require("mfg.common.actions.validate")
+
+local check = {}
+
+check.LIMITS = {
+level = 15,
+repeatMax = 64,
+supplyMax = 3456,
+everyMin = 20,
+pulseMax = 200,
+waitMax = 12000,
+withinMin = 20,
+textMax = 80,
+slotMax = 256,
+}
+
+
+check.VERBS = {supply = "supply", stock = "supply", collect = "collect",
+move = "move", set = "set_signal", pulse = "pulse"}
+
+local VALUE_KINDS = {level = "level", flag = "flag"}
+
+
+
+local function new(script, env)
+return {script = script, env = env or {}, errors = {}, warnings = {},
+ports = {}, footprint = {supplies = {}, collects = {}, writes = {}, drives = {},
+reads = {}}}
+end
+
+local function err(c, n, message)
+local span = n and n.span or {}
+c.errors[#c.errors + 1] = {line = span.line, col = span.col, node = n and n.id,
+message = message}
+return nil
+end
+
+local function warn(c, n, message)
+local span = n and n.span or {}
+c.warnings[#c.warnings + 1] = {line = span.line, col = span.col,
+node = n and n.id, message = message}
+end
+
+local function mark(set, value) set[value] = true end
+
+local function knownItem(c, n, item)
+local items = c.env.items
+if items and not items[item] then
+warn(c, n, ("the pool does not hold %s -- is it spelt right?"):format(item))
+end
+end
+
+
+local function portOf(c, n, name)
+local port = c.ports[name]
+if not port then
+return err(c, n, ("%s is not one of %s's ports"):format(tostring(name),
+tostring(c.script.machine)))
+end
+return port
+end
+
+local function pathOf(c, name)
+return "/" .. tostring(c.script.machine) .. "/" .. tostring(name)
+end
+
+local function describePort(port)
+return ("an %s %s"):format(port.direction, port.type)
+end
+
+
+
+
+local function lookup(scope, name)
+while scope do
+if scope.names[name] then return scope.names[name] end
+scope = scope.parent
+end
+end
+
+
+
+local exprType
+
+local function operand(c, e, scope)
+local t = exprType(c, e, scope)
+return t
+end
+
+local function cmpType(c, e, scope)
+local lt = operand(c, e.left, scope)
+local rt = operand(c, e.right, scope)
+if not lt or not rt then return nil end
+
+local function literal(t) return t == "number" end
+if literal(lt) and literal(rt) then
+return err(c, e, "compares two numbers: one side should be a reading")
+end
+
+
+local numeric, typed = nil, nil
+if literal(lt) then numeric, typed = e.left, rt
+elseif literal(rt) then numeric, typed = e.right, lt end
+if numeric then
+if typed ~= "level" and typed ~= "count" then
+return err(c, e, ("a number cannot be compared with a %s"):format(typed))
+end
+local limit = typed == "level" and check.LIMITS.level or math.huge
+if numeric.value > limit then
+return err(c, numeric, ("%d is out of range for a level (0-15)")
+:format(numeric.value))
+end
+lt, rt = typed, typed
+end
+
+if lt ~= rt then
+local hint = ""
+if (lt == "level" and rt == "count") or (lt == "count" and rt == "level") then
+hint = " -- a comparator level is not an item count (E4.2); read the "
+.. "volume with `count` for that"
+end
+return err(c, e, ("compares a %s with a %s%s"):format(lt, rt, hint))
+end
+if e.op ~= "=" and e.op ~= "!=" and lt ~= "level" and lt ~= "count" then
+return err(c, e, ("%s only compares levels and counts; a %s is = or !=")
+:format(e.op, lt))
+end
+if lt ~= "level" and lt ~= "count" and lt ~= "flag" then
+return err(c, e, ("a %s cannot be compared"):format(lt))
+end
+return "bool"
+end
+
+exprType = function(c, e, scope)
+local k = e.kind
+if k == "num" then return "number"
+elseif k == "onoff" then return "flag"
+elseif k == "dur" then
+return err(c, e, "a duration is not a value here")
+elseif k == "item" then
+return err(c, e, ("%s is an item, not a value -- `count %s in <port>` or "
+.. "`free %s` reads one"):format(e.value, e.value, e.value))
+elseif k == "text" then
+return err(c, e, "text is only for alarms")
+elseif k == "paren" then
+return exprType(c, e.expr, scope)
+elseif k == "name" then
+local bound = lookup(scope, e.name)
+if bound then return bound end
+local port = c.ports[e.name]
+if not port then
+return err(c, e, ("%s is not a port or a name"):format(e.name))
+end
+if port.type == "volume" then
+return err(c, e, ("%s is a volume, not a value -- read it with "
+.. "`count <item> in %s`"):format(e.name, e.name))
+end
+mark(c.footprint.reads, pathOf(c, e.name))
+return VALUE_KINDS[port.type]
+elseif k == "count" then
+local port = portOf(c, e, e.port)
+if not port then return nil end
+if port.type ~= "volume" then
+return err(c, e, ("%s is a %s signal, not a volume"):format(e.port, port.type))
+end
+knownItem(c, e, e.item)
+mark(c.footprint.reads, pathOf(c, e.port))
+return "count"
+elseif k == "free" then
+knownItem(c, e, e.item)
+return "count"
+elseif k == "cmp" then
+return cmpType(c, e, scope)
+elseif k == "and" or k == "or" then
+local lt = exprType(c, e.left, scope)
+local rt = exprType(c, e.right, scope)
+if lt and lt ~= "bool" then err(c, e.left, ("`%s` joins conditions, not a %s")
+:format(k, lt == "number" and "number" or lt)) end
+if rt and rt ~= "bool" then err(c, e.right, ("`%s` joins conditions, not a %s")
+:format(k, rt == "number" and "number" or rt)) end
+if lt == "bool" and rt == "bool" then return "bool" end
+return nil
+elseif k == "not" then
+local t = exprType(c, e.expr, scope)
+if t and t ~= "bool" then
+return err(c, e, ("`not` takes a condition, not a %s"):format(t))
+end
+return t and "bool" or nil
+end
+return err(c, e, "not an expression: " .. tostring(k))
+end
+
+local function condition(c, e, scope, where)
+local t = exprType(c, e, scope)
+if t and t ~= "bool" then
+
+
+local hint = ""
+if t == "flag" then
+hint = (" -- write `%s = on`"):format(e.kind == "name" and e.name or "it")
+end
+err(c, e, ("%s needs a condition, not a %s%s"):format(where, t, hint))
+end
+end
+
+
+
+local function verb(c, s, params)
+local decls = c.env.decls
+if not decls then return end
+
+
+for _, e in ipairs(c.errors) do
+if e.node == s.id then return end
+end
+local action = check.VERBS[s.kind]
+local decl = decls[action]
+if not decl then
+return err(c, s, ("the controller does not offer %s, which `%s` needs")
+:format(action, s.kind))
+end
+local ok, why = validate.check(decl, params)
+if not ok then
+err(c, s, ("%s would refuse this: %s"):format(action, tostring(why)))
+end
+end
+
+local function durationIn(c, s, d, low, high, what)
+local ticks = parse.ticks(d)
+if ticks < low or ticks > high then
+local function show(t)
+if t % 1200 == 0 then return math.floor(t / 1200) .. "m" end
+if t % 20 == 0 then return math.floor(t / 20) .. "s" end
+return t .. "t"
+end
+err(c, s, ("%s must be %s to %s"):format(what, show(low), show(high)))
+end
+return ticks
+end
+
+
+
+local block
+
+local function volume(c, s, name, direction, verbName)
+local port = portOf(c, s, name)
+if not port then return nil end
+if port.type ~= "volume" then
+return err(c, s, ("`%s` takes a volume, and %s is a %s signal"):format(verbName,
+name, port.type))
+end
+if direction and port.direction ~= direction then
+return err(c, s, ("`%s` takes an %s volume, and %s is %s"):format(verbName,
+direction, name, describePort(port)))
+end
+return port
+end
+
+local function outputSignal(c, s, name, verbName)
+local port = portOf(c, s, name)
+if not port then return nil end
+if port.type == "volume" then
+return err(c, s, ("`%s` drives a signal, and %s is a volume"):format(verbName,
+name))
+end
+if port.direction ~= "output" then
+return err(c, s, ("%s is an input -- it is read, not driven"):format(name))
+end
+return port
+end
+
+local function amount(c, s, n, low, high, what)
+if n < low or n > high then
+err(c, s, ("%s must be %d to %d"):format(what, low, high))
+end
+end
+
+local function statement(c, s, scope)
+local k = s.kind
+if k == "if" then
+condition(c, s.cond, scope, "`if`")
+block(c, s.body, scope)
+if s.orelse then block(c, s.orelse, scope) end
+elseif k == "repeat" then
+amount(c, s, s.n, 1, check.LIMITS.repeatMax, "repeat")
+block(c, s.body, scope)
+elseif k == "supply" or k == "stock" then
+amount(c, s, s.n, 1, check.LIMITS.supplyMax, "the count")
+knownItem(c, s, s.item)
+if volume(c, s, s.port, "input", k) then
+mark(c.footprint.writes, pathOf(c, s.port))
+mark(c.footprint.supplies, s.item)
+verb(c, s, {port = pathOf(c, s.port), item = s.item, count = s.n,
+upto = k == "stock"})
+end
+elseif k == "collect" then
+if volume(c, s, s.port, "output", k) then
+mark(c.footprint.collects, pathOf(c, s.port))
+verb(c, s, {port = pathOf(c, s.port)})
+end
+elseif k == "move" then
+amount(c, s, s.n, 1, check.LIMITS.supplyMax, "the count")
+local from = volume(c, s, s.from, nil, "move")
+local to = volume(c, s, s.to, "input", "move ... to")
+if from and to then
+if s.from == s.to then err(c, s, "moves from a port to itself") end
+mark(c.footprint.writes, pathOf(c, s.to))
+verb(c, s, {from = pathOf(c, s.from), to = pathOf(c, s.to), item = s.item,
+count = s.n})
+end
+elseif k == "set" then
+local port = outputSignal(c, s, s.port, "set")
+if port then
+local v = s.value
+local level
+if port.type == "flag" then
+if v.kind ~= "onoff" then
+return err(c, s, ("%s is a flag: set it to on or off"):format(s.port))
+end
+level = v.value and 15 or 0
+else
+if v.kind ~= "num" then
+return err(c, s, ("%s is a level: set it to 0-15"):format(s.port))
+end
+if v.value > check.LIMITS.level then
+return err(c, s, ("%d is out of range for a level (0-15)")
+:format(v.value))
+end
+level = v.value
+end
+mark(c.footprint.drives, pathOf(c, s.port))
+verb(c, s, {signal = pathOf(c, s.port), level = level})
+end
+elseif k == "pulse" then
+local ticks = durationIn(c, s, s.length, 1, check.LIMITS.pulseMax, "a pulse")
+if outputSignal(c, s, s.port, "pulse") then
+mark(c.footprint.drives, pathOf(c, s.port))
+verb(c, s, {signal = pathOf(c, s.port), length = ticks})
+end
+elseif k == "wait" then
+durationIn(c, s, s.length, 1, check.LIMITS.waitMax, "a wait")
+elseif k == "waituntil" then
+condition(c, s.cond, scope, "`wait until`")
+durationIn(c, s, s.within, check.LIMITS.withinMin, check.LIMITS.waitMax,
+"`within`")
+elseif k == "let" then
+if c.ports[s.name] then
+return err(c, s, ("%s is a port; a let needs its own name"):format(s.name))
+end
+if lookup(scope, s.name) then
+return err(c, s, ("%s is already a name here"):format(s.name))
+end
+local t = exprType(c, s.value, scope)
+if t == "number" or t == "flag" and s.value.kind == "onoff" then
+return err(c, s, "a let names a reading, not a constant")
+end
+if t then scope.names[s.name] = t end
+elseif k == "alarm" then
+if #s.text == 0 or #s.text > check.LIMITS.textMax then
+err(c, s, ("an alarm's text is 1 to %d characters"):format(check.LIMITS.textMax))
+end
+elseif k == "clearalarm" or k == "stop" then
+
+else
+err(c, s, "not a statement: " .. tostring(k))
+end
+end
+
+block = function(c, list, parent)
+local scope = {names = {}, parent = parent}
+for _, s in ipairs(list or {}) do statement(c, s, scope) end
+end
+
+
+
+local function sorted(set)
+local out = {}
+for key in pairs(set) do out[#out + 1] = key end
+table.sort(out)
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function check.check(script, env)
+local c = new(script, env)
+
+if script.lang ~= parse.LANG then
+err(c, script, ("this is language version %s, and this controller knows %d")
+:format(tostring(script.lang), parse.LANG))
+return check.report(c)
+end
+if type(script.machine) ~= "string" then
+err(c, script, "a script starts with `machine <name>`")
+return check.report(c)
+end
+
+
+
+
+local schema = require("mfg.common.script.schema")
+local holes = 0
+schema.each(script, function(n)
+for _, what in ipairs(schema.holes(n)) do
+err(c, n, "fill in " .. what)
+holes = holes + 1
+end
+end)
+if holes > 0 then return check.report(c) end
+
+if #(script.ports or {}) == 0 then
+err(c, script, "a machine needs at least one port")
+end
+
+local declared = {}
+local slotOwner = {}
+for _, port in ipairs(script.ports or {}) do
+if c.ports[port.name] then
+err(c, port, ("%s is declared twice"):format(port.name))
+else
+c.ports[port.name] = port
+local safe = nil
+if port.safe then
+if port.type == "volume" or port.direction ~= "output" then
+err(c, port, "only an output signal has a safe value")
+elseif port.type == "flag" and port.safe.kind ~= "onoff" then
+err(c, port, "a flag is safe on or off")
+elseif port.type == "level" and port.safe.kind ~= "num" then
+err(c, port, "a level is safe at 0-15")
+elseif port.safe.kind == "num" and port.safe.value > check.LIMITS.level then
+err(c, port, "a level is safe at 0-15")
+end
+if port.safe.kind == "onoff" then safe = port.safe.value and 15 or 0
+else safe = port.safe.value end
+end
+
+if port.slots then
+if port.type ~= "volume" then
+err(c, port, "only a volume has slots")
+end
+for _, slot in ipairs(port.slots) do
+if slot < 1 or slot > check.LIMITS.slotMax then
+err(c, port, ("slot %d is out of range (1-%d)"):format(slot,
+check.LIMITS.slotMax))
+elseif slotOwner[slot] then
+err(c, port, ("slot %d is already %s's"):format(slot,
+slotOwner[slot]))
+else
+slotOwner[slot] = port.name
+end
+end
+end
+
+
+local slots = nil
+if port.slots then
+slots = {}
+for i, slot in ipairs(port.slots) do slots[i] = slot end
+end
+declared[#declared + 1] = {name = port.name, kind = port.type,
+direction = port.direction, safe = safe, slots = slots}
+end
+end
+
+if #(script.handlers or {}) == 0 then
+err(c, script, "a script needs at least one handler: every, when or on")
+end
+local seen = {}
+for _, h in ipairs(script.handlers or {}) do
+if h.kind == "every" then
+durationIn(c, h, h.every, check.LIMITS.everyMin, 24 * 72000, "`every`")
+elseif h.kind == "when" then
+condition(c, h.cond, nil, "`when`")
+elseif h.kind == "on" then
+if seen[h.event] then err(c, h, ("`on %s` is written twice"):format(h.event)) end
+seen[h.event] = true
+end
+block(c, h.body, nil)
+end
+
+c.declared = declared
+return check.report(c)
+end
+
+function check.report(c)
+local function order(list)
+table.sort(list, function(a, b)
+if (a.line or 0) ~= (b.line or 0) then return (a.line or 0) < (b.line or 0) end
+return (a.col or 0) < (b.col or 0)
+end)
+return list
+end
+return {
+ok = #c.errors == 0,
+errors = order(c.errors),
+warnings = order(c.warnings),
+ports = c.declared or {},
+footprint = {
+supplies = sorted(c.footprint.supplies),
+writes = sorted(c.footprint.writes),
+collects = sorted(c.footprint.collects),
+drives = sorted(c.footprint.drives),
+reads = sorted(c.footprint.reads),
+},
+}
+end
+
+
+
+
+function check.source(source, env)
+local tree, errors = parse.parse(source)
+if #errors > 0 then
+return {ok = false, errors = errors, warnings = {}, ports = {},
+footprint = {supplies = {}, writes = {}, collects = {}, drives = {},
+reads = {}}, tree = tree}
+end
+local report = check.check(tree, env)
+report.tree = tree
+return report
+end
+
+return check

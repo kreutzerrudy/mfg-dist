@@ -1,0 +1,54 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local index = {}
+
+local listings = {}
+
+function index.reset()
+listings = {}
+end
+
+function index.get(device)
+return listings[device]
+end
+
+function index.put(device, listing, size)
+listings[device] = {listing = listing, size = size}
+end
+
+function index.drop(device)
+listings[device] = nil
+end
+
+
+
+
+
+
+
+
+function index.consumed(device, slot, count)
+local entry = listings[device]
+if not entry or not entry.listing then return end
+
+local stack = entry.listing[slot]
+if not stack then return end
+
+stack.count = stack.count - count
+if stack.count <= 0 then entry.listing[slot] = nil end
+end
+
+return index

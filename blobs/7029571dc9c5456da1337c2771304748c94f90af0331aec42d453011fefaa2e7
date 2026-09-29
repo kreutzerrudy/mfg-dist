@@ -1,0 +1,271 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local enrollment = require("mfg.common.enrollment")
+local leases = require("mfg.controller.leases")
+
+local netkeys = require("netkeys")
+local ip = require("ip")
+local random = require("ccryptolib.random")
+local state = require("mfg.common.state")
+
+local mint = {}
+
+
+local writeFile = state.writeText
+
+
+
+
+
+
+
+function mint.nextAddress(network, prefix)
+local taken = {}
+for _, addr in pairs(netkeys.addresses()) do taken[addr] = true end
+for _, lease in pairs(leases.all()) do
+if lease.address and not lease.consumed then taken[lease.address] = true end
+if lease.consumed and lease.address then taken[lease.address] = true end
+end
+
+local base = ip.network(network, prefix)
+local hosts = 2 ^ (32 - prefix)
+
+
+for offset = 100, hosts - 2 do
+local candidate = base + offset
+if not taken[candidate] then return candidate end
+end
+return nil, "no free address in " .. ip.formatCidr(base, prefix)
+end
+
+
+function mint.writeIdentity(dest, cfg)
+local lines = {
+"instance " .. cfg.instance,
+"secret " .. cfg.secretHex,
+
+
+
+"controller " .. tostring(cfg.controller),
+"address " .. ip.format(cfg.address),
+"name " .. cfg.name,
+
+
+}
+return writeFile(fs.combine(dest, "mfg/enroll.cfg"),
+table.concat(lines, "\n") .. "\n")
+end
+
+
+
+
+
+function mint.writeTrust(dest)
+local exchange = netkeys.publicKey()
+local anchor = netkeys.signerKey() or netkeys.signingKey()
+if not exchange then return false, "this computer has no keypair" end
+if not anchor then return false, "this computer has no signing key to anchor to" end
+
+writeFile(fs.combine(dest, "net/server.key"), netkeys.toHex(exchange))
+writeFile(fs.combine(dest, "net/signer.key"), netkeys.toHex(anchor))
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function mint.writeImage(dest, role, name)
+local repository = require("mfg.controller.repository")
+local configs = require("mfg.controller.configs")
+local apply = require("mfg.boot.apply")
+
+local carried = repository.carries(role)
+local m, why = repository.published(role)
+if not m then
+return false, ("the %s firmware is not published (%s) -- run: mfgctl publish %s")
+:format(role, tostring(why), role)
+end
+
+local intent = configs.get(name)
+if not intent or intent.role ~= role then
+local assigned, assignErr = configs.assign(name, role)
+if not assigned then return false, assignErr end
+end
+local envelope, doc = configs.issue(name)
+if not envelope then return false, doc end
+
+local result, installErr = apply.install(dest, m, envelope, apply.localSource("/"),
+{origin = "mint", signer = netkeys.signingKey(), startup = false,
+partial = not carried})
+if not result then return false, installErr end
+if result.missing > 0 then
+apply.loader().writeTable(fs.combine(dest, "boot/source"), {dist = repository.dist()})
+end
+return true, result.files - result.missing, result.missing
+end
+
+
+
+
+
+
+
+function mint.writeStartup(dest)
+local zero, why = require("mfg.boot.apply").stageZero()
+if not zero then return false, why end
+return writeFile(fs.combine(dest, "startup.lua"), zero)
+end
+
+function mint.writeSettings(dest, cfg)
+writeFile(fs.combine(dest, "net/role"), "client")
+writeFile(fs.combine(dest, "net/hostname"), cfg.name)
+writeFile(fs.combine(dest, "net/substrate"), netkeys.substrate() or "hopnet")
+
+
+
+
+
+
+
+
+
+
+
+
+
+local policy = state.readText("/net/ports")
+if policy then writeFile(fs.combine(dest, "net/ports"), policy) end
+
+return true
+end
+
+
+
+
+
+
+
+
+function mint.node(dest, opts)
+opts = opts or {}
+local role = opts.role or "turtle"
+local network, prefix = opts.network, opts.prefix
+if not network then return nil, "mint needs the subnet to allocate from" end
+
+local address, addrErr = opts.address, nil
+if not address then
+address, addrErr = mint.nextAddress(network, prefix)
+if not address then return nil, addrErr end
+end
+
+local instance = opts.instance or
+("%d-%d"):format(os.getComputerID(), os.epoch("utc"))
+
+
+
+
+
+
+
+
+if not random.isInit() then random.initWithTiming() end
+
+local secret = random.random(enrollment.SECRET_BYTES)
+local name = opts.name or "craft_turtle"
+
+local lease, leaseErr = leases.issue(instance, secret, address, name, role,
+opts.ttl)
+if not lease then return nil, leaseErr end
+
+local cfg = {
+instance = instance,
+secretHex = enrollment.toHex(secret),
+controller = opts.controller or os.getComputerID(),
+address = address,
+name = name,
+role = role,
+}
+
+
+
+
+
+
+local imaged, imageErr, toFetch = mint.writeImage(dest, role, name)
+if not imaged then return nil, imageErr end
+cfg.toFetch = toFetch
+
+if not mint.writeIdentity(dest, cfg) then
+return nil, "could not write the enrollment config"
+end
+local trusted, trustErr = mint.writeTrust(dest)
+if not trusted then return nil, trustErr end
+mint.writeSettings(dest, cfg)
+
+
+local started, startErr = mint.writeStartup(dest)
+if not started then return nil, startErr end
+
+return lease, cfg
+end
+
+return mint

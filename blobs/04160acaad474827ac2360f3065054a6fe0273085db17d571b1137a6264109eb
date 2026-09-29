@@ -1,0 +1,39 @@
+local rpc = require("mfg.common.rpc")
+local schema = require("mfg.common.config.schema")
+local configs = require("mfg.controller.configs")
+
+
+
+
+
+
+
+
+
+
+local names = {}
+for _, param in ipairs(schema.parameters) do names[#names + 1] = param.name end
+
+return {
+name        = "set_config",
+label       = "Set a node's setting",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "node", label = "Node", type = "node", required = true},
+{name = "key", label = "Setting", type = "choice", required = true,
+choices = names},
+{name = "value", label = "Value", type = "text", required = false,
+help = "Omit to clear it back to the default."},
+},
+
+returns = {node = "text", rev = "number"},
+
+run = function(params)
+local record, why = configs.set(params.node, params.key, params.value)
+if not record then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {node = params.node, rev = record.rev}
+end,
+}

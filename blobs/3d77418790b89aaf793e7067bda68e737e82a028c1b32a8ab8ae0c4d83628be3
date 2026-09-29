@@ -1,0 +1,27 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+return {
+name        = "disable_machine",
+label       = "Disable a machine",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "machine", label = "Machine", type = "text", required = true},
+},
+
+returns = {},
+
+run = function(params)
+local record = scripts.disable(params.machine)
+if not record then
+return rpc.REJECTED, {reason = "no machine called " .. params.machine}
+end
+return rpc.COMPLETED, {}
+end,
+}

@@ -1,0 +1,130 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local net = require("net")
+
+local rpc = {}
+
+rpc.ACCEPTED = "accepted"
+rpc.COMPLETED = "completed"
+rpc.REJECTED = "rejected"
+rpc.TIMED_OUT = "timed_out"
+
+rpc.DEFAULT_TIMEOUT = 4
+rpc.DEFAULT_ATTEMPTS = 3
+
+local counter = 0
+
+
+
+
+function rpc.newId()
+counter = counter + 1
+return ("%d:%d"):format(os.getComputerID(), counter)
+end
+
+local function reply(id, status, fields)
+local out = fields or {}
+out.rpc = id
+out.status = status
+return out
+end
+
+rpc.reply = reply
+
+
+
+
+
+
+
+function rpc.request(target, service, body, opts)
+opts = opts or {}
+local timeout = opts.timeout or rpc.DEFAULT_TIMEOUT
+local attempts = opts.attempts or rpc.DEFAULT_ATTEMPTS
+
+local id = opts.id or rpc.newId()
+local message = {}
+for k, v in pairs(body or {}) do message[k] = v end
+message.rpc = id
+
+local lastError = nil
+
+for attempt = 1, attempts do
+local sent, sendErr = net.send(target, service, message)
+if not sent then
+
+
+
+return {status = rpc.REJECTED, reason = tostring(sendErr),
+rpc = id, attempts = attempt}
+end
+
+local deadline = os.epoch("utc") + timeout * 1000
+while os.epoch("utc") < deadline do
+local packet = net.receive(service, 1)
+if packet and type(packet.body) == "table"
+and packet.body.rpc == id then
+local answer = packet.body
+answer.from = packet.from
+answer.src = packet.src
+answer.encrypted = packet.encrypted
+answer.attempts = attempt
+return answer
+end
+end
+lastError = ("no reply within %ds"):format(timeout)
+end
+
+
+
+
+return {status = rpc.TIMED_OUT, reason = lastError, rpc = id,
+attempts = attempts}
+end
+
+
+
+
+
+
+
+function rpc.serveOnce(service, handler, timeout)
+local packet = net.receive(service, timeout or 1)
+if not packet then return false end
+if type(packet.body) ~= "table" or not packet.body.rpc then return false end
+
+local id = packet.body.rpc
+local ok, status, fields = pcall(handler, packet.body, packet)
+
+if not ok then
+net.send(packet.src, service,
+reply(id, rpc.REJECTED, {reason = "handler error: " .. tostring(status)}))
+return true
+end
+
+if not status then
+net.send(packet.src, service,
+reply(id, rpc.REJECTED, {reason = "unhandled command"}))
+return true
+end
+
+net.send(packet.src, service, reply(id, status, fields))
+return true
+end
+
+return rpc

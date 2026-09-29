@@ -1,0 +1,104 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+local node = require("mfg.turtle.node")
+
+local rtu = {}
+
+local COMMANDS = {}
+
+function COMMANDS.points()
+return rpc.COMPLETED, {points = node.points()}
+end
+
+function COMMANDS.stop()
+
+
+
+
+return rpc.COMPLETED, {stopped = true, note = "nothing runs between requests"}
+end
+
+function COMMANDS.clear_fault()
+local ok, err = node.clearFault()
+if not ok then return rpc.REJECTED, {reason = tostring(err)} end
+return rpc.COMPLETED, {state = node.state()}
+end
+
+
+
+
+
+
+
+function COMMANDS.probe_observe()
+return rpc.COMPLETED, {observed = node.observe()}
+end
+
+
+
+function COMMANDS.probe_emit(body)
+local ok, err = node.emitMarker(body.marker)
+if not ok then return rpc.REJECTED, {reason = tostring(err)} end
+return rpc.COMPLETED, {emitted = body.marker}
+end
+
+
+
+
+
+
+
+
+
+
+function COMMANDS.set_label(body)
+local label = body.label
+if type(label) ~= "string" or label == "" then
+return rpc.REJECTED, {reason = "a label is required"}
+end
+
+
+if label:find("%s") then
+return rpc.REJECTED, {reason = "a label cannot contain whitespace"}
+end
+
+local ok, err = pcall(os.setComputerLabel, label)
+if not ok then return rpc.REJECTED, {reason = tostring(err)} end
+
+return rpc.COMPLETED, {label = os.getComputerLabel()}
+end
+
+function rtu.handle(body, packet)
+local command = body.command
+local handler = COMMANDS[command]
+
+if not handler then
+
+
+print(("rejected unknown command '%s' from %s"):format(
+tostring(command), tostring(packet and packet.src)))
+return rpc.REJECTED, {reason = "unknown command: " .. tostring(command)}
+end
+
+return handler(body, packet)
+end
+
+return rtu

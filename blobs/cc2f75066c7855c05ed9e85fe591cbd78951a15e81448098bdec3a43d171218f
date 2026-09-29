@@ -1,0 +1,98 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local services = require("mfg.common.services")
+
+local hmi = {}
+
+
+
+local function displayBackend()
+local hal = require("mfg.common.hal")
+if hal.mode() == "mock" then return require("mfg.hmi.hal.display_mock") end
+return require("mfg.hmi.hal.display_real")
+end
+
+function hmi.declare(manager, ctx)
+
+
+
+
+local onTerminal = displayBackend().attached() == "terminal"
+
+
+
+
+services.declare(manager, {
+name = "panel",
+requires = {"netstack"},
+ready = ctx.admitted,
+terminal = onTerminal,
+start = function()
+local panel = require("mfg.hmi.panel")
+local hostmod = require("mfg.hmi.host")
+local config = require("mfg.common.config")
+
+
+
+local host = config.setting("controller")
+local display = displayBackend()
+services.log(manager, "panel",
+("driving %s on a %s"):format(host, display.attached()))
+
+
+
+if display.invalidate then display.invalidate() end
+
+
+
+
+
+ctx.bind({"mfg-scada"})
+
+local screen = hostmod.new({
+host = host,
+source = config.setting("source"),
+display = display,
+transport = panel.transport(host),
+})
+
+
+local ok, err = pcall(hostmod.run, screen)
+if display.restore then pcall(display.restore) end
+if not ok then error(err, 0) end
+end,
+})
+end
+
+return hmi

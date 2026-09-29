@@ -1,0 +1,362 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local schematic = require("mfg.turtle.schematic")
+local odometry = require("mfg.turtle.odometry")
+
+local nav = {}
+
+local map = nil
+
+function nav.use(loaded)
+map = loaded
+return map
+end
+
+function nav.map()
+return map
+end
+
+
+
+
+
+
+
+function nav.at()
+if not map then return nil end
+local here = odometry.position()
+
+for name, entry in pairs(map.places) do
+if entry.stand and schematic.same(entry.stand, here) then
+return name, "stand"
+end
+end
+for name, entry in pairs(map.places) do
+if entry.approach and schematic.same(entry.approach, here) then
+return name, "approach"
+end
+end
+return nil
+end
+
+
+
+
+
+
+local function findRoute(from, to)
+if from == to then return {from} end
+
+local seen = {[from] = true}
+local queue = {{from}}
+local head = 1
+
+while head <= #queue do
+local path = queue[head]
+head = head + 1
+local last = path[#path]
+
+local neighbours = {}
+for target in pairs(map.corridors[last] or {}) do
+neighbours[target] = true
+end
+
+
+for source, targets in pairs(map.corridors) do
+if targets[last] then neighbours[source] = true end
+end
+
+for neighbour in pairs(neighbours) do
+if not seen[neighbour] then
+seen[neighbour] = true
+local extended = {}
+for _, step in ipairs(path) do extended[#extended + 1] = step end
+extended[#extended + 1] = neighbour
+if neighbour == to then return extended end
+queue[#queue + 1] = extended
+end
+end
+end
+
+return nil
+end
+
+
+
+local function cellsFor(hops)
+local cells, floors = {}, {}
+
+for i = 2, #hops do
+local waypoints, floor = schematic.route(map, hops[i - 1], hops[i])
+if not waypoints then
+return nil, ("no corridor between %s and %s"):format(hops[i - 1], hops[i])
+end
+
+local expanded, why = schematic.expand(waypoints)
+if not expanded then return nil, why end
+
+for _, cell in ipairs(expanded) do
+
+
+local previous = cells[#cells]
+if not (previous and schematic.same(previous, cell)) then
+cells[#cells + 1] = cell
+floors[#cells] = floor
+end
+end
+end
+
+return cells, floors
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+function nav.travel(cells, floors)
+if not cells or #cells == 0 then return false, "nothing to travel" end
+
+for index, cell in ipairs(cells) do
+local here = odometry.position()
+
+if not schematic.same(here, cell) then
+local direction = schematic.directionFrom(here, cell)
+if not direction then
+
+
+
+odometry.distrust("route stepped to a non-adjacent cell")
+return false, ("cannot step from %d,%d,%d to %d,%d,%d -- not adjacent")
+:format(here.x, here.y, here.z, cell.x, cell.y, cell.z)
+end
+
+local moved, why = odometry.go(direction)
+if not moved then
+return false, ("blocked at cell %d of %d: %s"):format(index,
+#cells, tostring(why))
+end
+end
+
+local expected = floors and floors[index]
+if expected then
+local under = odometry.floor()
+if under ~= expected then
+
+
+odometry.distrust("floor did not match the corridor")
+return false, ("off path at %d,%d,%d: floor is %s, corridor declares %s")
+:format(cell.x, cell.y, cell.z, tostring(under), expected)
+end
+end
+end
+
+return true
+end
+
+
+
+local function plan(destination)
+if not map then return nil, "no schematic loaded" end
+
+
+
+if not odometry.trusted() then
+return nil, "position is untrusted -- re-localise before planning a route"
+end
+
+local here = nav.at()
+if not here then
+local p = odometry.position()
+return nil, ("not at a named place (%d,%d,%d) -- routes run between declared "
+.. "places"):format(p.x, p.y, p.z)
+end
+
+local hops = findRoute(here, destination)
+if not hops then
+return nil, ("no declared corridor route from %s to %s"):format(here,
+destination)
+end
+return hops
+end
+
+nav.plan = plan
+
+
+function nav.goto(name)
+local target, why = schematic.standAt(map, name)
+if not target then return false, why end
+
+local hops, planErr = plan(name)
+if not hops then return false, planErr end
+
+local cells, floors = cellsFor(hops)
+if cells then
+local travelled, travelErr = nav.travel(cells, floors)
+if not travelled then return false, travelErr end
+end
+
+
+
+local here = odometry.position()
+if not schematic.same(here, target) then
+local direction = schematic.directionFrom(here, target)
+if not direction then
+return false, ("arrived at %d,%d,%d, which is not beside %s")
+:format(here.x, here.y, here.z, name)
+end
+local moved, moveErr = odometry.go(direction)
+if not moved then return false, moveErr end
+end
+
+return true
+end
+
+
+
+function nav.approach(name)
+local target, facing = schematic.approachTo(map, name)
+if not target then return false, facing end
+
+local hops, planErr = plan(name)
+if not hops then return false, planErr end
+
+local cells, floors = cellsFor(hops)
+if cells then
+local travelled, travelErr = nav.travel(cells, floors)
+if not travelled then return false, travelErr end
+end
+
+local here = odometry.position()
+if not schematic.same(here, target) then
+return false, ("route ended at %d,%d,%d, not at %s's approach %d,%d,%d")
+:format(here.x, here.y, here.z, name, target.x, target.y, target.z)
+end
+
+local turned, turnErr = odometry.face(facing)
+if not turned then return false, turnErr end
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+local function fixFrom(side, label)
+local candidates = schematic.landmarkCells(map, label)
+if not candidates then return nil end
+
+local viable, seen = {}, {}
+for _, candidate in ipairs(candidates) do
+local deduced = odometry.deduce(side, candidate.cell)
+if deduced then
+
+
+local options = deduced.position and {deduced} or deduced
+for _, option in ipairs(options) do
+local facing = option.facing or odometry.facing()
+if schematic.navigable(map, option.position) then
+local mark = schematic.key(option.position.x, option.position.y,
+option.position.z) .. "/" .. tostring(facing)
+if not seen[mark] then
+seen[mark] = true
+viable[#viable + 1] = {position = option.position,
+facing = facing, what = candidate.what}
+end
+end
+end
+end
+end
+
+if #viable ~= 1 then return nil end
+return viable[1]
+end
+
+
+local function scanOnce()
+for side, peer in pairs(odometry.neighbours()) do
+local fix = fixFrom(side, peer.label)
+if fix then
+odometry.fix(fix.position, fix.facing,
+("landmark %s (%s) on %s"):format(peer.label, fix.what, side))
+return true, "fixed by " .. peer.label
+end
+end
+return false
+end
+
+
+
+
+
+function nav.relocalise(opts)
+opts = opts or {}
+if not map then return false, "no schematic loaded" end
+if odometry.trusted() then return true, "already trusted" end
+
+
+
+for _ = 1, 4 do
+local fixed, how = scanOnce()
+if fixed then return true, how end
+odometry.face(schematic.right(odometry.facing()))
+end
+
+
+
+
+
+
+
+local floors = opts.floors or {}
+local steps = opts.search or 8
+
+if opts.direction and floors.expected then
+for _ = 1, steps do
+local under = odometry.floor()
+if under ~= floors.expected then
+
+
+return false, ("off path: floor is %s, expected %s"):format(
+tostring(under), floors.expected)
+end
+
+local moved = odometry.go(opts.direction)
+if not moved then break end
+
+local fixed, how = scanOnce()
+if fixed then return true, how end
+end
+end
+
+
+return false, "no landmark found -- stopped rather than searching blind"
+end
+
+return nav

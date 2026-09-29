@@ -1,0 +1,286 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local firmware = require("mfg.common.firmware")
+local config = require("mfg.common.config")
+local state = require("mfg.common.state")
+
+local apply = {}
+
+local function P(root, path) return fs.combine(root or "/", path) end
+
+local loaderLib
+local function loader()
+if not loaderLib then
+local fn, err = loadfile("/mfg/boot/loader.lua", nil, _ENV)
+if not fn then error("cannot load stage 0 as a library: " .. tostring(err), 0) end
+loaderLib = fn("--lib")
+end
+return loaderLib
+end
+apply.loader = loader
+
+
+
+function apply.stageZero()
+local text = state.readText("/mfg/boot/loader.lua")
+if not text then return nil, "no stage 0 at /mfg/boot/loader.lua" end
+local fn, err = load(text, "=startup", "t", {})
+if not fn then return nil, "stage 0 does not compile: " .. tostring(err) end
+return text
+end
+
+local function writeBytes(path, bytes)
+return state.writeText(path, bytes, true)
+end
+
+
+
+local function fetch(source, f)
+local ok, bytes = pcall(source, f.path, f.sha256)
+if not ok then return nil, ("%s: %s"):format(f.path, tostring(bytes)) end
+if type(bytes) ~= "string" then return nil, f.path .. ": the source returned nothing" end
+if #bytes ~= f.size or firmware.hashBytes(bytes) ~= f.sha256 then
+return nil, f.path .. ": does not match the manifest"
+end
+return bytes
+end
+
+apply.fetch = fetch
+
+
+function apply.localSource(from)
+return function(path)
+local bytes = state.readText(P(from or "/", path), true)
+if not bytes then error("not on this computer", 0) end
+return bytes
+end
+end
+
+
+
+
+function apply.httpSource(dist)
+dist = tostring(dist or ""):gsub("/+$", "")
+return function(_, sha)
+if not http then error("this computer has no http API", 0) end
+local handle, why = http.get(dist .. "/blobs/" .. sha, nil, true)
+if not handle then error(("%s: %s"):format(dist, tostring(why)), 0) end
+local bytes = handle.readAll()
+handle.close()
+return bytes
+end
+end
+
+
+local function present(root, f)
+local path = P(root, f.path)
+if not fs.exists(path) or fs.getSize(path) ~= f.size then return false end
+return firmware.hashFile(path) == f.sha256
+end
+
+
+local function newRecord(m, doc, extra)
+local record = {active = m.id, rev = doc.rev, role = doc.role, state = "trial", tries = 0}
+for k, v in pairs(extra or {}) do record[k] = v end
+return record
+end
+
+
+
+
+
+
+
+function apply.install(root, m, envelope, source, opts)
+opts = opts or {}
+local doc, why = config.decode(envelope)
+if not doc then return nil, why end
+if doc.firmware ~= m.id then
+return nil, ("the config requires firmware %s, not %s"):format(tostring(doc.firmware), m.id)
+end
+local zero, zeroWhy = apply.stageZero()
+if not zero then return nil, zeroWhy end
+
+local tick = firmware.yielder()
+local missing = 0
+for _, f in ipairs(m.files) do
+local bytes, bad = fetch(source, f)
+if bytes then
+if not writeBytes(P(root, f.path), bytes) then return nil, "could not write " .. f.path end
+elseif opts.partial then
+missing = missing + 1
+else
+return nil, bad
+end
+tick()
+end
+
+local L = loader()
+firmware.write(P(root, "boot/firmware"), m)
+L.writeTable(P(root, "boot/config"), envelope)
+if opts.signer then
+writeBytes(P(root, "boot/signer"), require("ccryptolib.util").toHex(opts.signer) .. "\n")
+end
+L.writeRecord(root, newRecord(m, doc, {origin = opts.origin or "mint",
+state = missing > 0 and "fetching" or nil}))
+
+
+if opts.startup ~= false then writeBytes(P(root, "startup.lua"), zero) end
+return {files = #m.files, firmware = m.id, rev = doc.rev, missing = missing}
+end
+
+
+
+
+
+
+
+function apply.complete(root, m, source)
+local tick, wrote = firmware.yielder(), 0
+for _, f in ipairs(m.files) do
+if not present(root, f) then
+local bytes, bad = fetch(source, f)
+if not bytes then return nil, bad end
+if not writeBytes(P(root, f.path), bytes) then return nil, "could not write " .. f.path end
+wrote = wrote + 1
+end
+tick()
+end
+return wrote
+end
+
+
+
+
+
+function apply.stage(root, m, envelope, source)
+local doc, why = config.decode(envelope)
+if not doc then return nil, why end
+if doc.firmware ~= m.id then
+return nil, ("the config requires firmware %s, not %s"):format(tostring(doc.firmware), m.id)
+end
+if doc.role ~= m.role then
+return nil, ("a %s config cannot boot %s firmware"):format(doc.role, m.role)
+end
+
+local active = firmware.read(P(root, "boot/firmware"))
+local have = {}
+for _, f in ipairs(active and active.files or {}) do have[f.path] = f.sha256 end
+
+local staging = P(root, "boot/stage")
+if fs.exists(staging) then fs.delete(staging) end
+
+local tick, fetched = firmware.yielder(), 0
+for _, f in ipairs(m.files) do
+if have[f.path] ~= f.sha256 or not fs.exists(P(root, f.path)) then
+local bytes, bad = fetch(source, f)
+if not bytes then fs.delete(staging) return nil, bad end
+writeBytes(fs.combine(staging, "files/" .. f.path), bytes)
+fetched = fetched + 1
+end
+tick()
+end
+firmware.write(fs.combine(staging, "firmware"), m)
+loader().writeTable(fs.combine(staging, "config"), envelope)
+return {fetched = fetched, files = #m.files, firmware = m.id, rev = doc.rev}
+end
+
+
+
+function apply.activate(root, opts)
+opts = opts or {}
+local L = loader()
+local staging = P(root, "boot/stage")
+local new, why = firmware.read(fs.combine(staging, "firmware"))
+if not new then return nil, "nothing staged: " .. tostring(why) end
+local newDoc, docWhy = config.decode(L.readTable(fs.combine(staging, "config")))
+if not newDoc then return nil, docWhy end
+
+local oldPaths = L.manifestPaths(P(root, "boot/firmware")) or {}
+local oldEnvelope = L.readTable(P(root, "boot/config"))
+local oldDoc = oldEnvelope and config.decode(oldEnvelope) or nil
+local oldRecord = L.record(root) or {}
+
+local newPaths = {}
+for _, f in ipairs(new.files) do newPaths[f.path] = true end
+
+local steps = {{"delete", "boot/prev"}}
+
+for _, rel in ipairs(L.listFiles(fs.combine(staging, "files"))) do
+if fs.exists(P(root, rel)) then steps[#steps + 1] = {"move", rel, "boot/prev/files/" .. rel} end
+steps[#steps + 1] = {"move", "boot/stage/files/" .. rel, rel}
+end
+
+
+
+local pruned = {}
+for path in pairs(oldPaths) do
+if not newPaths[path] and fs.exists(P(root, path)) then pruned[#pruned + 1] = path end
+end
+table.sort(pruned)
+for _, path in ipairs(pruned) do
+steps[#steps + 1] = {"move", path, "boot/prev/files/" .. path}
+end
+
+
+if oldDoc and oldDoc.role ~= newDoc.role then
+for _, rel in ipairs(L.listFiles(P(root, "mfg/state"))) do
+if rel ~= "actions" and rel ~= "actions.new" then
+steps[#steps + 1] = {"move", "mfg/state/" .. rel, "boot/prev/state/" .. rel}
+end
+end
+end
+
+for _, name in ipairs({"firmware", "config"}) do
+if fs.exists(P(root, "boot/" .. name)) then
+steps[#steps + 1] = {"move", "boot/" .. name, "boot/prev/" .. name}
+end
+steps[#steps + 1] = {"move", "boot/stage/" .. name, "boot/" .. name}
+end
+
+L.writeTable(fs.combine(staging, "record"), newRecord(new, newDoc, {
+prev = oldRecord.active, prev_rev = oldRecord.rev, origin = opts.origin or "update",
+}))
+if fs.exists(P(root, "boot/record")) then
+steps[#steps + 1] = {"move", "boot/record", "boot/prev/record"}
+end
+steps[#steps + 1] = {"move", "boot/stage/record", "boot/record"}
+steps[#steps + 1] = {"delete", "boot/stage"}
+
+L.writeJournal(root, steps, "activate")
+L.replay(root, opts.limit)
+return #steps
+end
+
+function apply.rollback(root, why)
+return loader().rollback(root, why)
+end
+
+return apply

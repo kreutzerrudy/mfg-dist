@@ -1,0 +1,164 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local firmware = require("mfg.common.firmware")
+
+local repository = {}
+
+repository.DIR = "/mfg/firmware"
+
+function repository.builtPath(role, dir)
+return fs.combine(dir or repository.DIR, role .. ".manifest")
+end
+
+function repository.publishedPath(role, dir)
+return fs.combine(dir or repository.DIR, role .. ".published")
+end
+
+
+
+
+function repository.published(role, opts)
+opts = opts or {}
+local m, why = firmware.read(repository.publishedPath(role, opts.dir))
+if not m then return nil, why end
+if m.role ~= role then return nil, ("%s.published names role %s"):format(role, tostring(m.role)) end
+
+
+local anchor = opts.anchor
+if not anchor then
+if not fs.exists("/net/sign.key") then return nil, "this controller has never signed anything" end
+anchor = require("netkeys").signingKey()
+end
+local ok, bad = firmware.verify(m, {anchor})
+if not ok then return nil, bad end
+return m
+end
+
+
+
+
+
+function repository.carries(role, dir)
+if fs.exists(repository.builtPath(role, dir)) then return true end
+return false, ("this controller does not carry the %s files (spec/delivery-draft.md "
+.. "GD3.1): they come from the dist repo"):format(role)
+end
+
+
+function repository.dist()
+return require("mfg.common.config").setting("dist")
+end
+
+
+
+function repository.build(root)
+local m, why = firmware.read(fs.combine(root or "/", "boot/firmware"))
+if not m then return nil, why end
+if not m.source then return nil, "this controller's firmware names no source build" end
+return (m.source:gsub(" ", "_"))
+end
+
+
+
+function repository.fetchBuilt(role, dist, build)
+if not http then return nil, "this computer has no http API to reach the dist repo" end
+local url = ("%s/builds/%s/%s.manifest"):format(tostring(dist):gsub("/+$", ""), build, role)
+local handle, why = http.get(url, nil, true)
+if not handle then
+return nil, ("the dist repo has no %s manifest for build %s (%s) -- run "
+.. "tools/publish.sh for this build"):format(role, build, tostring(why))
+end
+local text = handle.readAll()
+handle.close()
+return firmware.parse(text)
+end
+
+
+
+
+
+
+function repository.publish(role, opts)
+opts = opts or {}
+local root = opts.root or "/"
+local carried = repository.carries(role, opts.dir)
+
+local m, why, source
+if carried then
+m, why = firmware.read(repository.builtPath(role, opts.dir))
+else
+local build, buildWhy = opts.build, nil
+if not build then build, buildWhy = repository.build(root) end
+if not build then return nil, buildWhy end
+local dist = opts.dist or repository.dist()
+m, why = repository.fetchBuilt(role, dist, build)
+source = require("mfg.boot.apply").httpSource(dist)
+end
+if not m then return nil, why end
+if m.role ~= role then
+return nil, ("the manifest for %s names role %s"):format(role, tostring(m.role))
+end
+
+local mismatched, oversize, bytes, fetched = {}, {}, 0, 0
+local tick = firmware.yielder()
+local fetch = require("mfg.boot.apply").fetch
+for _, f in ipairs(m.files) do
+if f.size > firmware.MAX_FILE then oversize[#oversize + 1] = ("%s (%d bytes)"):format(f.path, f.size) end
+local sum, size = firmware.hashFile(fs.combine(root, f.path))
+if sum ~= f.sha256 or size ~= f.size then
+
+local got = source and fetch(source, f)
+if got then
+fetched = fetched + 1
+else
+mismatched[#mismatched + 1] = f.path .. (sum and "" or " (missing)")
+end
+end
+bytes = bytes + f.size
+tick()
+end
+
+if #oversize > 0 then
+return nil, ("%d file(s) larger than %d bytes cannot travel one per message: %s"):format(
+#oversize, firmware.MAX_FILE, table.concat(oversize, ", ")), {oversize = oversize}
+end
+if #mismatched > 0 then
+local shown = {}
+for i = 1, math.min(#mismatched, 5) do shown[i] = mismatched[i] end
+return nil, ("%d file(s) %s do not match the %s manifest: %s%s"):format(
+#mismatched, source and "in the dist repo" or "on this controller", role,
+table.concat(shown, ", "), #mismatched > 5 and ", ..." or ""),
+{mismatched = mismatched}
+end
+
+firmware.sign(m)
+local ok, bad = firmware.write(repository.publishedPath(role, opts.dir), m)
+if not ok then return nil, bad end
+m.bytes, m.fetched = bytes, fetched
+return m
+end
+
+return repository

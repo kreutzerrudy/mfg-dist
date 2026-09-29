@@ -1,0 +1,416 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local hal = require("mfg.common.hal")
+local store = require("mfg.storage")
+local mount = require("mfg.storage.mount")
+
+local args = {...}
+local quick = false
+for _, a in ipairs(args) do if a == "--quick" then quick = true end end
+
+local FILE = "/storecheck-results.txt"
+
+local findings = 0
+local mismatches = {}
+
+local function append(text)
+local handle = fs.open(FILE, fs.exists(FILE) and "a" or "w")
+if not handle then return end
+handle.write(text .. "\n")
+handle.close()
+end
+
+
+
+
+local function say(label, value)
+local line = ("  %-46s %s"):format(label, tostring(value))
+print(line)
+append(line)
+findings = findings + 1
+end
+
+local function note(text)
+print("    " .. text)
+append("    " .. text)
+end
+
+
+
+
+local function expect(label, got, want, why)
+local ok = got == want
+say(label .. (ok and "  [MATCHES]" or "  [DIFFERS]"), got)
+if not ok then
+mismatches[#mismatches + 1] = ("%s: got %s, code assumes %s -- %s")
+:format(label, tostring(got), tostring(want), why or "")
+end
+return ok
+end
+
+local function heading(text)
+print("")
+print("== " .. text)
+append("")
+append("== " .. text)
+end
+
+append("")
+append("=== storecheck " .. os.date("%Y-%m-%d %H:%M:%S") .. " ===")
+print("storecheck -- writing to " .. FILE)
+
+
+
+heading("bindings")
+
+local inv = hal.inventory()
+
+if not store.isBound("/pool") then
+printError("/pool is not bound")
+print("run: mfgctl bind /pool <name>   (mfgctl peripherals lists candidates)")
+append("ABORTED: /pool not bound")
+return
+end
+
+local status = store.status("/pool")
+say("/pool devices", table.concat(status.devices, ", "))
+say("/pool coherence", status.coherence)
+if status.degraded then
+printError("  DEGRADED, missing: " .. table.concat(status.missing, ", "))
+append("  DEGRADED, missing: " .. table.concat(status.missing, ", "))
+note("a missing device is a commissioning fault, not a transient error (S6.8)")
+note("re-activate its wired modem, or rebind /pool, before trusting figures")
+end
+
+local unclaimed = store.unclaimed()
+say("unclaimed inventories on the network", #unclaimed)
+for _, device in ipairs(unclaimed) do note("unclaimed, never written to: " .. device) end
+
+local slots = store.slots("/pool")
+say("/pool slots total / used / free",
+("%d / %d / %d"):format(slots.total, slots.used, slots.free))
+say("/pool distinct item keys", slots.keys)
+say("/pool reclaimable slots (upper bound)", slots.reclaimable)
+
+
+
+
+
+
+
+heading("item identity: does list() carry nbt?")
+
+local sawNbtField, sampleItem, sampleDevice, sampleSlot = false, nil, nil, nil
+for _, device in ipairs(status.devices) do
+for slot, stack in pairs(inv.list(device) or {}) do
+if not sampleItem then
+sampleItem, sampleDevice, sampleSlot = stack.name, device, slot
+end
+if stack.nbt ~= nil then sawNbtField = true end
+end
+end
+
+if not sampleItem then
+printError("/pool is empty -- put ~100 of one stacking item in it and re-run")
+append("ABORTED: /pool empty")
+return
+end
+
+say("a sample item", sampleItem)
+say("any stack reported an nbt field", sawNbtField)
+if not sawNbtField then
+note("NOT a failure by itself: plain items legitimately have no nbt.")
+note("It means this run could not confirm nbt reporting works. Put an")
+note("ENCHANTED or NAMED item in /pool and re-run to settle it.")
+note("If nbt is never reported, keys degrade to ids alone (S4.5) and two")
+note("variants of one id would be treated as fungible -- the one failure here")
+note("that can actually mix items.")
+end
+
+
+
+
+
+
+
+
+
+
+heading("item attributes: maxCount and tags")
+
+local detail = inv.detail(sampleDevice, sampleSlot)
+if not detail then
+say("getItemDetail returned", "nil -- attributes unavailable")
+note("room() would fall back to an assumed 64 and report exact=false (S5.4)")
+else
+say("detail.name", detail.name)
+say("detail.maxCount", tostring(detail.maxCount))
+say("detail.displayName", tostring(detail.displayName))
+
+
+
+
+local tagCount, firstTags, vanilla = 0, {}, {}
+for tag in pairs(detail.tags or {}) do
+tagCount = tagCount + 1
+if tag:sub(1, 10) == "minecraft:" then vanilla[#vanilla + 1] = tag
+elseif #firstTags < 4 then firstTags[#firstTags + 1] = tag end
+end
+table.sort(vanilla)
+for _, tag in ipairs(vanilla) do table.insert(firstTags, 1, tag) end
+while #firstTags > 4 do table.remove(firstTags) end
+say("detail.tags count", tagCount)
+if tagCount > 0 then
+note("tags: " .. table.concat(firstTags, ", ") .. (tagCount > 4 and ", ..." or ""))
+note("tag selectors are viable -- '#" .. (firstTags[1] or "?") .. "' would match this")
+else
+note("NO TAGS reported. Tag-shaped bills of material (S10.3) would not")
+note("work on this pack, and recipes must stay keyed on exact ids.")
+end
+
+
+local wrapped = peripheral.wrap(sampleDevice)
+if wrapped and wrapped.getItemLimit then
+local ok, limit = pcall(wrapped.getItemLimit, sampleSlot)
+say("getItemLimit for the same slot (NEVER used)", ok and tostring(limit) or "error")
+if ok and detail.maxCount and limit ~= detail.maxCount then
+note("CONFIRMED still wrong: getItemLimit disagrees with maxCount.")
+note("S5.3 forbids asking the container, and this is why.")
+elseif ok and detail.maxCount and limit == detail.maxCount then
+note("they agree on this pack now -- S5.3 still stands, since believing")
+note("what a transfer RETURNED costs nothing and cannot be wrong (S5.5)")
+end
+end
+end
+
+
+
+heading("capacity: room() is advisory, and reality is the judge")
+
+local roomFor, exact = store.room("/pool", sampleItem)
+say("room for " .. sampleItem, ("%d (exact=%s)"):format(roomFor, tostring(exact)))
+say("free slots", slots.free)
+note("these are two independent numbers, deliberately (S5.1): a volume can be")
+note("full of partial stacks with no slot left for a NEW item type")
+
+local newTypeRoom = store.room("/pool", "minecraft:bedrock")
+say("room for an item type not present", newTypeRoom)
+if slots.free == 0 and newTypeRoom ~= 0 then
+mismatches[#mismatches + 1] =
+"room reported space for a new item type with zero free slots"
+end
+
+if quick then
+heading("done (--quick: movement probes skipped)")
+say("findings recorded", findings)
+return
+end
+
+
+
+
+
+
+
+
+heading("S8.11: may an inventory push to itself?")
+
+local selfDevice = status.devices[1]
+
+
+
+
+
+
+
+
+
+
+local function slotsHolding(device, item)
+local found = {}
+for slot, stack in pairs(inv.list(device) or {}) do
+if stack.name == item then
+found[#found + 1] = {slot = slot, count = stack.count}
+end
+end
+table.sort(found, function(a, b) return a.count < b.count end)
+return found
+end
+
+local function firstEmptySlot(device)
+local listing = inv.list(device) or {}
+local size = inv.size(device) or 0
+for slot = 1, size do
+if not listing[slot] then return slot end
+end
+return nil
+end
+
+local held = slotsHolding(selfDevice, sampleItem)
+local splitMade = false
+
+if #held == 1 and held[1].count >= 2 then
+local empty = firstEmptySlot(selfDevice)
+if empty then
+local split = inv.push(selfDevice, selfDevice, held[1].slot, 1, empty)
+expect("split one item into an empty slot (self-push, easy case)",
+split or 0, 1, "defrag needs same-device pushes to work at all")
+splitMade = (split or 0) == 1
+if not splitMade then
+note("self-push into an EMPTY slot of the same inventory failed, so a")
+note("one-device volume cannot be reorganised at all. store.defrag")
+note("degrades to needing a second device (S8.11).")
+end
+held = slotsHolding(selfDevice, sampleItem)
+else
+note("no empty slot to split into -- cannot establish the precondition")
+end
+end
+
+if #held < 2 then
+say("self-push merge", "NOT TESTED -- could not create two stacks of one item")
+note("needs one item with at least 2 of it, and one free slot")
+else
+local totalBefore = store.count("/pool", sampleItem)
+local donor, target = held[1], held[#held]
+
+local moved, pushErr = inv.push(selfDevice, selfDevice, donor.slot,
+donor.count, target.slot)
+expect("self-push merged two stacks of one item", moved or 0, donor.count,
+"defrag on a single-device volume depends on this (S8.11)")
+
+if not moved or moved == 0 then
+note("SELF-PUSH DOES NOT MERGE on this block. Consequence: a volume of ONE")
+note("device cannot consolidate -- defrag needs a second device to route")
+note("through. store.defrag skips a refusing target, so it degrades rather")
+note("than failing, but a one-chest pool stays fragmented.")
+if pushErr then note("error: " .. tostring(pushErr)) end
+else
+note("self-push works, so a single-device volume CAN defragment --")
+note("a one-chest pool is not a special case (S8.11).")
+end
+
+expect("conservation across split and merge",
+store.count("/pool", sampleItem), totalBefore,
+"nothing may be created or destroyed by a probe")
+say("slots holding " .. sampleItem .. " afterwards",
+#slotsHolding(selfDevice, sampleItem))
+end
+
+
+
+
+
+
+
+heading("S8.1: pushing onto a different item must refuse")
+
+local other, otherSlot = nil, nil
+for slot, stack in pairs(inv.list(selfDevice) or {}) do
+if stack.name ~= sampleItem then other, otherSlot = stack.name, slot end
+end
+
+if not other then
+say("mixed-slot push", "NOT TESTED -- pool holds only one item type")
+note("put a second item type in the pool chest to settle it")
+else
+local src = nil
+for slot, stack in pairs(inv.list(selfDevice) or {}) do
+if stack.name == sampleItem then src = slot end
+end
+local before = store.count("/pool")
+local refused = inv.push(selfDevice, selfDevice, src, 1, otherSlot)
+expect("pushing " .. sampleItem .. " onto " .. other, refused or 0, 0,
+"S8.1 assumes no exchange primitive exists")
+say("conservation", store.count("/pool") == before and "OK" or "ITEMS LOST")
+end
+
+
+
+heading("defragmenting /pool")
+
+local pressureBefore = store.slots("/pool")
+local totalBefore = 0
+for _, count in pairs(store.manifest("/pool") or {}) do
+totalBefore = totalBefore + count
+end
+
+local result, defragErr = store.defrag("/pool")
+if not result then
+say("defrag refused", tostring(defragErr))
+else
+say("items merged", result.merged)
+say("slots freed", result.slotsFreed)
+say("peripheral calls", result.calls)
+say("keys considered", result.keys)
+
+local pressureAfter = store.slots("/pool")
+say("slots used before / after",
+("%d / %d"):format(pressureBefore.used, pressureAfter.used))
+
+local totalAfter = 0
+for _, count in pairs(store.manifest("/pool") or {}) do
+totalAfter = totalAfter + count
+end
+expect("total items conserved across defrag", totalAfter, totalBefore,
+"S8.9: a defrag never voids")
+
+if pressureAfter.used > pressureBefore.used then
+mismatches[#mismatches + 1] = "defrag INCREASED slot usage"
+end
+end
+
+
+
+
+
+
+heading("S2.1: are peripheral names stable across a rebuild?")
+say("currently bound", table.concat(status.devices, ", "))
+note("TO SETTLE THIS: break one of those chests and place it again, then run")
+note("`mfgctl peripherals`. If the name changed, mount points are load-bearing")
+note("rather than convenient, and `mfgctl bind /pool <new name>` is the repair.")
+note("Nothing above the store changes either way -- that is the point.")
+
+
+
+heading("summary")
+say("findings recorded", findings)
+
+if #mismatches == 0 then
+print("  nothing contradicted what the code assumes")
+append("  nothing contradicted what the code assumes")
+else
+printError(("  %d ANSWER(S) DISAGREE WITH THE CODE:"):format(#mismatches))
+append(("  %d ANSWER(S) DISAGREE WITH THE CODE:"):format(#mismatches))
+for _, m in ipairs(mismatches) do
+printError("    " .. m)
+append("    " .. m)
+end
+end
+
+print("")
+print("full results appended to " .. FILE)

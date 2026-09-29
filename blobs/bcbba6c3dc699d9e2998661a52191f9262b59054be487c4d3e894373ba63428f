@@ -1,0 +1,356 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local hal = require("mfg.common.hal")
+
+local marks = {}
+
+marks.PAGE = "computercraft:printed_page"
+marks.SLOT = 1
+marks.TRAY = "/markers"
+marks.RETRY = 60 * 1000
+marks.TRAY_WAIT = 5
+
+local STATE_FILE = "mounts"
+
+
+local function keyOf(stack)
+if not stack then return nil end
+if stack.nbt == nil or stack.nbt == "" then return stack.name end
+return stack.name .. "#" .. stack.nbt
+end
+marks.keyOf = keyOf
+
+
+function marks.clock() return os.epoch("utc") end
+
+local function records() return state.read(STATE_FILE, {}) end
+local function save(all) state.write(STATE_FILE, all) end
+
+
+
+
+local function isPage(stack, mark)
+if not stack or stack.name ~= marks.PAGE then return false end
+if stack.nbt == nil then return true end
+return keyOf(stack) == mark.key
+end
+
+
+
+
+function marks.hidden(record, device, listing)
+local mark = record and record.marks and record.marks[device]
+if not mark or mark.kind ~= "page" then return nil end
+if listing and isPage(listing[mark.slot or marks.SLOT], mark) then
+return {[mark.slot or marks.SLOT] = true}
+end
+return nil
+end
+
+
+function marks.status(record, device, listing)
+local mark = record and record.marks and record.marks[device]
+if not mark then return nil end
+if mark.kind == "held" then return "drawer: " .. tostring(mark.key) end
+if not listing then return "marked" end
+return isPage(listing[mark.slot or marks.SLOT], mark) and "marked" or "MARKER GONE"
+end
+
+
+
+function marks.stale(record, device, listing, size)
+local mark = record.marks and record.marks[device]
+if size == 1 then
+local key = keyOf(listing[1])
+return key ~= nil and (not mark or mark.kind ~= "held" or mark.key ~= key)
+end
+if mark or not record.marks then return false end
+local first = listing[marks.SLOT]
+return first ~= nil and first.name == marks.PAGE
+end
+
+
+
+
+
+
+function marks.observe(path, device, listing, size)
+if not listing then return false end
+local all = records()
+local record = all[path]
+if not record or record.slots then return false end
+record.marks = record.marks or {}
+local mark = record.marks[device]
+
+if size == 1 then
+local key = keyOf(listing[1])
+if key and (not mark or mark.kind ~= "held" or mark.key ~= key) then
+record.marks[device] = {kind = "held", key = key}
+save(all)
+return true
+end
+return false
+end
+
+local first = listing[marks.SLOT]
+if mark or not first or first.name ~= marks.PAGE then return false end
+local bound = {}
+for _, name in ipairs(record.devices) do bound[name] = true end
+for other, candidate in pairs(record.marks) do
+if not bound[other] and candidate.kind == "page" and isPage(first, candidate) then
+record.marks[device], record.marks[other] = candidate, nil
+save(all)
+return true
+end
+end
+return false
+end
+
+
+
+local lastLook = {}
+
+
+
+
+
+function marks.recover(path, missing)
+local now = marks.clock()
+if lastLook[path] and now - lastLook[path] < marks.RETRY then return {} end
+lastLook[path] = now
+
+local all = records()
+local record = all[path]
+if not record or not record.marks then return {} end
+
+local mount = require("mfg.storage.mount")
+local inv = hal.inventory()
+local candidates = mount.unclaimed()
+local rebound = {}
+
+for _, gone in ipairs(missing or {}) do
+local mark = record.marks[gone]
+if mark then
+local found = {}
+for _, device in ipairs(candidates) do
+if mark.kind == "page" then
+
+local detail = inv.detail(device, mark.slot or marks.SLOT)
+if detail and keyOf(detail) == mark.key then
+found[#found + 1] = device
+end
+elseif mark.kind == "held" and inv.size(device) == 1 then
+local listing = inv.list(device)
+if listing and keyOf(listing[1]) == mark.key then
+found[#found + 1] = device
+end
+end
+end
+
+if #found == 1 then
+local to = found[1]
+for index, name in ipairs(record.devices) do
+if name == gone then record.devices[index] = to end
+end
+record.marks[to], record.marks[gone] = mark, nil
+record.rebound = {from = gone, to = to, at = now,
+how = mark.kind == "page" and "its marker" or "the item it holds"}
+save(all)
+rebound[#rebound + 1] = {from = gone, to = to, how = record.rebound.how}
+
+for index, name in ipairs(candidates) do
+if name == to then table.remove(candidates, index) break end
+end
+elseif #found > 1 then
+
+rebound[#rebound + 1] = {from = gone, ambiguous = found}
+end
+end
+end
+return rebound
+end
+
+
+function marks._reset()
+lastLook = {}
+end
+
+
+
+local function tag()
+local chars = "abcdefghijkmnpqrstuvwxyz23456789"
+local out = {}
+for _ = 1, 4 do
+local i = math.random(1, #chars)
+out[#out + 1] = chars:sub(i, i)
+end
+return table.concat(out) .. ("%x"):format(marks.clock() % 0x1000)
+end
+
+
+
+local function clearFirst(record, device)
+local inv = hal.inventory()
+local listing = inv.list(device) or {}
+local stack = listing[marks.SLOT]
+if not stack then return true end
+for _, other in ipairs(record.devices) do
+local size = inv.size(other) or 0
+local held = (other == device) and listing or (inv.list(other) or {})
+for slot = (other == device) and (marks.SLOT + 1) or 1, size do
+if not held[slot] then
+local moved = inv.push(device, other, marks.SLOT, stack.count, slot)
+if moved == stack.count then return true end
+return nil, ("could not clear slot %d of %s: moved %s of %d")
+:format(marks.SLOT, device, tostring(moved), stack.count)
+end
+end
+end
+return nil, ("slot %d of %s holds %d %s, and there is no empty slot in the volume "
+.. "to move it to"):format(marks.SLOT, device, stack.count, stack.name)
+end
+
+
+local function usedKeys(all)
+local used = {}
+for _, record in pairs(all) do
+for _, mark in pairs(record.marks or {}) do used[mark.key or ""] = true end
+end
+return used
+end
+
+
+
+local function fetch(printer, device, used)
+local inv = hal.inventory()
+for _, slot in ipairs(hal.printer().OUTPUT) do
+local n = inv.pull(device, printer, slot, 1, marks.SLOT)
+if n and n > 0 then return true end
+end
+
+local mount = require("mfg.storage.mount")
+if not mount.isBound(marks.TRAY) then
+return nil, ("the page is in %s's output tray and can't be pulled from there "
+.. "by cable: put a hopper under the printer into a cabled chest, and "
+.. "`mfgctl bind %s <chest>`"):format(printer, marks.TRAY)
+end
+local deadline = marks.clock() + marks.TRAY_WAIT * 1000
+repeat
+for _, tray in ipairs((mount.devices(marks.TRAY))) do
+for slot, stack in pairs(inv.list(tray) or {}) do
+local detail = stack.name == marks.PAGE and inv.detail(tray, slot)
+if detail and not used[keyOf(detail)] then
+local n = inv.push(tray, device, slot, 1, marks.SLOT)
+if n and n > 0 then return true end
+end
+end
+end
+if marks.clock() >= deadline then break end
+sleep(0.5)
+until false
+return nil, ("no new page reached %s within %ds: is the hopper under the printer, "
+.. "and not locked by redstone?"):format(marks.TRAY, marks.TRAY_WAIT)
+end
+
+
+
+
+function marks.mark(path, opts)
+opts = opts or {}
+local mount = require("mfg.storage.mount")
+local record = mount.get(path)
+if not record then return nil, "no such storage: " .. tostring(path) end
+if mount.isSignal(record) then return nil, path .. " is a signal, not a chest" end
+if record.slots then
+return nil, path .. " is some slots of a machine, which has no slot to spare"
+end
+if path == marks.TRAY then return nil, marks.TRAY .. " is where markers come from" end
+if #record.devices == 0 then return nil, path .. " is not bound" end
+
+local printers = hal.printer()
+local printer = opts.printer or printers.names()[1]
+local inv = hal.inventory()
+local out = {}
+
+for _, device in ipairs(record.devices) do
+local all = records()
+local current = all[path]
+local mark = current.marks and current.marks[device]
+local size = inv.isPresent(device) and inv.size(device) or nil
+local listing = size and inv.list(device) or nil
+
+if not size then
+out[#out + 1] = {device = device, status = "missing",
+text = "not on the network: bind it again first"}
+elseif size == 1 then
+marks.observe(path, device, listing, size)
+local held = keyOf(listing and listing[1])
+out[#out + 1] = {device = device, status = "drawer", text = held
+and ("a drawer, known by what it holds: %s"):format(held)
+or "an empty drawer: it can't be known until it holds something"}
+elseif mark and mark.kind == "page" and listing
+and isPage(listing[mark.slot or marks.SLOT], mark) then
+out[#out + 1] = {device = device, status = "marked", text = "already marked"}
+elseif not printer then
+return nil, "no printer on the network: cable one to the controller, with "
+.. "paper and ink, and turn its modem on"
+else
+local ok, why = clearFirst(current, device)
+if ok then
+local title = ("mfg %s %s"):format(path, tag())
+ok, why = printers.print(printer, title, {
+"Storage identity for", path, "",
+"Leave this page in the", "first slot of this chest.",
+"", "If the chest's network", "name changes, mfg finds",
+"it again by this page."})
+if ok then ok, why = fetch(printer, device, usedKeys(all)) end
+if ok then
+local detail = inv.detail(device, marks.SLOT)
+local key = keyOf(detail)
+all = records()
+if not detail or detail.name ~= marks.PAGE then
+ok, why = nil, "the page did not arrive in the first slot"
+elseif usedKeys(all)[key] then
+
+
+ok, why = nil, ("the page reads the same as another marker "
+.. "(%s): pages are not telling titles apart"):format(key)
+else
+all[path].marks = all[path].marks or {}
+all[path].marks[device] = {kind = "page", slot = marks.SLOT,
+key = key, title = title, at = marks.clock()}
+save(all)
+require("mfg.storage.index").drop(device)
+out[#out + 1] = {device = device, status = "marked",
+text = "marked: " .. title}
+end
+end
+end
+if not ok then
+out[#out + 1] = {device = device, status = "failed", text = tostring(why)}
+end
+end
+end
+return out
+end
+
+return marks

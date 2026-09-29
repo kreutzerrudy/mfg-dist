@@ -1,0 +1,58 @@
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+
+
+backend.OUTPUT = {8, 9, 10, 11, 12, 13}
+
+function backend.names()
+local out = {}
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.hasType(name, "printer") then out[#out + 1] = name end
+end
+table.sort(out)
+return out
+end
+
+local function wrap(name)
+if not (peripheral.isPresent(name) and peripheral.hasType(name, "printer")) then
+return nil, "no printer named " .. tostring(name)
+end
+return peripheral.wrap(name)
+end
+
+
+function backend.levels(name)
+local printer, why = wrap(name)
+if not printer then return nil, why end
+return {paper = printer.getPaperLevel(), ink = printer.getInkLevel()}
+end
+
+
+
+function backend.print(name, title, lines)
+local printer, why = wrap(name)
+if not printer then return nil, why end
+if not printer.newPage() then
+return nil, ("%s can't start a page: it needs paper and ink, and room in its "
+.. "output tray"):format(name)
+end
+printer.setPageTitle(title)
+for index, line in ipairs(lines or {}) do
+printer.setCursorPos(1, index)
+printer.write(line)
+end
+if not printer.endPage() then
+return nil, ("%s printed a page it could not put out: its output tray is full")
+:format(name)
+end
+return true
+end
+
+return backend

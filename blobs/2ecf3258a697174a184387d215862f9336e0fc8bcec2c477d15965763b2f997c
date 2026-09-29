@@ -1,0 +1,25 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+return {
+name        = "forget_script",
+label       = "Forget a machine script",
+tier        = "node",
+manual      = true,
+destructive = true,
+
+parameters = {
+{name = "script", label = "Script", type = "text", required = true},
+},
+
+returns = {},
+
+run = function(params)
+local ok, why = scripts.forgetScript(params.script)
+if not ok then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {}
+end,
+}

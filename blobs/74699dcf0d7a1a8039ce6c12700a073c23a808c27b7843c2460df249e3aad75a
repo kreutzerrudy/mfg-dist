@@ -1,0 +1,151 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+local custody = require("mfg.storage.custody")
+
+local orders = {}
+
+local COMMANDS = {}
+
+
+
+
+
+
+
+function COMMANDS.place(body, packet)
+local spec = body.order
+if type(spec) ~= "table" then
+return rpc.REJECTED, {reason = "an order must be supplied"}
+end
+
+local accepted, err = custody.accept({
+id = spec.id,
+
+
+
+from = tostring(packet and packet.src or "unknown"),
+product = spec.product,
+quantity = spec.quantity,
+supplied = spec.supplied,
+owed = spec.owed,
+})
+if not accepted then return rpc.REJECTED, {reason = tostring(err)} end
+
+return rpc.COMPLETED, {order = accepted.id, state = accepted.state}
+end
+
+
+
+
+
+function COMMANDS.receive(body)
+local statement, err = custody.receive(body.order or "")
+if not statement then return rpc.REJECTED, {reason = tostring(err)} end
+return rpc.COMPLETED, {statement = statement}
+end
+
+
+
+function COMMANDS.statement(body)
+local statement, err = custody.statement(body.order or "")
+if not statement then return rpc.REJECTED, {reason = tostring(err)} end
+return rpc.COMPLETED, {statement = statement}
+end
+
+
+
+
+function COMMANDS.settle(body)
+local settled, err = custody.settle(body.order or "")
+if not settled then return rpc.REJECTED, {reason = tostring(err)} end
+return rpc.COMPLETED, {settled = settled}
+end
+
+function COMMANDS.cancel(body)
+local cancelled, err = custody.cancel(body.order or "",
+body.why or "withdrawn by the station")
+if not cancelled then return rpc.REJECTED, {reason = tostring(err)} end
+return rpc.COMPLETED, {cancelled = cancelled}
+end
+
+
+
+
+function COMMANDS.hello()
+local recipes = require("mfg.controller.recipes")
+local products = {}
+for _, def in ipairs(recipes.all()) do
+products[#products + 1] = def.output.item
+end
+
+local open = 0
+for _, order in pairs(custody.orders()) do
+if order.state ~= custody.SETTLED and order.state ~= custody.RETURNED then
+open = open + 1
+end
+end
+
+return rpc.COMPLETED, {
+kind = "manufacturer",
+inbound = custody.IN,
+outbound = custody.OUT,
+products = products,
+ordersOpen = open,
+}
+end
+
+orders.COMMANDS = COMMANDS
+
+function orders.handle(body, packet)
+local name = body and body.command
+local handler = COMMANDS[name]
+
+if not handler then
+print(("orders: rejected unknown command '%s' from %s"):format(
+tostring(name), tostring(packet and packet.src)))
+return rpc.REJECTED, {reason = "unknown command: " .. tostring(name)}
+end
+
+local ok, status, fields = pcall(handler, body or {}, packet)
+if not ok then
+print(("orders: %s failed: %s"):format(tostring(name), tostring(status)))
+return rpc.REJECTED, {reason = tostring(status)}
+end
+return status, fields
+end
+
+
+
+
+
+
+function orders.fulfil()
+local delivered = {}
+for id, order in pairs(custody.orders()) do
+local open = order.state ~= custody.SETTLED
+and order.state ~= custody.RETURNED
+and order.state ~= custody.FULFILLED
+if open then
+local sent = custody.deliver(id)
+if sent and next(sent.sent or {}) then delivered[id] = sent.sent end
+end
+end
+return delivered
+end
+
+return orders

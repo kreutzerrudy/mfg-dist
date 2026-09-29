@@ -1,0 +1,281 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local routing = require("routing")
+local peersession = require("peersession")
+
+local netcrypt = {}
+
+local SEND_TIMEOUT = 30
+
+local state = _G.__netcrypt
+if not state then
+state = {running = false, debug = false}
+_G.__netcrypt = state
+end
+
+state.encrypted = state.encrypted or {}
+
+local pendingSends = {}
+local nextRequest = 0
+
+local function log(...)
+if state.debug then os.queueEvent("netcrypt_debug", ...) end
+end
+
+function netcrypt.setDebug(enabled)
+state.debug = enabled
+end
+
+
+
+function netcrypt.setEncrypted(port, enabled)
+state.encrypted[port] = enabled and true or nil
+end
+
+
+
+
+
+function netcrypt.setPolicy(ports)
+local replacement = {}
+for port in pairs(ports) do replacement[port] = true end
+state.encrypted = replacement
+end
+
+function netcrypt.isEncrypted(port)
+return state.encrypted[port] == true
+end
+
+function netcrypt.encryptedPorts()
+return state.encrypted
+end
+
+
+
+local function toHex(s)
+return (s:gsub(".", function(c) return ("%02x"):format(c:byte()) end))
+end
+
+local function fromHex(h)
+if type(h) ~= "string" or #h % 2 ~= 0 or h:find("%X") then return nil end
+return (h:gsub("%x%x", function(b) return string.char(tonumber(b, 16)) end))
+end
+
+
+
+local function deliver(request)
+local port = request.dstPort
+
+if not netcrypt.isEncrypted(port) then
+return routing.send(request.dst, port,
+{enc = false, d = request.body}, request.srcPort)
+end
+
+local sealed, counter = peersession.seal(request.dst, textutils.serialize(request.body))
+if not sealed then return false, counter end
+
+log("sealed", request.dst, port, counter)
+return routing.send(request.dst, port,
+{enc = true, n = counter, d = toHex(sealed)}, request.srcPort)
+end
+
+local function finish(request, ok, err)
+os.queueEvent("net_send_result", request.id, ok and true or false, err)
+end
+
+
+
+
+function netcrypt.send(dstAddress, dstPort, body, srcPort)
+nextRequest = nextRequest + 1
+local id = ("%d:%d"):format(os.getComputerID(), nextRequest)
+
+os.queueEvent("net_send", id, dstAddress, dstPort, body, srcPort)
+
+local timer = os.startTimer(SEND_TIMEOUT)
+while true do
+local event, p1, p2, p3 = os.pullEvent()
+if event == "net_send_result" and p1 == id then
+if p2 then return true end
+return false, p3
+elseif event == "timer" and p1 == timer then
+return false, "timed out waiting for the crypto daemon"
+end
+end
+end
+
+
+
+function netcrypt.receive(port, timeout)
+local timer = nil
+local filter = nil
+if timeout then
+timer = os.startTimer(timeout)
+else
+filter = "net_data"
+end
+
+while true do
+local event, p1, p2, p3, p4, p5, p6 = os.pullEvent(filter)
+if event == "net_data" then
+local src, sport, dport, body, encrypted, name = p1, p2, p3, p4, p5, p6
+if port == nil or dport == port then
+if timer then os.cancelTimer(timer) end
+return {
+src = src, sport = sport, dport = dport,
+body = body, encrypted = encrypted, name = name,
+}
+end
+elseif event == "timer" and p1 == timer then
+return nil
+end
+end
+end
+
+
+
+local function handleInbound(packet)
+local env = packet.body
+if type(env) ~= "table" then return end
+
+local port = packet.dport
+
+if env.enc ~= true then
+
+
+if netcrypt.isEncrypted(port) then
+log("downgrade", packet.src, port)
+return
+end
+os.queueEvent("net_data", packet.src, packet.sport, port, env.d, false)
+return
+end
+
+local ciphertext = fromHex(env.d)
+if not ciphertext then
+log("malformed", packet.src, port)
+return
+end
+
+local plaintext, err = peersession.open(packet.src, env.n, ciphertext)
+if not plaintext then
+
+
+log("rejected", packet.src, port, tostring(err))
+return
+end
+
+local ok, body = pcall(textutils.unserialize, plaintext)
+if not ok then
+log("unserialize", packet.src, port)
+return
+end
+
+
+
+
+os.queueEvent("net_data", packet.src, packet.sport, port, body, true,
+peersession.nameOf(packet.src))
+end
+
+local function attempt(request)
+local ok, err = deliver(request)
+if ok then
+finish(request, true)
+return true
+end
+return false, err
+end
+
+
+
+
+
+
+local function inboundLoop()
+while true do
+local _, src, sport, dport, body = os.pullEvent("net_message")
+handleInbound({src = src, sport = sport, dport = dport, body = body})
+end
+end
+
+local function outboundLoop()
+while true do
+local event, p1, p2, p3, p4, p5 = os.pullEvent()
+
+if event == "net_send" then
+local request = {
+id = p1, dst = p2, dstPort = p3, body = p4, srcPort = p5,
+}
+
+if not netcrypt.isEncrypted(request.dstPort)
+or peersession.get(request.dst) then
+local ok, err = attempt(request)
+if not ok then finish(request, false, err) end
+else
+
+
+
+log("awaiting session", request.dst, request.dstPort)
+pendingSends[request.dst] = pendingSends[request.dst] or {}
+table.insert(pendingSends[request.dst], request)
+os.queueEvent("peer_connect", request.dst)
+end
+
+elseif event == "peer_session" then
+local address, established, detail = p1, p2, p3
+local waiting = pendingSends[address]
+pendingSends[address] = nil
+
+for _, request in ipairs(waiting or {}) do
+if established then
+local ok, err = attempt(request)
+if not ok then finish(request, false, err) end
+else
+finish(request, false, "no session: " .. tostring(detail))
+end
+end
+end
+end
+end
+
+function netcrypt.runtime()
+if state.running then
+error("netcrypt: daemon already running", 0)
+end
+state.running = true
+
+local ok, err = pcall(parallel.waitForAny, inboundLoop, outboundLoop)
+
+state.running = false
+if not ok then error(err, 0) end
+end
+
+function netcrypt.isRunning()
+return state.running == true
+end
+
+function netcrypt.shutdown()
+state.running = false
+pendingSends = {}
+end
+
+return netcrypt

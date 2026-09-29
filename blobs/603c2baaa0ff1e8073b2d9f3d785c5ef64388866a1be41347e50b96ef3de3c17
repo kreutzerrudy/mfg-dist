@@ -1,0 +1,63 @@
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local node = require("mfg.turtle.node")
+
+local healthy, problems, seen = node.selfCheck()
+
+print("turtle self check")
+print("")
+
+if seen then
+print("in front:  " .. tostring(seen.blockInFront))
+print("  usable as an inventory: " ..
+tostring(seen.front and seen.front.inventory or false))
+print("below:     " .. tostring(seen.blockBelow))
+print("  usable as an inventory: " ..
+tostring(seen.bottom and seen.bottom.inventory or false))
+print("")
+for _, side in ipairs({"left", "right", "top"}) do
+local info = seen[side]
+if info and info.peripheral then
+print(("%-6s %s"):format(side, info.peripheral))
+end
+end
+print("")
+if seen.equipment then
+
+
+print("fitted" .. (seen.equipment.how == "peripheral" and " (inferred)" or "") .. ":")
+print("  left:  " .. tostring(seen.equipment.left or "nothing"))
+print("  right: " .. tostring(seen.equipment.right or "nothing"))
+print("")
+end
+end
+
+if healthy then
+term.setTextColour(colours.lime)
+print("wiring looks correct")
+else
+term.setTextColour(colours.red)
+print("PROBLEMS:")
+for _, problem in ipairs(problems) do print("  " .. problem) end
+print("")
+term.setTextColour(colours.white)
+print("the INPUT chest goes in FRONT of the turtle")
+print("the OUTPUT chest goes BELOW it")
+if seen and seen.missing and #seen.missing > 0 then
+print("fit what is missing, then reboot: equipment is checked at boot")
+end
+end
+term.setTextColour(colours.white)
+
+print("")
+print("state: " .. node.state())

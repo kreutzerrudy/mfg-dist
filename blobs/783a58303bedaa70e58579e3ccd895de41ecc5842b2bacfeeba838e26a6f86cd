@@ -1,0 +1,18 @@
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local enroll = require("mfg.controller.enroll")
+local acknet = require("acknet")
+
+if not acknet.isRunning() then
+printError("acknet is not running -- start netstart first")
+return
+end
+
+print("enrollment service listening")
+enroll.runtime()

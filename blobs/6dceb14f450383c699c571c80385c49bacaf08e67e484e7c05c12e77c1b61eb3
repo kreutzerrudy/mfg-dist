@@ -1,0 +1,45 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "drain",
+label       = "Empty a volume into another",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "from", label = "From", type = "path", required = true,
+choices = {source = "volumes"},
+help = "The volume to empty."},
+
+{name = "to", label = "To", type = "path", required = true,
+choices = {source = "volumes"},
+help = "The volume to empty it into."},
+},
+
+returns = {drained = "items"},
+
+run = function(params)
+local drained, why = store.drain(params.from, params.to)
+if not drained then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {drained = drained}
+end,
+}

@@ -1,0 +1,736 @@
+
+
+
+
+
+
+
+
+local acknet = require("acknet")
+local random = require("ccryptolib.random")
+local netkeys = require("netkeys")
+local netsession = require("netsession")
+local peersession = require("peersession")
+local routing = require("routing")
+local netcrypt = require("netcrypt")
+local ipnet = require("ipnet")
+local ip = require("ip")
+local bootrelay = require("bootrelay")
+local icmp = require("icmp")
+local band = require("band")
+
+local args = {...}
+
+
+
+
+local serverArg = nil
+if args[1] then
+serverArg = ip.parse(args[1])
+local id = tonumber(args[1])
+if not serverArg and id and id >= 0 and id < 65536 and id == math.floor(id) then
+serverArg = ip.linkLocal(id)
+end
+if not serverArg then
+printError(("'%s' is not an address or a computer id"):format(args[1]))
+return
+end
+end
+
+
+if not random.isInit() then
+write("seeding crypto rng... ")
+random.initWithTiming()
+print("done")
+end
+
+netkeys.init()
+
+local role = netkeys.role()
+if not role then
+printError("this computer has no role yet")
+print("run 'netadmin role server', 'client', or 'both'")
+return
+end
+
+
+
+local isServer = netkeys.isServer()
+local isClient = netkeys.isClient()
+
+
+
+
+
+
+
+
+
+
+
+local zoneCache = nil
+
+local function ourZone()
+if zoneCache == nil then zoneCache = netkeys.zone() end
+return zoneCache
+end
+
+local function forgetZone()
+zoneCache = nil
+end
+
+local function ourName()
+local zone = ourZone()
+return zone ~= "" and zone or (netkeys.hostname() or "server")
+end
+
+
+
+
+local function ownLabel()
+return ourZone() ~= "" and "" or ourName()
+end
+
+
+
+
+local substrateName = netkeys.substrate()
+local link = substrateName == "hopnet" and require("hopnet") or require("rednetsub")
+
+
+
+
+ipnet.setSubstrate(link)
+acknet.setSubstrate(ipnet)
+if not ipnet.init() then
+printError("no modem found")
+return
+end
+
+
+
+
+
+local declared = isServer and netkeys.serverInterfaces()
+or netkeys.interfaces()
+
+
+
+
+local ownBand = netkeys.band()
+if ownBand then
+for _, iface in ipairs(declared) do
+for _, subnet in ipairs(netkeys.subnets()) do
+if not subnet.via and subnet.band
+and ip.contains(subnet.network, subnet.prefix, iface.address) then
+iface.band = subnet.band
+end
+end
+iface.band = iface.band or ownBand
+end
+end
+
+ipnet.setInterfaces(declared)
+if ownBand and #declared == 0 then
+
+ipnet.setBands({}, ownBand)
+end
+
+
+
+
+
+ipnet.setForwarding(isServer or #declared > 0)
+
+
+
+local policy = netkeys.encryptedPorts()
+netcrypt.setPolicy(policy)
+
+local encryptedPorts = {}
+for port in pairs(policy) do encryptedPorts[#encryptedPorts + 1] = port end
+table.sort(encryptedPorts)
+
+print(("role: %s   key: %s"):format(role, netkeys.toHex(netkeys.publicKey()):sub(1, 16)))
+if #encryptedPorts > 0 then
+print("encrypted ports: " .. table.concat(encryptedPorts, " "))
+end
+print("substrate: " .. substrateName)
+if ownBand then print("band: " .. band.format(ownBand)) end
+if #declared > 0 then
+for _, iface in ipairs(declared) do
+print(("  %s %s"):format(
+ip.formatCidr(iface.address, iface.prefix), iface.modem or "(all)"))
+end
+else
+print("  " .. ip.format(ipnet.localAddress()) .. " (link-local, unassigned)")
+end
+
+
+
+
+
+
+
+
+local function ownVoucher()
+local voucher, why = netkeys.issueVoucher(
+ipnet.localAddress(), netkeys.publicKey(), ownLabel())
+if not voucher then
+printError("cannot vouch for ourselves: " .. tostring(why))
+print("list this computer's OWN subnet address first in /net/interfaces")
+return nil
+end
+return netkeys.toHex(voucher)
+end
+
+local JOIN_RETRY = 5
+local JOIN_RETRY_MAX = 60
+
+local function clientTask()
+
+
+
+local delay = JOIN_RETRY
+local session
+
+
+
+while not session do
+local serverAddress = serverArg
+if not serverAddress then
+serverAddress = netsession.findServer()
+end
+
+if serverAddress then
+print("handshaking with " .. ip.format(serverAddress) .. "...")
+local err
+session, err = netsession.connect(serverAddress)
+if not session then
+printError("handshake failed: " .. tostring(err))
+end
+else
+print("no handshake server answered")
+end
+
+if not session then
+print(("retrying in %ds -- ctrl+t to stop"):format(delay))
+
+
+os.sleep(delay)
+delay = math.min(delay * 2, JOIN_RETRY_MAX)
+end
+end
+
+print("admitted as " .. ip.format(session.address))
+
+
+
+
+if not session.prefix then
+printError("the server sent no subnet -- assuming /24")
+end
+ipnet.configure(session.address, session.prefix or 24, session.gateway,
+session.band)
+ipnet.setRoutes(session.routes)
+
+
+
+
+
+if #declared > 0 then
+local matches = false
+for _, iface in ipairs(declared) do
+if iface.address == session.address then matches = true end
+end
+if not matches then
+printError(("the server assigned %s, which is not in /net/interfaces")
+:format(ip.format(session.address)))
+print("pin it with 'netadmin address' on the server, or fix it here")
+end
+end
+
+if session.gateway then
+print("gateway: " .. ip.format(session.gateway))
+end
+for _, route in ipairs(session.routes or {}) do
+print(("route: %s via %s"):format(
+ip.formatCidr(route.network, route.prefix), ip.format(route.via)))
+end
+
+
+
+
+
+
+
+
+
+routing.setParent(session.gateway or session.serverAddress)
+
+
+
+
+
+if not routing.address() then
+routing.setLocal(session.address)
+end
+
+
+
+
+
+
+
+
+
+if session.voucher and not isServer then
+peersession.setVoucher(session.voucher)
+
+
+
+peersession.setChain(session.chain)
+
+
+
+local voucher = netkeys.fromHex(session.voucher)
+local assigned = nil
+if voucher then
+local _, _, name = netkeys.verifyVoucher(
+voucher, netkeys.decodeChain(session.chain))
+assigned = name ~= "" and name or nil
+end
+if assigned then
+routing.setName(assigned)
+print("hostname: " .. assigned)
+end
+
+elseif session.voucher then
+print("joined as " .. ip.format(session.address)
+.. "; keeping our own name and voucher")
+
+
+
+
+
+if session.cert then
+local chain = {session.cert}
+for _, hex in ipairs(session.chain or {}) do
+chain[#chain + 1] = hex
+end
+netkeys.setChain(chain)
+
+forgetZone()
+routing.setName(ourName())
+
+local granted = netkeys.parseCert(netkeys.fromHex(session.cert))
+if granted then
+print(("delegated %s"):format(
+ip.formatCidr(granted.network, granted.prefix)))
+end
+
+peersession.setVoucher(ownVoucher())
+peersession.setChain(netkeys.chainHex())
+else
+printError("no delegation issued -- this computer cannot sign")
+print("add a 'subnet <cidr> via " .. ip.format(session.address)
+.. "' on the parent")
+end
+
+else
+printError("no voucher issued -- peer sessions will not work")
+print("the server may predate voucher support; restart it")
+end
+
+
+
+while true do os.pullEvent() end
+end
+
+
+
+
+
+
+
+local function withinZone(name)
+local zone = ourZone()
+if zone == "" then return name end
+if name == zone then return "" end
+
+local suffix = "." .. zone
+if #name > #suffix and name:sub(-#suffix) == suffix then
+return name:sub(1, #name - #suffix)
+end
+return nil
+end
+
+local function directoryResolver(query)
+
+
+
+local relative = query.name and withinZone(query.name) or nil
+
+if (query.address ~= nil and ipnet.isOurs(query.address))
+or (query.name ~= nil and (relative == "" or query.name == ourName())) then
+return {
+address = ipnet.localAddress(),
+voucher = ownVoucher(),
+chain = netkeys.chainHex(),
+}
+end
+
+
+
+if query.name ~= nil and relative == nil then return nil end
+
+
+
+
+if relative ~= nil and relative:find(".", 1, true) then
+local delegate = relative:match("([^.]+)$")
+local hex = delegate and netkeys.keyForName(delegate) or nil
+local addr = hex and netkeys.addresses()[hex] or nil
+if addr then return nil, addr end
+return nil
+end
+
+
+local wanted = relative and netkeys.keyForName(relative) or nil
+
+local live = netsession.sessions()
+for hex, addr in pairs(netkeys.addresses()) do
+local matches = (wanted and hex == wanted) or
+(not wanted and addr == query.address)
+
+if matches then
+local session = live[hex]
+if not session then return nil end
+
+
+
+
+local pk = netkeys.fromHex(hex)
+local voucher = netkeys.issueVoucher(addr, pk, netkeys.nameFor(pk))
+if not voucher then return nil end
+
+return {
+address = addr,
+voucher = netkeys.toHex(voucher),
+
+
+chain = netkeys.chainHex(),
+}
+end
+end
+
+
+
+
+if query.address then
+for _, subnet in ipairs(netkeys.subnets()) do
+if subnet.via
+and ip.contains(subnet.network, subnet.prefix, query.address) then
+return nil, subnet.via
+end
+end
+end
+
+return nil
+end
+
+
+
+
+
+
+
+
+local function segmentFor(cameFrom)
+if cameFrom ~= nil and not ip.isLinkLocal(cameFrom) then
+for _, subnet in ipairs(netkeys.subnets()) do
+if ip.contains(subnet.network, subnet.prefix, cameFrom) then
+return {address = cameFrom, prefix = subnet.prefix}
+end
+end
+return nil
+end
+
+local modem = ipnet.ingressOf(cameFrom)
+local ifaces = ipnet.interfaces()
+
+for _, iface in ipairs(ifaces) do
+if iface.modem == modem then return iface end
+end
+
+
+
+return ifaces[1]
+end
+
+
+
+
+
+local function routesFor(iface)
+local routes = {}
+for _, subnet in ipairs(netkeys.subnets()) do
+if subnet.via
+and not ip.contains(iface.address, iface.prefix, subnet.network)
+and ip.contains(iface.address, iface.prefix, subnet.via) then
+routes[#routes + 1] = {
+network = subnet.network,
+prefix = subnet.prefix,
+via = subnet.via,
+}
+end
+end
+return routes
+end
+
+
+
+
+
+
+
+
+local function delegationFor(address, signingKey, name)
+if not signingKey then return nil end
+
+for _, subnet in ipairs(netkeys.subnets()) do
+if subnet.via == address then
+local cert, why = netkeys.issueCert(
+signingKey, subnet.network, subnet.prefix, name)
+if cert then return netkeys.toHex(cert) end
+
+printError(("cannot delegate %s: %s"):format(
+ip.formatCidr(subnet.network, subnet.prefix), tostring(why)))
+return nil
+end
+end
+return nil
+end
+
+local function allocate(clientPk, cameFrom, signingKey)
+local segment = segmentFor(cameFrom)
+if not segment then
+return nil, ("no subnet covers %s"):format(ip.format(cameFrom))
+end
+
+local address, err = netkeys.addressFor(clientPk, segment.address, segment.prefix)
+if not address then return nil, err end
+
+local plan = {
+address = address,
+prefix = segment.prefix,
+
+
+gateway = segment.address,
+routes = routesFor(segment),
+}
+
+
+
+
+
+plan.chain = netkeys.chainHex()
+plan.cert = delegationFor(address, signingKey, netkeys.nameFor(clientPk))
+
+
+
+
+
+plan.band = segment.band or netkeys.band()
+for _, subnet in ipairs(netkeys.subnets()) do
+if subnet.band and ip.contains(subnet.network, subnet.prefix, address) then
+plan.band = subnet.band
+end
+end
+
+return plan
+end
+
+
+local function ownRoutes()
+local routes = {}
+for _, subnet in ipairs(netkeys.subnets()) do
+if subnet.via then
+routes[#routes + 1] = {
+network = subnet.network,
+prefix = subnet.prefix,
+via = subnet.via,
+}
+end
+end
+return routes
+end
+
+
+
+
+
+local services = {}
+
+
+
+
+
+
+
+
+
+local function linkSecrets()
+local map = {}
+
+local function add(source)
+for address, secret in pairs(source) do
+local neighbour = ipnet.linkFor(address)
+if neighbour then map[neighbour] = secret end
+end
+end
+
+add(peersession.linkSecrets())
+add(netsession.linkSecrets())
+return map
+end
+
+
+ipnet.setKeyProvider(linkSecrets)
+
+
+
+
+if link.runtime then
+services[#services + 1] = {
+name = substrateName,
+run = link.runtime,
+shutdown = link.shutdown,
+running = link.isRunning,
+}
+end
+
+
+
+services[#services + 1] = {
+name = "ipnet",
+run = ipnet.runtime,
+shutdown = ipnet.shutdown,
+running = ipnet.isRunning,
+}
+
+local coreServices = {
+
+
+
+
+
+
+{
+name = "icmp",
+run = icmp.runtime,
+shutdown = icmp.shutdown,
+running = icmp.isRunning,
+},
+{
+name = "acknet",
+run = acknet.runtime,
+shutdown = acknet.shutdown,
+running = acknet.isRunning,
+},
+{
+name = "routing",
+run = routing.runtime,
+shutdown = routing.shutdown,
+running = routing.isRunning,
+},
+{
+name = "netcrypt",
+run = netcrypt.runtime,
+shutdown = netcrypt.shutdown,
+running = netcrypt.isRunning,
+},
+}
+for _, service in ipairs(coreServices) do services[#services + 1] = service end
+
+if isServer then
+ipnet.setRoutes(ownRoutes())
+
+routing.setLocal(ipnet.localAddress())
+
+
+routing.setName(ourName())
+routing.setDirectory(directoryResolver)
+netsession.setAllocator(allocate)
+
+
+peersession.setVoucher(ownVoucher())
+peersession.setChain(netkeys.chainHex())
+
+services[#services + 1] = {name = "handshake server", run = netsession.serve}
+end
+
+if isClient then
+services[#services + 1] = {name = "client join", run = clientTask}
+end
+
+
+
+
+if not isServer and #declared > 0 then
+bootrelay.setUpstream(routing.serverAddress)
+bootrelay.setSegment(function(client)
+local modem = ipnet.ingressOf(client)
+for _, iface in ipairs(ipnet.interfaces()) do
+if iface.modem == modem then return iface.address end
+end
+local first = ipnet.interfaces()[1]
+return first and first.address or nil
+end)
+
+services[#services + 1] = {
+name = "bootstrap relay",
+run = bootrelay.runtime,
+shutdown = bootrelay.shutdown,
+running = bootrelay.isRunning,
+}
+end
+
+
+
+
+services[#services + 1] = {name = "peer sessions", run = peersession.runtime}
+
+
+
+
+for _, service in ipairs(services) do
+if service.running and service.running() then
+printError(("%s is already running"):format(service.name))
+print("stop the other netstart, or run 'netstop' to clear stale flags")
+return
+end
+end
+
+local tasks = {}
+for i, service in ipairs(services) do tasks[i] = service.run end
+
+
+
+
+
+local ok, err = pcall(parallel.waitForAny, table.unpack(tasks))
+
+
+
+for i = #services, 1, -1 do
+local service = services[i]
+if service.shutdown then
+local down, reason = pcall(service.shutdown)
+if not down then
+printError(("%s shutdown failed: %s"):format(service.name, tostring(reason)))
+end
+end
+end
+
+if not ok then error(err, 0) end

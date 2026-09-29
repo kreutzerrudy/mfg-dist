@@ -1,0 +1,34 @@
+local rpc = require("mfg.common.rpc")
+local signals = require("mfg.controller.signals")
+
+
+
+
+
+
+
+
+return {
+name        = "set_signal",
+label       = "Drive a signal",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "signal", label = "Signal", type = "path", required = true,
+choices = {source = "signals"}},
+{name = "level", label = "Level", type = "number", integer = true,
+min = 0, max = 15, required = true,
+help = "0-15. A flag is off at 0 and on above it."},
+},
+
+returns = {level = "number", was = "number"},
+
+run = function(params, ctx)
+local was, why = signals.write(params.signal, params.level,
+ctx.policy or "operator")
+if not was then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {level = params.level, was = was}
+end,
+}

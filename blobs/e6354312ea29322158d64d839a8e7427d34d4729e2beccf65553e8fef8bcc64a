@@ -1,0 +1,245 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local store = require("mfg.storage")
+local ledger = require("mfg.station.ledger")
+
+local broker = {}
+
+broker.POOL = "/pool"
+
+
+
+
+function broker.inboundOf(node)
+return ("/%s/in"):format(node)
+end
+
+function broker.outboundOf(node)
+return ("/%s/out"):format(node)
+end
+
+
+
+
+
+
+
+
+function broker.place(link, spec)
+local id = spec.id or ledger.nextId()
+
+local record, err = ledger.open({
+id = id, node = spec.node, product = spec.product,
+quantity = spec.quantity, supplied = spec.supplied,
+owed = spec.owed or {[spec.product] = spec.quantity},
+})
+if not record then return nil, err end
+
+local answer = link.request(spec.node, {
+command = "place",
+order = {
+id = id, product = spec.product, quantity = spec.quantity,
+supplied = record.promised, owed = record.owed,
+},
+})
+
+if not answer or answer.status ~= "completed" then
+ledger.advance(id, ledger.WITHDRAWN,
+"the node did not accept it: "
+.. tostring(answer and answer.reason or "no reply"))
+return nil, ("%s did not accept the order: %s"):format(spec.node,
+tostring(answer and answer.reason or "no reply"))
+end
+
+return record
+end
+
+
+
+
+
+
+
+function broker.supply(link, id)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+
+local inbound = broker.inboundOf(record.node)
+if not store.isBound(inbound) then
+return nil, ("%s is not bound -- that is the boundary this station pushes "
+.. "into"):format(inbound)
+end
+
+local outstanding = ledger.outstandingSupply(record)
+if not next(outstanding) then return {sent = {}, complete = true} end
+
+local sent, short = {}, {}
+for item, wanted in pairs(outstanding) do
+local moved = store.move(broker.POOL, inbound, item, wanted)
+if moved and moved > 0 then sent[item] = moved end
+if (moved or 0) < wanted then
+short[item] = wanted - (moved or 0)
+end
+end
+
+if next(sent) then ledger.pushed(id, sent) end
+
+
+
+local answer = link.request(record.node, {command = "receive", order = id})
+local accepted = answer and answer.status == "completed"
+
+record = ledger.get(id)
+if not next(ledger.outstandingSupply(record)) then
+ledger.advance(id, ledger.AWAITING, "supplied in full")
+else
+ledger.advance(id, ledger.SUPPLYING, "part supplied")
+end
+
+return {
+sent = sent,
+short = next(short) and short or nil,
+complete = not next(ledger.outstandingSupply(ledger.get(id))),
+acknowledged = accepted,
+statement = answer and answer.statement,
+}
+end
+
+
+
+
+
+
+
+
+function broker.collect(link, id)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+
+local outbound = broker.outboundOf(record.node)
+if not store.isBound(outbound) then
+return nil, ("%s is not bound -- that is where this station collects")
+:format(outbound)
+end
+
+local outstanding = ledger.outstandingProduct(record)
+local got = {}
+for item, wanted in pairs(outstanding) do
+local moved = store.move(outbound, broker.POOL, item, wanted)
+if moved and moved > 0 then got[item] = moved end
+end
+
+if next(got) then
+ledger.collected(id, got)
+ledger.advance(id, ledger.COLLECTING,
+"collected from " .. outbound)
+end
+
+record = ledger.get(id)
+local remaining = ledger.outstandingProduct(record)
+
+if not next(remaining) then
+
+
+local answer = link.request(record.node, {command = "settle", order = id})
+if answer and answer.status == "completed" then
+ledger.advance(id, ledger.CLOSED, "settled with " .. record.node)
+return {got = got, closed = true, settled = answer.settled}
+end
+return {got = got, closed = false,
+reason = answer and answer.reason or "no reply to settle"}
+end
+
+return {got = got, closed = false, outstanding = remaining}
+end
+
+
+
+
+function broker.check(link, id)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+
+local answer = link.request(record.node, {command = "statement", order = id})
+if not answer or answer.status ~= "completed" or not answer.statement then
+return nil, ("no statement from %s: %s"):format(record.node,
+tostring(answer and answer.reason or "no reply"))
+end
+
+local reconciliation = ledger.reconcile(id, answer.statement)
+return answer.statement, reconciliation
+end
+
+
+
+
+
+function broker.step(link)
+local acted = {}
+
+for _, record in ipairs(ledger.open_orders()) do
+local id = record.id
+local statement, reconciliation = broker.check(link, id)
+
+if not statement then
+acted[#acted + 1] = {order = id, did = "unreachable"}
+else
+
+if next(ledger.outstandingSupply(record)) then
+local supplied = broker.supply(link, id)
+acted[#acted + 1] = {order = id, did = "supplied",
+detail = supplied}
+end
+
+
+if statement.state == "fulfilled"
+or next(statement.delivered or {}) then
+local collected = broker.collect(link, id)
+acted[#acted + 1] = {order = id, did = "collected",
+detail = collected}
+end
+
+
+if reconciliation and not reconciliation.agrees then
+acted[#acted + 1] = {order = id, did = "DISAGREES",
+detail = reconciliation.findings}
+end
+end
+end
+
+return acted
+end
+
+function broker.withdraw(link, id, why)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+
+local answer = link.request(record.node,
+{command = "cancel", order = id, why = why})
+if not answer or answer.status ~= "completed" then
+return nil, ("%s did not accept the cancellation: %s"):format(record.node,
+tostring(answer and answer.reason or "no reply"))
+end
+
+ledger.advance(id, ledger.WITHDRAWN, why or "withdrawn")
+
+
+return {returned = answer.cancelled and answer.cancelled.returned}
+end
+
+return broker

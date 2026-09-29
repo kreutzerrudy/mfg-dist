@@ -1,0 +1,176 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local doc = require("mfg.hmi.doc")
+
+local args = {...}
+local opts = {}
+local i = 1
+while i <= #args do
+local a = args[i]
+if a == "--term" then opts.term = true
+elseif a == "--mono" then opts.mono = true
+elseif a == "--scale" then opts.scale = tonumber(args[i + 1]) i = i + 1
+elseif a == "--size" then
+local w, h = tostring(args[i + 1]):match("^(%d+)x(%d+)$")
+if w then opts.width, opts.height = tonumber(w), tonumber(h) end
+i = i + 1
+end
+i = i + 1
+end
+
+
+
+local PALETTE = {
+text = colours.white, title = colours.white, label = colours.lightGrey,
+dim = colours.grey, good = colours.lime, warn = colours.yellow,
+bad = colours.red, stale = colours.grey, action = colours.lightBlue,
+selected = colours.white, flow = colours.grey,
+}
+
+local screen, what = term.current(), "terminal"
+if not opts.term then
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.getType(name) == "monitor" then
+screen = peripheral.wrap(name)
+what = name
+break
+end
+end
+end
+
+if opts.scale and screen.setTextScale then
+pcall(screen.setTextScale, opts.scale)
+end
+
+local sw, sh = screen.getSize()
+local width = opts.width or sw
+local height = opts.height or sh
+local colour = screen.isColour and screen.isColour() or false
+if opts.mono then colour = false end
+
+
+
+local function sample(w)
+return doc.stack({
+doc.row({
+doc.text("DOCPREVIEW", {colour = "title", keep = doc.REQUIRED}),
+doc.gap(2),
+doc.text(("%dx%d"):format(w, height), {colour = "label", keep = 7}),
+doc.spacer(),
+doc.text(colour and "COLOUR" or "MONO",
+{colour = colour and "good" or "warn", keep = 6, name = "mode"}),
+}, {keep = doc.REQUIRED}),
+doc.rule({keep = 9}),
+
+
+doc.row({
+doc.text("text", {colour = "text"}), doc.gap(1),
+doc.text("title", {colour = "title"}), doc.gap(1),
+doc.text("label", {colour = "label"}), doc.gap(1),
+doc.text("dim", {colour = "dim"}), doc.gap(1),
+doc.text("stale", {colour = "stale"}),
+}, {keep = 8}),
+doc.row({
+doc.text("good", {colour = "good"}), doc.gap(1),
+doc.text("warn", {colour = "warn"}), doc.gap(1),
+doc.text("bad", {colour = "bad"}), doc.gap(1),
+doc.text("action", {colour = "action"}),
+}, {keep = 8}),
+doc.rule({keep = 5}),
+
+
+doc.field{label = "nodes", value = "3", keep = 7},
+doc.field{label = "stock", value = "1204", leader = ".", keep = 7},
+doc.rule({keep = 4}),
+
+
+doc.table{
+columns = {
+{head = "NODE", width = 9},
+{head = "STATE", width = 9},
+{head = "QTY", width = 5, align = "right"},
+},
+rows = {
+{"t1", {value = "crafting", colour = "good"}, 64},
+{"t2", {value = "faulted", colour = "bad"}, 0},
+{"builder1", {value = "idle", colour = "stale"}, 12},
+},
+keep = 6,
+},
+doc.rule({keep = 3}),
+doc.row({
+doc.text("[ORDERS]", {colour = "action", keep = 2}),
+doc.gap(1),
+doc.text("[ALARMS]", {colour = "action", keep = 2}),
+doc.spacer(),
+doc.text("[QUIT]", {colour = "action", keep = 1, name = "quit"}),
+}, {keep = 2}),
+})
+end
+
+
+
+local grid, report = doc.render(sample(width), width, height,
+{colour = colour})
+
+screen.setBackgroundColour(colours.black)
+screen.setTextColour(colours.white)
+screen.clear()
+
+if not grid then
+screen.setCursorPos(1, 1)
+screen.setTextColour(colours.red)
+screen.write("layout failed")
+screen.setCursorPos(1, 2)
+screen.setTextColour(colours.white)
+screen.write(doc.explain(report))
+else
+for y = 1, grid.height do
+for _, run in ipairs(grid.rows[y] or {}) do
+screen.setCursorPos(run.x, y)
+screen.setTextColour(colour and (PALETTE[run.colour] or colours.white)
+or colours.white)
+screen.write(run.text)
+end
+end
+end
+
+
+
+if screen ~= term.current() then
+print(("docpreview -> %s"):format(what))
+print(("  screen %dx%d, rendered at %dx%d"):format(sw, sh, width, height))
+print(("  colour: %s%s"):format(tostring(colour),
+opts.mono and "  (forced mono)" or ""))
+if screen.getTextScale then
+print(("  text scale: %s"):format(tostring(screen.getTextScale())))
+end
+else
+
+
+term.setCursorPos(1, math.min(height, sh))
+end
+
+print(("  fitting: %s"):format(doc.explain(report)))
+if grid and #report.dropped > 0 then
+print("  ^ dropped elements are EXPECTED on a small screen -- that is T4.3")
+end

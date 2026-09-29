@@ -1,0 +1,174 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local args = {...}
+local ROUNDS = tonumber(args[1]) or 40
+
+local function ms()
+return os.epoch("utc")
+end
+
+local function stat(samples)
+if #samples == 0 then return 0, 0, 0 end
+local total, worst = 0, 0
+for _, v in ipairs(samples) do
+total = total + v
+if v > worst then worst = v end
+end
+table.sort(samples)
+return total / #samples, samples[math.ceil(#samples / 2)], worst
+end
+
+local function report(label, samples, unit, note)
+local mean, median, worst = stat(samples)
+print(("  %-26s %6.1f %6.1f %6.1f %s"):format(label, mean, median, worst,
+unit or "ms"))
+if note then print("      " .. note) end
+end
+
+print("perfcheck -- mean / median / worst")
+print("")
+
+
+
+
+
+
+
+
+print("scheduling latency (how long to get back to a ready coroutine)")
+local latency = {}
+for _ = 1, ROUNDS do
+local t0 = ms()
+os.queueEvent("perfcheck_ping")
+os.pullEvent("perfcheck_ping")
+latency[#latency + 1] = ms() - t0
+end
+report("queueEvent -> pullEvent", latency, "ms")
+
+
+
+local yields = {}
+for _ = 1, math.min(ROUNDS, 20) do
+local t0 = ms()
+sleep(0)
+yields[#yields + 1] = ms() - t0
+end
+report("sleep(0) round trip", yields, "ms",
+"50ms is the floor -- one tick. Well above it means oversubscribed.")
+
+
+
+
+
+
+
+print("")
+print("peripheral calls")
+
+local hal = require("mfg.common.hal")
+local inv = hal.inventory()
+local devices = inv.names()
+
+if #devices == 0 then
+print("  no inventories on the network -- nothing to measure")
+else
+local sample = devices[1]
+
+local lists = {}
+for _ = 1, ROUNDS do
+local t0 = ms()
+inv.list(sample)
+lists[#lists + 1] = ms() - t0
+end
+report("list() one inventory", lists, "ms")
+
+local sizes = {}
+for _ = 1, ROUNDS do
+local t0 = ms()
+inv.size(sample)
+sizes[#sizes + 1] = ms() - t0
+end
+report("size() one inventory", sizes, "ms")
+
+local presence = {}
+for _ = 1, ROUNDS do
+local t0 = ms()
+inv.isPresent(sample)
+presence[#presence + 1] = ms() - t0
+end
+report("isPresent()", presence, "ms")
+
+print(("      %d inventory(ies) on the network"):format(#devices))
+end
+
+
+
+
+
+
+
+print("")
+print("a full supervisory scan")
+
+local ok, tags = pcall(require, "mfg.controller.tags")
+if not ok then
+print("  not a controller -- no tag database here")
+else
+local scans = {}
+for _ = 1, math.min(ROUNDS, 5) do
+local t0 = ms()
+tags.snapshot({timeout = 1, attempts = 1})
+scans[#scans + 1] = ms() - t0
+end
+report("tags.snapshot()", scans, "ms")
+
+local mean = select(1, stat(scans))
+
+print(("      alarms tick every 30s -- a scan is %.1f%% of that"):format(
+mean / 30000 * 100))
+print(("      an HMI polls every 4s  -- a scan is %.1f%% of that"):format(
+mean / 4000 * 100))
+if mean > 4000 then
+printError("      A SCAN TAKES LONGER THAN AN HMI POLL INTERVAL.")
+printError("      The controller would never stop scanning. Raise the")
+printError("      poll interval, or move storage off this computer.")
+end
+end
+
+
+
+
+
+
+
+print("")
+print("services")
+print("  perfcheck cannot see the running manager from here --")
+print("  run 'svc' in the controller's console. What to look for:")
+print("    a high restart count on any service, netstack above all")
+print("    'gave up after N short-lived starts' in svc log <name>")
+print("  a service restarting every few seconds will saturate this computer")
+print("  on its own, and no amount of tuning the scanners will fix that.")

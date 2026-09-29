@@ -1,0 +1,494 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local services = {}
+
+services.STOPPED = "stopped"
+services.WAITING = "waiting"
+services.RUNNING = "running"
+services.RESTARTING = "restarting"
+services.HALTED = "halted"
+
+
+
+local BACKOFF = {1, 2, 4, 8, 15, 30}
+local GIVE_UP_AFTER = 8
+
+
+
+
+local STABLE_AFTER = 60 * 1000
+
+
+
+
+local LOG_LINES = 80
+
+
+
+function services.new(opts)
+opts = opts or {}
+return {
+name = opts.name or "node",
+list = {},
+order = {},
+halted = nil,
+clock = opts.clock,
+sleeper = opts.sleeper,
+}
+end
+
+local function now(manager)
+if manager.clock then return manager.clock() end
+return os.epoch("utc")
+end
+
+local function pause(manager, seconds)
+if manager.sleeper then return manager.sleeper(seconds) end
+sleep(seconds)
+end
+
+
+
+
+
+function services.declare(manager, spec)
+if type(spec) ~= "table" or not spec.name then
+return nil, "a service needs a name"
+end
+if type(spec.start) ~= "function" then
+return nil, ("service %s needs a start function"):format(spec.name)
+end
+if manager.list[spec.name] then
+return nil, ("service %s is already declared"):format(spec.name)
+end
+
+local record = {
+name = spec.name,
+start = spec.start,
+critical = spec.critical or false,
+requires = spec.requires or {},
+ready = spec.ready,
+restart = spec.restart ~= false,
+
+
+terminal = spec.terminal or false,
+state = services.STOPPED,
+restarts = 0,
+attempts = 0,
+failures = 0,
+lastError = nil,
+startedAt = nil,
+log = {},
+}
+manager.list[spec.name] = record
+manager.order[#manager.order + 1] = spec.name
+return record
+end
+
+function services.get(manager, name)
+return manager.list[name]
+end
+
+
+
+
+
+
+function services.log(manager, name, line)
+local record = manager.list[name]
+if not record then return end
+
+record.log[#record.log + 1] = {at = now(manager), text = tostring(line)}
+while #record.log > LOG_LINES do table.remove(record.log, 1) end
+end
+
+function services.logs(manager, name, count)
+local record = manager.list[name]
+if not record then return {} end
+local out = {}
+local from = math.max(1, #record.log - (count or LOG_LINES) + 1)
+for i = from, #record.log do out[#out + 1] = record.log[i] end
+return out
+end
+
+
+
+
+
+
+function services.capture(manager, name, target)
+local buffer = ""
+
+local function flush()
+if #buffer > 0 then
+services.log(manager, name, buffer)
+buffer = ""
+end
+end
+
+local proxy = {}
+setmetatable(proxy, {__index = target})
+
+proxy.write = function(text)
+buffer = buffer .. tostring(text)
+if target and target.write then target.write(text) end
+end
+proxy.blit = function(text, fg, bg)
+buffer = buffer .. tostring(text)
+if target and target.blit then target.blit(text, fg, bg) end
+end
+
+
+proxy.setCursorPos = function(x, y)
+flush()
+if target and target.setCursorPos then target.setCursorPos(x, y) end
+end
+proxy.clear = function()
+flush()
+if target and target.clear then target.clear() end
+end
+proxy.flush = flush
+
+return proxy
+end
+
+
+
+
+
+
+
+local function ready(manager, record)
+for _, name in ipairs(record.requires) do
+local dependency = manager.list[name]
+if not dependency or dependency.state ~= services.RUNNING then
+return false, ("waiting for %s"):format(name)
+end
+end
+if record.ready then
+local ok, why = record.ready()
+if not ok then return false, why or "not ready" end
+end
+return true
+end
+
+services.ready = ready
+
+
+
+
+
+
+
+
+
+local function backoffFor(attempt)
+local index = math.min(math.max(tonumber(attempt) or 1, 1), #BACKOFF)
+return BACKOFF[index]
+end
+
+services.backoffFor = backoffFor
+
+
+
+
+
+local function supervise(manager, record)
+while true do
+if manager.halted then return end
+
+local isReady, why = ready(manager, record)
+if not isReady then
+if record.state ~= services.WAITING then
+record.state = services.WAITING
+record.blockedOn = why
+services.log(manager, record.name, why)
+end
+pause(manager, 1)
+else
+record.state = services.RUNNING
+record.blockedOn = nil
+record.startedAt = now(manager)
+services.log(manager, record.name, "started")
+
+local ok, err = pcall(record.start)
+
+
+
+
+if not ok and tostring(err) == "Terminated" then
+manager.halted = manager.halted or "Terminated"
+return
+end
+
+if manager.halted then return end
+
+local ranFor = now(manager) - (record.startedAt or now(manager))
+
+if ok then
+
+services.log(manager, record.name,
+("exited after %ds"):format(math.floor(ranFor / 1000)))
+else
+record.failures = record.failures + 1
+record.lastError = tostring(err)
+
+
+
+services.log(manager, record.name, "ERROR " .. tostring(err))
+end
+
+
+
+
+
+
+
+if ranFor >= STABLE_AFTER then
+record.attempts = 0
+else
+record.attempts = (record.attempts or 0) + 1
+end
+
+if not record.restart then
+record.state = services.STOPPED
+return
+end
+
+if record.attempts >= GIVE_UP_AFTER then
+record.state = services.HALTED
+services.log(manager, record.name,
+("gave up after %d short-lived start(s), %d of them errors")
+:format(record.attempts, record.failures))
+
+
+if record.critical then
+manager.halted = ("critical service %s gave up after %d "
+.. "short-lived starts: %s"):format(record.name,
+record.attempts,
+tostring(record.lastError or "it kept exiting"))
+end
+return
+end
+
+record.restarts = record.restarts + 1
+record.state = services.RESTARTING
+
+
+
+local wait = backoffFor(record.restarts)
+services.log(manager, record.name,
+("restarting in %ds (attempt %d)"):format(wait, record.restarts))
+pause(manager, wait)
+end
+end
+end
+
+services.supervise = supervise
+
+
+
+
+
+function services.stop(manager, name)
+local record = manager.list[name]
+if not record then return false, "no such service: " .. tostring(name) end
+record.restart = false
+record.state = services.STOPPED
+services.log(manager, name, "stopped by operator")
+return true
+end
+
+function services.start(manager, name)
+local record = manager.list[name]
+if not record then return false, "no such service: " .. tostring(name) end
+record.restart = true
+record.failures = 0
+record.attempts = 0
+record.state = services.WAITING
+services.log(manager, name, "started by operator")
+return true
+end
+
+
+
+
+
+
+function services.status(manager)
+local out = {}
+for _, name in ipairs(manager.order) do
+local record = manager.list[name]
+out[#out + 1] = {
+name = record.name,
+state = record.state,
+critical = record.critical,
+restarts = record.restarts,
+attempts = record.attempts,
+failures = record.failures,
+lastError = record.lastError,
+blockedOn = record.blockedOn,
+uptime = record.startedAt and (now(manager) - record.startedAt) or nil,
+}
+end
+return out
+end
+
+function services.halted(manager)
+return manager.halted
+end
+
+
+
+function services.terminalOwner(manager)
+for _, name in ipairs(manager.order) do
+if manager.list[name].terminal then return name end
+end
+return nil
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local INPUT = {key = true, key_up = true, char = true, paste = true,
+mouse_click = true, mouse_up = true, mouse_drag = true, mouse_scroll = true}
+
+
+
+
+local function sink(manager, name)
+local native = term.native()
+local width, height = native.getSize()
+return services.capture(manager, name,
+window.create(native, 1, 1, width, height, false))
+end
+
+
+
+local function schedule(manager, tasks)
+local owner = services.terminalOwner(manager)
+local ownerRecord = owner and manager.list[owner]
+local routines, filters, alive = {}, {}, 0
+for i, task in ipairs(tasks) do
+routines[i] = coroutine.create(task.fn)
+if not task.ends then alive = alive + 1 end
+end
+
+local event = {n = 0}
+local function isOwned()
+return ownerRecord ~= nil and ownerRecord.state == services.RUNNING
+end
+while true do
+local name = event[1]
+
+
+local ownedAtEvent = isOwned()
+for i, task in ipairs(tasks) do
+
+
+local owned = isOwned()
+local routine = routines[i]
+local hears = not (ownedAtEvent and INPUT[name] and task.name ~= owner)
+if routine and hears and (filters[i] == nil or filters[i] == name
+or name == "terminate") then
+local redirect = owned and task.sink and task.name ~= owner
+local previous
+if redirect then previous = term.redirect(task.sink) end
+local ok, param = coroutine.resume(routine, table.unpack(event, 1, event.n))
+if redirect then
+
+task.sink = term.current()
+term.redirect(previous)
+end
+if not ok then error(param, 0) end
+filters[i] = param
+if coroutine.status(routine) == "dead" then
+routines[i] = nil
+if task.ends then return end
+alive = alive - 1
+if alive == 0 then return end
+end
+end
+end
+event = table.pack(os.pullEventRaw())
+end
+end
+
+
+
+
+
+function services.run(manager)
+local owner = services.terminalOwner(manager)
+local tasks = {}
+for _, name in ipairs(manager.order) do
+local record = manager.list[name]
+tasks[#tasks + 1] = {name = name,
+sink = (owner and name ~= owner) and sink(manager, name) or nil}
+tasks[#tasks].fn = function()
+
+
+
+
+
+
+
+local ok, err = pcall(supervise, manager, record)
+if not ok then
+services.log(manager, record.name,
+"SUPERVISOR ERROR " .. tostring(err))
+record.state = services.HALTED
+record.lastError = tostring(err)
+if record.critical then
+manager.halted = ("the supervisor for critical service %s "
+.. "failed: %s"):format(record.name, tostring(err))
+end
+end
+end
+end
+if #tasks == 0 then return end
+
+
+
+
+
+tasks[#tasks + 1] = {name = "(halt)", ends = true, fn = function()
+while not manager.halted do sleep(0.5) end
+end}
+schedule(manager, tasks)
+return manager.halted
+end
+
+return services

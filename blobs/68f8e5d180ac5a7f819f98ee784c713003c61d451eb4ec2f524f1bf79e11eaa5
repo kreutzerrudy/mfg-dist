@@ -1,0 +1,60 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "register_script",
+label       = "Register a machine script",
+tier        = "node",
+manual      = true,
+destructive = true,
+
+parameters = {
+{name = "source", label = "Script", type = "text", required = true},
+{name = "expect", label = "Revision opened", type = "number", integer = true,
+min = 0, required = false},
+},
+
+returns = {script = "text", rev = "number", footprint = "table",
+warnings = "table", machines = "table", problems = "table"},
+
+run = function(params, ctx)
+if params.expect then
+local checked = scripts.check(params.source)
+local name = checked.tree and checked.tree.machine
+local current = name and scripts.get(name)
+local rev = current and current.rev or 0
+if name and rev ~= params.expect then
+return rpc.REJECTED, {stale = true, rev = rev, script = name,
+reason = ("%s is at revision %d now, not %d -- someone loaded it "
+.. "since it was opened"):format(name, rev, params.expect)}
+end
+end
+local record, report, problems = scripts.register(params.source, ctx.by)
+if not record then
+local first = report.errors[1] or {}
+return rpc.REJECTED, {errors = report.errors, warnings = report.warnings,
+reason = ("%d error(s); line %s: %s"):format(#report.errors,
+tostring(first.line), tostring(first.message))}
+end
+local following = {}
+for _, machine in ipairs(scripts.machines(record.name)) do
+following[#following + 1] = machine.name
+end
+return rpc.COMPLETED, {script = record.name, rev = record.rev,
+footprint = record.footprint, warnings = report.warnings,
+machines = following, problems = next(problems) and problems or nil}
+end,
+}

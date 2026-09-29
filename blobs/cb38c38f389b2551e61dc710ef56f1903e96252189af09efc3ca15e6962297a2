@@ -1,0 +1,288 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local routing = require("routing")
+local netcrypt = require("netcrypt")
+local netkeys = require("netkeys")
+local ip = require("ip")
+
+local net = {}
+
+local REGISTRY = "/services"
+
+local registry = nil
+local reverse = nil
+
+local function load()
+if registry then return registry end
+
+registry, reverse = {}, {}
+if not fs.exists(REGISTRY) then return registry end
+
+local handle = fs.open(REGISTRY, "r")
+if not handle then return registry end
+local data = handle.readAll()
+handle.close()
+
+for line in data:gmatch("[^\r\n]+") do
+
+local name, port = line:match("^%s*([%w_%-]+)%s+(%d+)")
+if name and not line:match("^%s*#") then
+registry[name] = tonumber(port)
+reverse[tonumber(port)] = name
+end
+end
+return registry
+end
+
+function net.services()
+return load()
+end
+
+function net.port(name)
+return load()[name]
+end
+
+function net.nameOf(port)
+load()
+return reverse[port]
+end
+
+
+function net.reload()
+registry, reverse = nil, nil
+return load()
+end
+
+local function portFor(name)
+if type(name) ~= "string" then
+return nil, "service name must be a string"
+end
+local port = net.port(name)
+if not port then
+return nil, ("unknown service '%s' -- add it to %s"):format(name, REGISTRY)
+end
+return port
+end
+
+
+
+
+function net.serve(name)
+local port, err = portFor(name)
+if not port then return false, err end
+return routing.bind(port)
+end
+
+function net.unserve(name)
+local port = net.port(name)
+if port then routing.unbind(port) end
+end
+
+
+
+
+
+
+function net.parseAddress(text)
+return ip.parse(text)
+end
+
+function net.formatAddress(address)
+return ip.format(address)
+end
+
+
+
+
+
+
+
+
+
+local function resolveName(name)
+local record, err = routing.lookupName(name)
+if not record then return nil, err end
+
+local voucher = netkeys.fromHex(record.voucher or "")
+if not voucher then return nil, ("no voucher for '%s'"):format(name) end
+
+
+
+local address, pk, vouchedName = netkeys.verifyVoucher(
+voucher, netkeys.decodeChain(record.chain))
+if not address then return nil, "voucher rejected: " .. tostring(pk) end
+if vouchedName ~= name then
+return nil, ("voucher names '%s', not '%s'"):format(
+tostring(vouchedName), name)
+end
+
+return address
+end
+
+
+
+
+
+
+
+
+local function candidates(name)
+if name:find(".", 1, true) then return {name} end
+
+local zone = net.zone()
+if zone == "" then return {name} end
+
+local out = {}
+while zone ~= "" do
+out[#out + 1] = name .. "." .. zone
+zone = zone:match("%.(.+)$") or ""
+end
+out[#out + 1] = name
+return out
+end
+
+
+local function addressFor(target)
+if type(target) == "number" then return target end
+if type(target) ~= "string" then
+return nil, "expected an address or a hostname"
+end
+
+
+
+local literal = ip.parse(target)
+if literal then return literal end
+
+local err
+for _, candidate in ipairs(candidates(target)) do
+local address
+address, err = resolveName(candidate)
+if address then return address end
+end
+return nil, err
+end
+
+
+
+function net.resolve(target)
+local address, err = addressFor(target)
+if not address then return nil, err end
+return ip.format(address)
+end
+
+
+
+function net.send(target, name, body)
+local port, err = portFor(name)
+if not port then return false, err end
+
+local address, resolveErr = addressFor(target)
+if not address then return false, resolveErr end
+
+
+return netcrypt.send(address, port, body, port)
+end
+
+
+function net.receive(name, timeout)
+local port = nil
+if name ~= nil then
+local err
+port, err = portFor(name)
+if not port then return nil, err end
+end
+
+local packet = netcrypt.receive(port, timeout)
+if not packet then return nil end
+
+return {
+
+src = ip.format(packet.src),
+service = net.nameOf(packet.dport) or packet.dport,
+body = packet.body,
+
+
+encrypted = packet.encrypted,
+
+
+from = packet.name,
+}
+end
+
+
+
+
+function net.nameFor(target)
+local address, addrErr = addressFor(target)
+if not address then return nil, addrErr end
+
+local record, err = routing.lookup(address)
+if not record then return nil, err end
+
+local voucher = netkeys.fromHex(record.voucher or "")
+if not voucher then return nil, "no voucher for that address" end
+
+local vouchedAddress, pk, name = netkeys.verifyVoucher(
+voucher, netkeys.decodeChain(record.chain))
+if not vouchedAddress then return nil, "voucher rejected: " .. tostring(pk) end
+if vouchedAddress ~= address then
+return nil, "voucher describes a different address"
+end
+
+return name ~= "" and name or nil
+end
+
+function net.isEncrypted(name)
+local port = net.port(name)
+return port ~= nil and netcrypt.isEncrypted(port)
+end
+
+
+function net.address()
+local address = routing.address()
+return address and ip.format(address) or nil
+end
+
+
+
+function net.hostname()
+return routing.localName()
+end
+
+
+
+
+
+
+function net.zone()
+local own = netkeys.zone()
+if own ~= "" then return own end
+
+local name = routing.localName()
+if not name then return "" end
+return name:match("%.(.+)$") or ""
+end
+
+
+function net.whoami()
+return net.hostname() or net.address() or "unassigned"
+end
+
+function net.ready()
+return netcrypt.isRunning() and routing.address() ~= nil
+end
+
+return net

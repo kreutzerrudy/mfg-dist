@@ -1,0 +1,403 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local blake3 = require("ccryptolib.blake3")
+local band = require("band")
+
+local hopnet = {}
+
+hopnet.messageEvent = "hopnet_message"
+
+local BROADCAST_CHANNEL = 65535
+
+
+local CHANNEL_SPACE = 65533
+
+local HOP_INTERVAL = 15
+local CHANNEL_CONTEXT = "acknet hopnet channel v1"
+
+local modems = {}
+local running = false
+local keyProvider = nil
+local hopChannels = {}
+
+
+
+
+
+
+
+
+
+local bands = {}
+local defaultBand = nil
+
+
+
+
+
+function hopnet.setKeyProvider(fn)
+keyProvider = fn
+end
+
+
+
+
+function hopnet.setBands(map, fallback)
+bands = map or {}
+defaultBand = fallback
+end
+
+function hopnet.bandFor(modem)
+return (modem and bands[modem]) or defaultBand
+end
+
+
+
+
+
+local linkCache = nil
+
+local function links()
+if linkCache then return linkCache end
+if not keyProvider then return {} end
+
+local ok, map = pcall(keyProvider)
+if ok and type(map) == "table" then
+linkCache = map
+return map
+end
+
+return {}
+end
+
+
+
+local function u64le(n)
+local b = {}
+for i = 1, 8 do
+b[i] = string.char(n % 256)
+n = math.floor(n / 256)
+end
+return table.concat(b)
+end
+
+local function slotNow()
+return math.floor(os.epoch("utc") / (HOP_INTERVAL * 1000))
+end
+
+local function msToNextSlot()
+local period = HOP_INTERVAL * 1000
+return period - (os.epoch("utc") % period)
+end
+
+
+
+
+
+
+
+local function channelForSlot(secret, slot, within)
+local out = blake3.deriveKey(CHANNEL_CONTEXT)(secret .. u64le(slot), 4)
+local n = ((out:byte(1) * 256 + out:byte(2)) * 256 + out:byte(3)) * 256
++ out:byte(4)
+
+
+
+
+
+if not within then return n % CHANNEL_SPACE end
+
+return within.base + (n % within.size)
+end
+
+hopnet.slotNow = slotNow
+
+
+
+function hopnet.init()
+modems = {}
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.getType(name) == "modem" then
+modems[#modems + 1] = name
+
+
+peripheral.call(name, "open", os.getComputerID())
+peripheral.call(name, "open", BROADCAST_CHANNEL)
+end
+end
+return #modems > 0
+end
+
+function hopnet.isOpen()
+for _, name in ipairs(modems) do
+if peripheral.call(name, "isOpen", os.getComputerID()) then return true end
+end
+return false
+end
+
+function hopnet.open()
+return hopnet.init()
+end
+
+function hopnet.close()
+for _, name in ipairs(modems) do
+peripheral.call(name, "closeAll")
+end
+end
+
+function hopnet.modems()
+return modems
+end
+
+
+
+function hopnet.localAddress()
+return os.getComputerID()
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+local fixedProtocols = {
+["acknet_hs"] = true,
+["acknet_peer"] = true,
+["acknet_dns"] = true,
+}
+
+function hopnet.setFixedProtocols(set)
+fixedProtocols = set
+end
+
+
+
+
+function hopnet.channelFor(peerId, protocol, modem)
+if protocol and fixedProtocols[protocol] then return peerId end
+
+local secret = links()[peerId]
+
+
+if not secret then return peerId end
+return channelForSlot(secret, slotNow(), hopnet.bandFor(modem))
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function activeBands()
+local seen, out = {}, {}
+local function add(b)
+if not b then return end
+local key = b.base .. ":" .. b.size
+if not seen[key] then
+seen[key] = true
+out[#out + 1] = b
+end
+end
+for _, b in pairs(bands) do add(b) end
+add(defaultBand)
+
+
+if #out == 0 then out[1] = false end
+return out
+end
+
+local function refreshWindow()
+local slot = slotNow()
+local wanted = {}
+local listening = activeBands()
+
+for peerId, secret in pairs(links()) do
+for _, within in ipairs(listening) do
+for offset = -1, 1 do
+local channel = channelForSlot(secret, slot + offset, within or nil)
+
+if channel ~= os.getComputerID() and channel ~= BROADCAST_CHANNEL then
+wanted[channel] = true
+end
+end
+end
+end
+
+for channel in pairs(wanted) do
+if not hopChannels[channel] then
+for _, name in ipairs(modems) do
+peripheral.call(name, "open", channel)
+end
+hopChannels[channel] = true
+end
+end
+
+for channel in pairs(hopChannels) do
+if not wanted[channel] then
+for _, name in ipairs(modems) do
+peripheral.call(name, "close", channel)
+end
+hopChannels[channel] = nil
+end
+end
+end
+
+
+
+
+
+
+local function transmitAll(channel, frame, only)
+local sent = false
+for _, name in ipairs(modems) do
+if not only or name == only then
+peripheral.call(name, "transmit", channel, os.getComputerID(), frame)
+sent = true
+end
+end
+return sent
+end
+
+function hopnet.send(peerId, message, protocol, modem)
+
+
+if peerId == os.getComputerID() then
+os.queueEvent(hopnet.messageEvent, peerId, message, protocol)
+return true
+end
+
+
+
+
+return transmitAll(hopnet.channelFor(peerId, protocol, modem), {
+src = os.getComputerID(),
+dst = peerId,
+protocol = protocol,
+body = message,
+}, modem)
+end
+
+function hopnet.broadcast(message, protocol)
+
+return transmitAll(BROADCAST_CHANNEL, {
+src = os.getComputerID(),
+bcast = true,
+protocol = protocol,
+body = message,
+})
+end
+
+
+
+local function daemonLoop()
+refreshWindow()
+local slotTimer = os.startTimer(msToNextSlot() / 1000 + 0.05)
+
+
+
+while true do
+local event, p1, p2, p3, p4 = os.pullEvent()
+
+if event == "modem_message" then
+local frame = p4
+
+
+
+if type(frame) == "table" and type(frame.src) == "number" then
+local mine = frame.bcast == true or frame.dst == os.getComputerID()
+if mine and frame.src ~= os.getComputerID() then
+
+
+
+os.queueEvent(hopnet.messageEvent,
+frame.src, frame.body, frame.protocol, p1)
+end
+end
+
+elseif event == "timer" and p1 == slotTimer then
+refreshWindow()
+slotTimer = os.startTimer(msToNextSlot() / 1000 + 0.05)
+
+
+
+
+elseif event == "net_link_changed" then
+linkCache = nil
+refreshWindow()
+
+
+
+
+elseif event == "hopnet_status" then
+local channels, count = {}, 0
+for channel in pairs(hopChannels) do channels[#channels + 1] = channel end
+table.sort(channels)
+for _ in pairs(links()) do count = count + 1 end
+os.queueEvent("hopnet_status_reply", slotNow(), count, channels,
+defaultBand and defaultBand.base or nil,
+defaultBand and defaultBand.size or nil)
+end
+end
+end
+
+function hopnet.runtime()
+if running then
+error("hopnet: daemon already running", 0)
+end
+running = true
+
+local ok, err = pcall(daemonLoop)
+
+running = false
+if not ok then error(err, 0) end
+end
+
+function hopnet.isRunning()
+return running == true
+end
+
+
+
+function hopnet.shutdown()
+running = false
+linkCache = nil
+bands = {}
+defaultBand = nil
+hopChannels = {}
+hopnet.close()
+end
+
+return hopnet

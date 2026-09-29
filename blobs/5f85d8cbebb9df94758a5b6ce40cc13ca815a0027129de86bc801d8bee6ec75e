@@ -1,0 +1,378 @@
+local acknet = {}
+
+
+
+
+
+
+
+
+
+local state = _G.__acknet
+if not state then
+state = {debug = false, running = false}
+_G.__acknet = state
+end
+
+state.pendingAcks = state.pendingAcks or {}
+state.retryTimers = state.retryTimers or {}
+state.seen = state.seen or {}
+state.seenTimeouts = state.seenTimeouts or {}
+
+
+
+state.hostnames = state.hostnames or {}
+
+state.outbox = state.outbox or {}
+
+local pendingAcks = state.pendingAcks
+local outbox = state.outbox
+local retryTimers = state.retryTimers
+local seen = state.seen
+local seenTimeouts = state.seenTimeouts
+local hostnames = state.hostnames
+
+
+
+
+
+local RETRY_BASE = 0.5
+local BACKOFF_BASE = 2
+local DEFAULT_ATTEMPTS = 3
+
+
+local SEEN_TIMEOUT = 60
+
+local DNS_PROTOCOL = "acknet_dns"
+local LOOKUP_TIMEOUT = 2
+
+
+
+
+local function log(...)
+if state.debug then os.queueEvent("acknet_debug", ...) end
+end
+
+
+function acknet.setDebug(enabled)
+state.debug = enabled
+end
+
+
+
+
+
+
+
+
+
+
+
+local substrate = require("rednetsub")
+
+
+
+function acknet.setSubstrate(mod)
+substrate = mod
+end
+
+function acknet.substrate()
+return substrate
+end
+
+
+
+
+function acknet.open(modem) return substrate.open(modem) end
+function acknet.close(modem) return substrate.close(modem) end
+function acknet.isOpen(modem) return substrate.isOpen(modem) end
+function acknet.localAddress() return substrate.localAddress() end
+
+
+
+
+local function mintId()
+return math.random(1, 2147483647)
+end
+
+local function transmit(handle)
+log("send", handle.id, handle.attempts)
+substrate.send(handle.peer, handle.message, handle.protocol)
+end
+
+
+
+local function queueBroadcast(message, protocol, raw)
+local id = mintId()
+outbox[id] = {message = message, protocol = protocol, raw = raw}
+os.queueEvent("acknet_broadcast", id)
+return id
+end
+
+
+
+local function scheduleRetry(handle)
+local delay = RETRY_BASE * (BACKOFF_BASE ^ handle.attempts)
+handle.retryTimer = os.startTimer(delay)
+retryTimers[handle.retryTimer] = handle.id
+return delay
+end
+
+local function resolve(handle)
+if handle.retryTimer then
+os.cancelTimer(handle.retryTimer)
+retryTimers[handle.retryTimer] = nil
+end
+pendingAcks[handle.id] = nil
+end
+
+
+
+function acknet.send(peer, msg, protocol, retries)
+local id = mintId()
+
+local handle = {
+id = id,
+peer = peer,
+message = {type = "msg", id = id, body = msg, timestamp = os.epoch("utc")},
+protocol = protocol,
+maxAttempts = retries or DEFAULT_ATTEMPTS,
+attempts = 0
+}
+pendingAcks[id] = handle
+
+
+
+
+
+os.queueEvent("acknet_transmit", id)
+
+return id
+end
+
+
+
+
+function acknet.broadcast(msg, protocol)
+local id = mintId()
+queueBroadcast(
+{type = "bcast", id = id, body = msg, timestamp = os.epoch("utc")},
+protocol, true)
+return id
+end
+
+function acknet.host(protocol, hostname)
+if type(protocol) ~= "string" or type(hostname) ~= "string" then
+error("acknet.host(protocol, hostname): both must be strings", 2)
+end
+if hostname == "localhost" then
+error("acknet.host: 'localhost' is reserved", 2)
+end
+hostnames[protocol] = hostname
+end
+
+function acknet.unhost(protocol)
+hostnames[protocol] = nil
+end
+
+
+
+
+
+
+
+
+
+
+function acknet.lookup(protocol, hostname, skipLocal)
+local results = nil
+if hostname == nil then results = {} end
+
+
+if hostnames[protocol] and not skipLocal then
+if hostname == nil then
+results[#results + 1] = substrate.localAddress()
+elseif hostname == hostnames[protocol] then
+return substrate.localAddress()
+end
+end
+
+if not substrate.isOpen() then
+if results then return table.unpack(results) end
+return nil
+end
+
+queueBroadcast(
+{type = "lookup", protocol = protocol, hostname = hostname},
+DNS_PROTOCOL, true)
+
+local timer = os.startTimer(LOOKUP_TIMEOUT)
+while true do
+local event, p1, p2, p3 = os.pullEvent()
+if event == "acknet_lookup" then
+local sender, foundProtocol, foundHostname = p1, p2, p3
+if foundProtocol == protocol then
+if hostname == nil then
+results[#results + 1] = sender
+elseif foundHostname == hostname then
+os.cancelTimer(timer)
+return sender
+end
+end
+elseif event == "timer" and p1 == timer then
+break
+end
+end
+
+if results then return table.unpack(results) end
+return nil
+end
+
+
+
+function acknet.receive(protocol_filter, timeout)
+local timer = nil
+local event_filter = nil
+if timeout then
+timer = os.startTimer(timeout)
+event_filter = nil
+else
+event_filter = "acknet_message"
+end
+while true do
+local event, p1, p2, p3 = os.pullEvent(event_filter)
+if event == "acknet_message" then
+local sender_id, body, protocol = p1, p2, p3
+if protocol_filter == nil or protocol == protocol_filter then
+if timer then os.cancelTimer(timer) end
+return {sender_id = sender_id, body = body, protocol = protocol}
+end
+elseif event == "timer" then
+if p1 == timer then
+return nil
+end
+end
+end
+end
+
+local function daemonLoop()
+while true do
+local event, p1, p2, p3 = os.pullEvent()
+if event == substrate.messageEvent then
+local sender, msg, protocol = p1, p2, p3
+
+if type(msg) == "table" then
+if msg.type == "msg" or msg.type == "bcast" then
+
+
+local key = sender .. ":" .. tostring(msg.id)
+if seen[key] then
+log("dup", msg.id, sender)
+else
+seen[key] = true
+seenTimeouts[os.startTimer(SEEN_TIMEOUT)] = key
+os.queueEvent("acknet_message", sender, msg.body, protocol)
+end
+
+
+if msg.type == "msg" then
+substrate.send(sender, {type = "ack", id = msg.id}, protocol)
+end
+
+elseif msg.type == "ack" then
+local handle = pendingAcks[msg.id]
+log("ack", msg.id, handle ~= nil)
+if handle then resolve(handle) end
+
+elseif msg.type == "lookup" then
+
+local hosted = hostnames[msg.protocol]
+if hosted and (msg.hostname == nil or msg.hostname == hosted) then
+substrate.send(sender,
+{type = "lookup_response", protocol = msg.protocol, hostname = hosted},
+DNS_PROTOCOL)
+end
+
+elseif msg.type == "lookup_response" then
+
+os.queueEvent("acknet_lookup", sender, msg.protocol, msg.hostname)
+end
+end
+
+
+
+
+elseif event == "acknet_transmit" then
+local handle = pendingAcks[p1]
+if handle and not handle.retryTimer and handle.attempts == 0 then
+transmit(handle)
+scheduleRetry(handle)
+end
+
+elseif event == "acknet_broadcast" then
+local out = outbox[p1]
+if out then
+outbox[p1] = nil
+log("bcast", p1)
+substrate.broadcast(out.message, out.protocol)
+end
+
+elseif event == "timer" then
+local pendingId = retryTimers[p1]
+if pendingId then
+retryTimers[p1] = nil
+local handle = pendingAcks[pendingId]
+if handle then
+handle.retryTimer = nil
+if handle.attempts >= handle.maxAttempts then
+
+
+pendingAcks[pendingId] = nil
+log("failed", pendingId, handle.attempts)
+os.queueEvent("acknet_transport_failed", pendingId)
+else
+handle.attempts = handle.attempts + 1
+transmit(handle)
+log("backoff", pendingId, scheduleRetry(handle))
+end
+end
+else
+
+local key = seenTimeouts[p1]
+if key then
+seenTimeouts[p1] = nil
+seen[key] = nil
+end
+end
+end
+end
+end
+
+
+function acknet.runtime()
+if state.running then
+error("acknet: daemon already running", 0)
+end
+state.running = true
+
+local ok, err = pcall(daemonLoop)
+
+state.running = false
+if not ok then error(err, 0) end
+end
+
+function acknet.isRunning()
+return state.running == true
+end
+
+
+
+
+
+
+
+function acknet.shutdown()
+state.running = false
+end
+
+return acknet

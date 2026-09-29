@@ -1,0 +1,68 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local tags = require("mfg.controller.tags")
+local alarms = require("mfg.controller.alarms")
+
+local scada = {}
+
+
+
+
+
+
+
+
+
+
+local latest = nil
+local latestAt = nil
+
+
+
+
+scada.EVERY = 30
+
+
+function scada.refresh(opts)
+latest = tags.snapshot(opts or {timeout = 2, attempts = 1}, latest)
+latestAt = os.epoch("utc")
+return latest, latestAt
+end
+
+
+function scada.refreshDue(now)
+if not latestAt then return true end
+return ((now or os.epoch("utc")) - latestAt) >= scada.EVERY * 1000
+end
+
+
+function scada._forget()
+latest, latestAt = nil, nil
+end
+
+
+
+
+
+
+
+function scada.tick(opts)
+local snapshot = scada.refresh(opts)
+local raised = alarms.evaluate(snapshot)
+return snapshot, raised
+end
+
+return scada

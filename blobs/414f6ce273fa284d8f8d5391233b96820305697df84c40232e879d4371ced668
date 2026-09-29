@@ -1,0 +1,363 @@
+
+
+
+
+
+
+
+
+
+
+
+local acknet = require("acknet")
+local netkeys = require("netkeys")
+local handshake = require("handshake")
+local ip = require("ip")
+
+local netsession = {}
+
+local PROTOCOL = "acknet_hs"
+local HOSTNAME = "server"
+local RESEND = 3
+local ATTEMPTS = 5
+local PENDING_TTL = 60
+
+
+
+local pending = {}
+local sessions = {}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local allocator = nil
+
+function netsession.setAllocator(fn)
+allocator = fn
+end
+
+local function frame(peer, t, ephHex, data)
+acknet.send(peer, {t = t, e = ephHex, d = netkeys.toHex(data)}, PROTOCOL)
+end
+
+local function sweep()
+local now = os.epoch("utc")
+for k, p in pairs(pending) do
+if now > p.expires then pending[k] = nil end
+end
+end
+
+local function handleMsg1(ourPk, sender, ephHex, msg1)
+local p = pending[ephHex]
+if p then
+
+
+frame(sender, 2, ephHex, p.msg2)
+return
+end
+
+local st = handshake.startResponder(ourPk)
+if not handshake.responderReadMsg1(st, msg1, netkeys.exchange) then
+return "message 1 failed authentication"
+end
+
+local msg2 = handshake.responderWriteMsg2(st, "")
+pending[ephHex] = {
+st = st,
+msg2 = msg2,
+sender = sender,
+expires = os.epoch("utc") + PENDING_TTL * 1000,
+}
+frame(sender, 2, ephHex, msg2)
+end
+
+
+
+
+local function handleMsg3(sender, ephHex, msg3, relay)
+local p = pending[ephHex]
+if not p then return "message 3 for an unknown session" end
+
+
+if p.reply then
+frame(sender, 4, ephHex, p.reply)
+return
+end
+
+local clientPk, offered, tx, rx = handshake.responderReadMsg3(p.st, msg3)
+if not clientPk then
+pending[ephHex] = nil
+return "message 3 failed authentication"
+end
+
+local clientHex = netkeys.toHex(clientPk)
+local reply
+
+
+
+if netkeys.isAllowed(clientPk) then
+
+
+
+local signingKey = nil
+if type(offered) == "string" and #offered == 32 then signingKey = offered end
+
+local plan, why
+if allocator then
+plan, why = allocator(clientPk, relay or sender, signingKey)
+end
+
+if not plan then
+why = why or "the server has no address to give"
+reply = handshake.seal(tx, 0,
+textutils.serialize({ok = false, reason = why}))
+print(("refused %s (%s)"):format(clientHex:sub(1, 16), tostring(why)))
+else
+sessions[clientHex] = {
+address = plan.address, tx = tx, rx = rx,
+counter = 1,
+
+
+
+
+
+peerAddress = (not relay) and sender or nil,
+
+link = (not relay) and handshake.linkSecret(rx, tx) or nil,
+}
+os.queueEvent("net_link_changed")
+
+
+
+
+local voucher, voucherErr = netkeys.issueVoucher(
+plan.address, clientPk, netkeys.nameFor(clientPk))
+
+if not voucher then
+reply = handshake.seal(tx, 0, textutils.serialize(
+{ok = false, reason = tostring(voucherErr)}))
+print(("refused %s (%s)"):format(
+clientHex:sub(1, 16), tostring(voucherErr)))
+else
+reply = handshake.seal(tx, 0, textutils.serialize({
+ok = true,
+address = plan.address,
+prefix = plan.prefix,
+gateway = plan.gateway,
+routes = plan.routes,
+
+
+
+
+band = plan.band,
+voucher = netkeys.toHex(voucher),
+
+
+cert = plan.cert,
+chain = plan.chain,
+
+
+relayed = relay ~= nil,
+}))
+print(("admitted %s as %s%s"):format(
+clientHex:sub(1, 16), ip.format(plan.address),
+plan.cert and "  (delegated)" or ""))
+end
+end
+else
+reply = handshake.seal(tx, 0,
+textutils.serialize({ok = false, reason = "not on the allowlist"}))
+print(("refused %s (not allowed)"):format(clientHex:sub(1, 16)))
+end
+
+
+p.reply = reply
+p.expires = os.epoch("utc") + PENDING_TTL * 1000
+frame(sender, 4, ephHex, reply)
+end
+
+function netsession.serve()
+netkeys.init()
+netkeys.initSigning()
+local ourPk = netkeys.publicKey()
+
+
+
+
+acknet.host(PROTOCOL, HOSTNAME)
+
+print("handshake server listening")
+print("exchange key: " .. netkeys.toHex(ourPk))
+print("signer key:   " .. netkeys.toHex(netkeys.signingKey()))
+
+while true do
+local packet = acknet.receive(PROTOCOL)
+sweep()
+
+local body = packet.body
+if type(body) == "table" and type(body.d) == "string"
+and type(body.e) == "string" then
+local data = netkeys.fromHex(body.d)
+local err
+if data and body.t == 1 then
+err = handleMsg1(ourPk, packet.sender_id, body.e, data)
+elseif data and body.t == 3 then
+err = handleMsg3(packet.sender_id, body.e, data,
+type(body.r) == "number" and body.r or nil)
+end
+if err then
+print(("from %d: %s"):format(packet.sender_id, err))
+end
+end
+end
+end
+
+function netsession.sessions()
+return sessions
+end
+
+
+
+
+local clientSession = nil
+
+
+
+
+function netsession.linkSecrets()
+local map = {}
+
+if clientSession and clientSession.link then
+map[clientSession.serverAddress] = clientSession.link
+end
+
+
+for _, session in pairs(sessions) do
+if session.link and session.peerAddress then
+map[session.peerAddress] = session.link
+end
+end
+return map
+end
+
+
+
+local function request(peer, t, ephHex, data, expect)
+for _ = 1, ATTEMPTS do
+frame(peer, t, ephHex, data)
+
+
+
+local deadline = os.epoch("utc") + RESEND * 1000
+while true do
+local remaining = (deadline - os.epoch("utc")) / 1000
+if remaining <= 0 then break end
+
+local packet = acknet.receive(PROTOCOL, remaining)
+if packet and packet.sender_id == peer
+and type(packet.body) == "table"
+and packet.body.t == expect
+and packet.body.e == ephHex then
+return netkeys.fromHex(packet.body.d)
+end
+end
+end
+return nil
+end
+
+
+function netsession.connect(serverAddress)
+netkeys.init()
+
+local serverPk = netkeys.serverKey()
+if not serverPk then
+return nil, "no pinned server key -- run 'netadmin pin <hex>'"
+end
+
+local st, msg1 = handshake.startInitiator(serverPk, "")
+local ephHex = netkeys.toHex(msg1:sub(1, 32))
+
+local msg2 = request(serverAddress, 1, ephHex, msg1, 2)
+if not msg2 then return nil, "no reply to message 1" end
+
+if not handshake.initiatorReadMsg2(st, msg2) then
+
+
+return nil, "message 2 failed authentication -- wrong server key?"
+end
+
+
+
+
+local offer = ""
+if netkeys.isServer() then offer = netkeys.signingKey() end
+
+local msg3, tx, rx = handshake.initiatorFinish(
+st, netkeys.publicKey(), netkeys.exchange, offer)
+
+local msg4 = request(serverAddress, 3, ephHex, msg3, 4)
+if not msg4 then return nil, "no reply to message 3" end
+
+local plain = handshake.open(rx, 0, msg4)
+if not plain then return nil, "welcome failed authentication" end
+
+local ok, welcome = pcall(textutils.unserialize, plain)
+if not ok or type(welcome) ~= "table" then
+return nil, "welcome was malformed"
+end
+if not welcome.ok then
+return nil, welcome.reason or "refused by server"
+end
+
+clientSession = {
+serverAddress = serverAddress,
+
+
+relayed = welcome.relayed == true,
+address = welcome.address,
+
+
+prefix = welcome.prefix,
+gateway = welcome.gateway,
+routes = welcome.routes,
+
+
+band = welcome.band,
+
+link = (welcome.relayed ~= true) and handshake.linkSecret(tx, rx) or nil,
+
+
+voucher = welcome.voucher,
+
+
+cert = welcome.cert,
+chain = welcome.chain,
+tx = tx,
+rx = rx,
+counter = 1,
+}
+os.queueEvent("net_link_changed")
+return clientSession
+end
+
+
+
+
+
+
+function netsession.findServer()
+return acknet.lookup(PROTOCOL, HOSTNAME, true)
+end
+
+return netsession

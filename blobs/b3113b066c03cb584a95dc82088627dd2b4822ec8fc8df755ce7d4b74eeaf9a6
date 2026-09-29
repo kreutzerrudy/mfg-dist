@@ -1,0 +1,68 @@
+local rpc = require("mfg.common.rpc")
+local recipes = require("mfg.controller.recipes")
+local supervisor = require("mfg.controller.supervisor")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "make",
+label       = "Make",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "recipe", label = "Recipe", type = "choice", required = true,
+choices = {source = "recipes"},
+help = "What to make. Its ingredients are made too, from the book, when "
+.. "the pool does not hold them."},
+
+{name = "quantity", label = "Quantity", type = "number", integer = true,
+min = 1, max = 4096, required = true,
+help = "How many items. Rounded up to whole crafting sets."},
+},
+
+returns = {job = "number", sets = "number", yield = "number", steps = "table",
+short = "table"},
+
+run = function(params, ctx)
+local def = recipes.get(params.recipe)
+if not def then
+return rpc.REJECTED, {reason = "no such recipe: " .. tostring(params.recipe)}
+end
+
+
+local job, second, third = supervisor.order(def.id, params.quantity,
+{by = ctx.by})
+local plan, why = third, second
+if job then plan, why = second, nil end
+
+local steps = {}
+for _, step in ipairs((plan or {}).steps or {}) do
+steps[#steps + 1] = {recipe = step.recipe, label = step.label,
+sets = step.sets, count = step.count, produces = step.produces}
+end
+
+if not job then
+return rpc.REJECTED, {
+reason = plan and ("short for %d %s -- %s -- nothing queued"):format(
+params.quantity, def.label, why) or why,
+short = plan and plan.shortfall, steps = steps,
+}
+end
+
+return rpc.COMPLETED, {job = job, sets = plan.sets, yield = plan.yield,
+label = def.label, product = def.output.item, steps = steps}
+end,
+}

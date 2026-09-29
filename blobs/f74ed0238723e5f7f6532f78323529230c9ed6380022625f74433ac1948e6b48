@@ -1,0 +1,54 @@
+
+
+
+
+
+
+
+
+local rednetsub = {}
+
+rednetsub.messageEvent = "rednet_message"
+
+
+
+function rednetsub.init()
+peripheral.find("modem", rednet.open)
+return rednet.isOpen()
+end
+
+
+function rednetsub.shutdown()
+end
+
+
+
+function rednetsub.localAddress()
+return os.getComputerID()
+end
+
+
+
+
+
+function rednetsub.send(peerId, message, protocol, modem)
+return rednet.send(peerId, message, protocol)
+end
+
+function rednetsub.broadcast(message, protocol)
+return rednet.broadcast(message, protocol)
+end
+
+function rednetsub.isOpen(modem)
+return rednet.isOpen(modem)
+end
+
+function rednetsub.open(modem)
+return rednet.open(modem)
+end
+
+function rednetsub.close(modem)
+return rednet.close(modem)
+end
+
+return rednetsub

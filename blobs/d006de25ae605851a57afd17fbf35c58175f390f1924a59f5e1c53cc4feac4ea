@@ -1,0 +1,36 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "count",
+label       = "Count an item in a volume",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "path", label = "Volume", type = "path", required = true,
+choices = {source = "volumes"},
+help = "A mount point such as /pool or /t1/in."},
+
+{name = "item", label = "Item", type = "item", required = false,
+choices = {source = "items"},
+help = "An item id, an id#nbt, or a #tag. Omit to count everything."},
+},
+
+returns = {count = "number"},
+
+run = function(params)
+local total, why = store.count(params.path, params.item)
+if not total then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {count = total}
+end,
+}

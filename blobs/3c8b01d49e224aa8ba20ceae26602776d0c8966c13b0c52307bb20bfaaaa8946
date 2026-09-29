@@ -1,0 +1,953 @@
+
+
+
+
+
+
+
+local x25519 = require("ccryptolib.x25519")
+local ed25519 = require("ccryptolib.ed25519")
+local random = require("ccryptolib.random")
+local ip = require("ip")
+
+local netkeys = {}
+
+local DIR = "/net"
+local F_STATIC = DIR .. "/static.key"
+local F_SERVER = DIR .. "/server.key"
+local F_SIGN = DIR .. "/sign.key"
+local F_SIGNER = DIR .. "/signer.key"
+local F_ALLOWED = DIR .. "/allowed"
+local F_ADDRESSES = DIR .. "/addresses"
+local F_ROLE = DIR .. "/role"
+local F_SUBSTRATE = DIR .. "/substrate"
+local F_PORTS = DIR .. "/ports"
+local F_NAMES = DIR .. "/names"
+local F_HOSTNAME = DIR .. "/hostname"
+local F_INTERFACES = DIR .. "/interfaces"
+local F_SUBNETS = DIR .. "/subnets"
+local F_CHAIN = DIR .. "/chain"
+local F_BAND = DIR .. "/band"
+
+
+
+
+local ADDRESS_START = 100
+
+
+
+
+
+local DEFAULT_NETWORK = 167772160
+local DEFAULT_PREFIX = 24
+
+
+
+local staticSk, staticPk
+local signSk, signPk
+
+
+
+
+local VOUCHER_CONTEXT = "acknet-voucher-v2"
+local VOUCHER_TTL = 24 * 60 * 60
+local NAME_LEN = 32
+local VOUCHER_LEN = 8 + 8 + NAME_LEN + 32 + 64
+
+function netkeys.toHex(s)
+return (s:gsub(".", function(c) return ("%02x"):format(c:byte()) end))
+end
+
+function netkeys.fromHex(h)
+if type(h) ~= "string" or #h % 2 ~= 0 or h:find("%X") then return nil end
+return (h:gsub("%x%x", function(b) return string.char(tonumber(b, 16)) end))
+end
+
+local function readFile(path)
+if not fs.exists(path) then return nil end
+local f = fs.open(path, "r")
+if not f then return nil end
+local data = f.readAll()
+f.close()
+return data
+end
+
+local function writeFile(path, data)
+if not fs.exists(DIR) then fs.makeDir(DIR) end
+local f = fs.open(path, "w")
+f.write(data)
+f.close()
+end
+
+
+
+function netkeys.init()
+if staticSk then return end
+
+local stored = readFile(F_STATIC)
+if stored then
+staticSk = netkeys.fromHex((stored:gsub("%s", "")))
+if not staticSk or #staticSk ~= 32 then
+error("netkeys: " .. F_STATIC .. " is corrupt", 0)
+end
+else
+if not random.isInit() then
+error("netkeys: seed the RNG before generating a key", 0)
+end
+staticSk = random.random(32)
+writeFile(F_STATIC, netkeys.toHex(staticSk))
+end
+staticPk = x25519.publicKey(staticSk)
+end
+
+function netkeys.publicKey()
+netkeys.init()
+return staticPk
+end
+
+
+function netkeys.exchange(peerPk)
+netkeys.init()
+return x25519.exchange(staticSk, peerPk)
+end
+
+
+
+
+
+
+
+local function u64le(n)
+local b = {}
+for i = 1, 8 do
+b[i] = string.char(n % 256)
+n = math.floor(n / 256)
+end
+return table.concat(b)
+end
+
+local function readU64le(s, at)
+local n = 0
+for i = 7, 0, -1 do
+n = n * 256 + s:byte(at + i)
+end
+return n
+end
+
+
+function netkeys.initSigning()
+if signSk then return end
+
+local stored = readFile(F_SIGN)
+if stored then
+signSk = netkeys.fromHex((stored:gsub("%s", "")))
+if not signSk or #signSk ~= 32 then
+error("netkeys: " .. F_SIGN .. " is corrupt", 0)
+end
+else
+if not random.isInit() then
+error("netkeys: seed the RNG before generating a signing key", 0)
+end
+signSk = random.random(32)
+writeFile(F_SIGN, netkeys.toHex(signSk))
+end
+signPk = ed25519.publicKey(signSk)
+end
+
+function netkeys.signingKey()
+netkeys.initSigning()
+return signPk
+end
+
+
+
+
+
+
+
+
+
+function netkeys.sign(context, data)
+if type(context) ~= "string" or context == "" then
+error("netkeys.sign: a context string is required", 2)
+end
+netkeys.initSigning()
+return ed25519.sign(signSk, signPk, context .. data)
+end
+
+
+
+
+
+
+
+
+
+
+
+function netkeys.signerKey()
+local h = readFile(F_SIGNER)
+if h then
+local pk = netkeys.fromHex((h:gsub("%s", "")))
+if pk and #pk == 32 then return pk end
+return nil
+end
+
+if netkeys.isServer() then return netkeys.signingKey() end
+return nil
+end
+
+function netkeys.setSignerKey(hex)
+local pk = netkeys.fromHex(hex)
+if not pk or #pk ~= 32 then
+error("netkeys.setSignerKey: expected 64 hex characters", 2)
+end
+writeFile(F_SIGNER, hex)
+end
+
+local NUL = string.char(0)
+
+local function padName(name)
+name = name or ""
+if #name > NAME_LEN then
+error(("netkeys: name longer than %d characters"):format(NAME_LEN), 0)
+end
+return name .. string.rep(NUL, NAME_LEN - #name)
+end
+
+local function unpadName(field)
+local stop = field:find(NUL, 1, true)
+return stop and field:sub(1, stop - 1) or field
+end
+
+
+
+
+
+
+
+function netkeys.issueVoucher(address, peerPk, name, ttl)
+netkeys.initSigning()
+
+local network, prefix = netkeys.authority()
+if not ip.contains(network, prefix, address) then
+return nil, ("%s is outside our grant of %s"):format(
+ip.format(address), ip.formatCidr(network, prefix))
+end
+
+local expires = os.epoch("utc") + (ttl or VOUCHER_TTL) * 1000
+local body = u64le(address) .. u64le(expires) .. padName(name) .. peerPk
+return body .. ed25519.sign(signSk, signPk, VOUCHER_CONTEXT .. body)
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local CERT_CONTEXT = "acknet-delegation-v1"
+local CERT_TTL = 24 * 60 * 60
+local CERT_LEN = 8 + 8 + 8 + NAME_LEN + 32 + 64
+
+
+
+
+local MAX_CHAIN = 8
+
+
+
+
+local function parseCert(cert)
+if type(cert) ~= "string" or #cert ~= CERT_LEN then return nil end
+local body = cert:sub(1, CERT_LEN - 64)
+return {
+network = readU64le(body, 1),
+prefix = readU64le(body, 9),
+expires = readU64le(body, 17),
+name = unpadName(body:sub(25, 24 + NAME_LEN)),
+signer = body:sub(25 + NAME_LEN),
+}
+end
+
+netkeys.parseCert = parseCert
+
+local function openCert(cert, byPk)
+local fields = parseCert(cert)
+if not fields then return nil, "malformed certificate" end
+
+local body = cert:sub(1, CERT_LEN - 64)
+local sig = cert:sub(CERT_LEN - 63)
+if not ed25519.verify(byPk, CERT_CONTEXT .. body, sig) then
+return nil, "bad certificate signature"
+end
+if os.epoch("utc") > fields.expires then return nil, "certificate expired" end
+
+return fields
+end
+
+
+function netkeys.chain()
+local out = {}
+local data = readFile(F_CHAIN)
+if not data then return out end
+for line in data:gmatch("[^\r\n]+") do
+local cert = netkeys.fromHex((line:gsub("%s", "")))
+if cert and #cert == CERT_LEN then out[#out + 1] = cert end
+end
+return out
+end
+
+
+
+
+function netkeys.decodeChain(hexList)
+if hexList == nil then return nil end
+if type(hexList) ~= "table" then return {} end
+
+local out = {}
+for _, hex in ipairs(hexList) do
+local cert = netkeys.fromHex(type(hex) == "string" and hex or "")
+out[#out + 1] = cert or ""
+end
+return out
+end
+
+function netkeys.chainHex()
+local out = {}
+for _, cert in ipairs(netkeys.chain()) do out[#out + 1] = netkeys.toHex(cert) end
+return out
+end
+
+function netkeys.setChain(hexList)
+local lines = {}
+for _, hex in ipairs(hexList or {}) do lines[#lines + 1] = hex end
+writeFile(F_CHAIN, table.concat(lines, "\n"))
+end
+
+
+
+
+function netkeys.authority()
+local chain = netkeys.chain()
+if #chain == 0 then return 0, 0 end
+
+local ours = parseCert(chain[1])
+if not ours then return 0, 0 end
+return ours.network, ours.prefix
+end
+
+function netkeys.issueCert(signerPk, network, prefix, name, ttl)
+netkeys.initSigning()
+
+if type(signerPk) ~= "string" or #signerPk ~= 32 then
+return nil, "expected a 32-byte signing key"
+end
+
+local ourNetwork, ourPrefix = netkeys.authority()
+if not ip.within(network, prefix, ourNetwork, ourPrefix) then
+return nil, ("%s is outside our own grant of %s"):format(
+ip.formatCidr(network, prefix),
+ip.formatCidr(ourNetwork, ourPrefix))
+end
+
+local expires = os.epoch("utc") + (ttl or CERT_TTL) * 1000
+local body = u64le(ip.network(network, prefix)) .. u64le(prefix)
+.. u64le(expires) .. padName(name) .. signerPk
+return body .. ed25519.sign(signSk, signPk, CERT_CONTEXT .. body)
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function qualify(label, zone)
+if zone == "" then return label end
+if label == "" then return zone end
+return label .. "." .. zone
+end
+
+netkeys.qualify = qualify
+
+
+local function descend(zone, label)
+if label == "" then return zone end
+return qualify(label, zone)
+end
+
+
+
+
+
+
+
+function netkeys.verifyVoucher(voucher, chain)
+local anchor = netkeys.signerKey()
+if not anchor then return nil, "no pinned signer key" end
+if type(voucher) ~= "string" or #voucher ~= VOUCHER_LEN then
+return nil, "malformed voucher"
+end
+
+
+local signer = anchor
+local network, prefix = 0, 0
+local zone = ""
+
+if chain ~= nil then
+if type(chain) ~= "table" then return nil, "malformed chain" end
+if #chain > MAX_CHAIN then return nil, "certificate chain too long" end
+
+for i = #chain, 1, -1 do
+local cert, why = openCert(chain[i], signer)
+if not cert then return nil, why end
+
+if not ip.within(cert.network, cert.prefix, network, prefix) then
+return nil, ("delegation of %s exceeds a grant of %s"):format(
+ip.formatCidr(cert.network, cert.prefix),
+ip.formatCidr(network, prefix))
+end
+
+signer, network, prefix = cert.signer, cert.network, cert.prefix
+
+
+zone = descend(zone, cert.name)
+end
+end
+
+local body = voucher:sub(1, VOUCHER_LEN - 64)
+local sig = voucher:sub(VOUCHER_LEN - 63)
+
+if not ed25519.verify(signer, VOUCHER_CONTEXT .. body, sig) then
+return nil, "bad signature"
+end
+
+local expires = readU64le(body, 9)
+if os.epoch("utc") > expires then return nil, "voucher expired" end
+
+local address = readU64le(body, 1)
+
+
+
+
+if not ip.contains(network, prefix, address) then
+return nil, ("%s is outside the signer's grant of %s"):format(
+ip.format(address), ip.formatCidr(network, prefix))
+end
+
+return address,
+body:sub(17 + NAME_LEN),
+qualify(unpadName(body:sub(17, 16 + NAME_LEN)), zone)
+end
+
+
+
+
+
+
+local function readNames()
+local data = readFile(F_NAMES)
+if not data then return {} end
+local ok, t = pcall(textutils.unserialize, data)
+if ok and type(t) == "table" then return t end
+return {}
+end
+
+function netkeys.names()
+return readNames()
+end
+
+function netkeys.nameFor(pk)
+return readNames()[netkeys.toHex(pk)]
+end
+
+function netkeys.setName(hex, name)
+if type(name) ~= "string" or name == "" or #name > NAME_LEN then
+error(("netkeys.setName: name must be 1-%d characters"):format(NAME_LEN), 2)
+end
+if name:find(NUL, 1, true) then
+error("netkeys.setName: name cannot contain a null byte", 2)
+end
+
+
+
+if name:find(".", 1, true) then
+error("netkeys.setName: a name cannot contain '.'", 2)
+end
+
+local names = readNames()
+for owner, taken in pairs(names) do
+if taken == name and owner ~= hex then
+error(("netkeys.setName: '%s' already belongs to %s"):format(
+name, owner:sub(1, 16)), 2)
+end
+end
+
+names[hex] = name
+writeFile(F_NAMES, textutils.serialize(names))
+end
+
+
+
+function netkeys.zone()
+local zone = ""
+local chain = netkeys.chain()
+
+for i = #chain, 1, -1 do
+local cert = parseCert(chain[i])
+if not cert then return zone end
+zone = descend(zone, cert.name)
+end
+return zone
+end
+
+
+
+
+
+function netkeys.hostname()
+local h = readFile(F_HOSTNAME)
+return h and (h:gsub("%s", "")) or nil
+end
+
+function netkeys.setHostname(name)
+if type(name) ~= "string" or name == "" or #name > NAME_LEN then
+error(("netkeys.setHostname: name must be 1-%d characters"):format(NAME_LEN), 2)
+end
+if name:find("%s") then
+error("netkeys.setHostname: name cannot contain spaces", 2)
+end
+writeFile(F_HOSTNAME, name)
+end
+
+
+
+
+
+
+
+
+
+function netkeys.assignName(hex, preferred)
+if type(preferred) ~= "string" or preferred == "" then
+return nil, "no name requested"
+end
+
+local names = readNames()
+
+
+
+if names[hex] then return names[hex] end
+
+local taken = {}
+for owner, name in pairs(names) do
+if owner ~= hex then taken[name] = true end
+end
+
+if #preferred <= NAME_LEN and not taken[preferred] then
+netkeys.setName(hex, preferred)
+return preferred
+end
+
+for n = 1, 999 do
+local suffix = tostring(n)
+
+local candidate = preferred:sub(1, NAME_LEN - #suffix) .. suffix
+if not taken[candidate] then
+netkeys.setName(hex, candidate)
+return candidate
+end
+end
+
+return nil, ("no free variant of '%s'"):format(preferred)
+end
+
+function netkeys.keyForName(name)
+for hex, assigned in pairs(readNames()) do
+if assigned == name then return hex end
+end
+return nil
+end
+
+function netkeys.role()
+local r = readFile(F_ROLE)
+return r and (r:gsub("%s", "")) or nil
+end
+
+
+
+function netkeys.isServer()
+local r = netkeys.role()
+return r == "server" or r == "both"
+end
+
+function netkeys.isClient()
+local r = netkeys.role()
+return r == "client" or r == "both"
+end
+
+
+
+function netkeys.substrate()
+local s = readFile(F_SUBSTRATE)
+return s and (s:gsub("%s", "")) or "rednet"
+end
+
+function netkeys.setSubstrate(name)
+if name ~= "rednet" and name ~= "hopnet" then
+error("netkeys.setSubstrate: expected 'rednet' or 'hopnet'", 2)
+end
+writeFile(F_SUBSTRATE, name)
+end
+
+
+
+
+function netkeys.encryptedPorts()
+local set = {}
+local data = readFile(F_PORTS)
+if not data then return set end
+for line in data:gmatch("[^\r\n]+") do
+local port = tonumber((line:gsub("%s", "")))
+if port then set[port] = true end
+end
+return set
+end
+
+function netkeys.setPortEncrypted(port, enabled)
+local set = netkeys.encryptedPorts()
+set[port] = enabled and true or nil
+
+local ports = {}
+for value in pairs(set) do ports[#ports + 1] = value end
+table.sort(ports)
+
+local lines = {}
+for _, value in ipairs(ports) do lines[#lines + 1] = tostring(value) end
+writeFile(F_PORTS, table.concat(lines, "\n"))
+end
+
+function netkeys.setRole(role)
+if role ~= "server" and role ~= "client" and role ~= "both" then
+error("netkeys.setRole: role must be 'server', 'client' or 'both'", 2)
+end
+writeFile(F_ROLE, role)
+end
+
+
+
+function netkeys.serverKey()
+local h = readFile(F_SERVER)
+if not h then return nil end
+local pk = netkeys.fromHex((h:gsub("%s", "")))
+if not pk or #pk ~= 32 then return nil end
+return pk
+end
+
+function netkeys.setServerKey(hex)
+local pk = netkeys.fromHex(hex)
+if not pk or #pk ~= 32 then
+error("netkeys.setServerKey: expected 64 hex characters", 2)
+end
+writeFile(F_SERVER, hex)
+end
+
+
+local function readAllowed()
+local set = {}
+local data = readFile(F_ALLOWED)
+if not data then return set end
+for line in data:gmatch("[^\r\n]+") do
+local hex = line:gsub("%s", "")
+if #hex == 64 then set[hex] = true end
+end
+return set
+end
+
+function netkeys.allowed()
+return readAllowed()
+end
+
+function netkeys.isAllowed(pk)
+return readAllowed()[netkeys.toHex(pk)] == true
+end
+
+function netkeys.allow(hex)
+local pk = netkeys.fromHex(hex)
+if not pk or #pk ~= 32 then
+error("netkeys.allow: expected 64 hex characters", 2)
+end
+local set = readAllowed()
+set[hex] = true
+local lines = {}
+for k in pairs(set) do lines[#lines + 1] = k end
+table.sort(lines)
+writeFile(F_ALLOWED, table.concat(lines, "\n"))
+end
+
+function netkeys.revoke(hex)
+local set = readAllowed()
+set[hex] = nil
+local lines = {}
+for k in pairs(set) do lines[#lines + 1] = k end
+table.sort(lines)
+writeFile(F_ALLOWED, table.concat(lines, "\n"))
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function readLines(path)
+local out = {}
+local data = readFile(path)
+if not data then return out end
+for line in data:gmatch("[^\r\n]+") do
+local trimmed = line:match("^%s*(.-)%s*$")
+if trimmed ~= "" and not trimmed:match("^#") then out[#out + 1] = trimmed end
+end
+return out
+end
+
+
+
+function netkeys.interfaces()
+local out = {}
+for _, line in ipairs(readLines(F_INTERFACES)) do
+local cidr, modem = line:match("^(%S+)%s*(%S*)$")
+local addr, prefix = ip.parseCidr(cidr or "")
+if addr then
+out[#out + 1] = {
+address = addr,
+prefix = prefix,
+modem = modem ~= "" and modem or nil,
+}
+end
+end
+return out
+end
+
+local function writeInterfaces(list)
+local lines = {}
+for _, iface in ipairs(list) do
+lines[#lines + 1] = ip.formatCidr(iface.address, iface.prefix)
+.. (iface.modem and (" " .. iface.modem) or "")
+end
+writeFile(F_INTERFACES, table.concat(lines, "\n"))
+end
+
+function netkeys.addInterface(address, prefix, modem)
+local list = netkeys.interfaces()
+for i, iface in ipairs(list) do
+
+
+if iface.address == address then
+table.remove(list, i)
+break
+end
+end
+list[#list + 1] = {address = address, prefix = prefix, modem = modem}
+writeInterfaces(list)
+end
+
+function netkeys.removeInterface(address)
+local list, kept = netkeys.interfaces(), {}
+for _, iface in ipairs(list) do
+if iface.address ~= address then kept[#kept + 1] = iface end
+end
+writeInterfaces(kept)
+return #kept < #list
+end
+
+
+
+
+function netkeys.serverInterfaces()
+local list = netkeys.interfaces()
+if #list > 0 then return list end
+return {{address = DEFAULT_NETWORK + 1, prefix = DEFAULT_PREFIX, modem = nil}}
+end
+
+
+
+function netkeys.subnets()
+local out = {}
+for _, line in ipairs(readLines(F_SUBNETS)) do
+
+
+
+local bandBase, bandSize = line:match("band%s+(%d+)%s+(%d+)%s*$")
+local head = line:gsub("%s*band%s+%d+%s+%d+%s*$", "")
+
+local cidr, via = head:match("^(%S+)%s+via%s+(%S+)$")
+if not cidr then cidr = head:match("^(%S+)$") end
+
+local network, prefix = ip.parseCidr(cidr or "")
+if network then
+out[#out + 1] = {
+network = ip.network(network, prefix),
+prefix = prefix,
+via = via and ip.parse(via) or nil,
+band = bandBase and
+{base = tonumber(bandBase), size = tonumber(bandSize)} or nil,
+}
+end
+end
+
+if #out == 0 then
+out[1] = {network = DEFAULT_NETWORK, prefix = DEFAULT_PREFIX}
+end
+return out
+end
+
+local function writeSubnets(list)
+local lines = {}
+for _, subnet in ipairs(list) do
+lines[#lines + 1] = ip.formatCidr(subnet.network, subnet.prefix)
+.. (subnet.via and (" via " .. ip.format(subnet.via)) or "")
+.. (subnet.band and
+(" band " .. subnet.band.base .. " " .. subnet.band.size) or "")
+end
+writeFile(F_SUBNETS, table.concat(lines, "\n"))
+end
+
+function netkeys.setSubnet(network, prefix, via, subnetBand)
+network = ip.network(network, prefix)
+
+local list = {}
+for _, subnet in ipairs(netkeys.subnets()) do
+if not (subnet.network == network and subnet.prefix == prefix) then
+list[#list + 1] = subnet
+end
+end
+list[#list + 1] = {network = network, prefix = prefix, via = via,
+band = subnetBand}
+writeSubnets(list)
+end
+
+
+
+
+function netkeys.band()
+local text = readFile(F_BAND)
+if not text then return nil end
+local base, size = text:match("(%d+)%s+(%d+)")
+if not base then return nil end
+return {base = tonumber(base), size = tonumber(size)}
+end
+
+function netkeys.setBand(b)
+if not b then
+if fs.exists(F_BAND) then fs.delete(F_BAND) end
+return
+end
+writeFile(F_BAND, b.base .. " " .. b.size)
+end
+
+function netkeys.removeSubnet(network, prefix)
+network = ip.network(network, prefix)
+
+local list, kept = netkeys.subnets(), {}
+for _, subnet in ipairs(list) do
+if not (subnet.network == network and subnet.prefix == prefix) then
+kept[#kept + 1] = subnet
+end
+end
+writeSubnets(kept)
+return #kept < #list
+end
+
+
+
+
+
+
+
+local function readAddresses()
+local data = readFile(F_ADDRESSES)
+if not data then return {} end
+local ok, t = pcall(textutils.unserialize, data)
+if ok and type(t) == "table" then return t end
+return {}
+end
+
+
+function netkeys.addresses()
+local out = {}
+for hex, dotted in pairs(readAddresses()) do
+local addr = type(dotted) == "string" and ip.parse(dotted) or nil
+if addr then out[hex] = addr end
+end
+return out
+end
+
+local function storeAddress(hex, address)
+local book = readAddresses()
+book[hex] = ip.format(address)
+writeFile(F_ADDRESSES, textutils.serialize(book))
+end
+
+
+
+function netkeys.setAddress(hex, address)
+storeAddress(hex, address)
+end
+
+
+
+
+
+
+function netkeys.addressFor(pk, network, prefix)
+local hex = netkeys.toHex(pk)
+local book = netkeys.addresses()
+
+local existing = book[hex]
+if existing and ip.contains(network, prefix, existing) then return existing end
+
+local base = ip.network(network, prefix)
+local last = ip.broadcastOf(network, prefix)
+
+local taken = {}
+for _, addr in pairs(book) do taken[addr] = true end
+
+
+
+for candidate = base + ADDRESS_START, last - 1 do
+if not taken[candidate] then
+storeAddress(hex, candidate)
+return candidate
+end
+end
+
+return nil, ("no free address in %s"):format(ip.formatCidr(base, prefix))
+end
+
+return netkeys

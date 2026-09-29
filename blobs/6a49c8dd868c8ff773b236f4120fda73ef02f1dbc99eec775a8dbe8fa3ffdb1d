@@ -1,0 +1,156 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local types = require("mfg.common.actions.types")
+
+local validate = {}
+
+
+
+
+function validate.declaration(decl)
+if type(decl) ~= "table" then return false, {"not a table"} end
+
+local errors = {}
+if type(decl.name) ~= "string" or decl.name == "" then
+errors[#errors + 1] = "an action needs a name"
+end
+if type(decl.run) ~= "function" then
+errors[#errors + 1] = ("%s: a declaration with no handler is an action "
+.. "that fails when picked"):format(tostring(decl.name))
+end
+
+local seen = {}
+for index, param in ipairs(decl.parameters or {}) do
+local where = ("%s parameter %d"):format(tostring(decl.name), index)
+if type(param) ~= "table" then
+errors[#errors + 1] = where .. ": not a table"
+else
+if type(param.name) ~= "string" or param.name == "" then
+errors[#errors + 1] = where .. ": needs a name"
+elseif seen[param.name] then
+errors[#errors + 1] = where .. ": duplicates " .. param.name
+else
+seen[param.name] = true
+end
+if not types.get(param.type) then
+errors[#errors + 1] = ("%s: unknown type '%s' -- one of %s")
+:format(where, tostring(param.type),
+table.concat(types.names(), ", "))
+end
+end
+end
+
+
+
+if decl.needs ~= nil then
+local good = type(decl.needs) == "table"
+for _, id in ipairs(good and decl.needs or {}) do
+if type(id) ~= "string" or id == "" then good = false end
+end
+if not good then
+errors[#errors + 1] = ("%s: needs is a list of item ids"):format(tostring(decl.name))
+end
+end
+
+if #errors > 0 then return false, errors end
+return true
+end
+
+
+
+
+
+
+
+
+function validate.parameters(decl, supplied)
+supplied = supplied or {}
+local out, errors = {}, {}
+local declared = {}
+
+for _, param in ipairs(decl.parameters or {}) do
+declared[param.name] = true
+local value = supplied[param.name]
+
+if value == nil and param.default ~= nil then
+value = param.default
+end
+
+if value == nil then
+if param.required then
+errors[#errors + 1] = ("%s is required"):format(
+param.label or param.name)
+end
+else
+local kind = types.get(param.type)
+local coerced = kind.coerce(value)
+if coerced == nil then
+errors[#errors + 1] = ("%s: %s is not a %s"):format(
+param.label or param.name, tostring(value), param.type)
+else
+local ok, why = kind.check(coerced, param)
+if ok then
+out[param.name] = coerced
+else
+errors[#errors + 1] = ("%s: %s"):format(
+param.label or param.name, why)
+end
+end
+end
+end
+
+
+
+
+
+
+
+
+
+
+
+
+local transport = {command = true, rpc = true, action = true,
+status = true, from = true, src = true, encrypted = true,
+attempts = true, reason = true,
+
+
+operator = true, policy = true}
+
+for name in pairs(supplied) do
+if not declared[name] and not transport[name] then
+errors[#errors + 1] = ("unknown parameter: %s"):format(tostring(name))
+end
+end
+
+if #errors > 0 then return nil, errors end
+return out
+end
+
+
+function validate.check(decl, supplied)
+local params, errors = validate.parameters(decl, supplied)
+if not params then
+return nil, table.concat(errors, "; "), errors
+end
+return params
+end
+
+return validate

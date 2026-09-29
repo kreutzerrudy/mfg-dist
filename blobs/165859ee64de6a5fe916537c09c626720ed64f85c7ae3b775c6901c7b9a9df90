@@ -1,0 +1,25 @@
+
+
+
+
+
+
+
+
+local acknet = require("acknet")
+local routing = require("routing")
+
+local wasAck = acknet.isRunning()
+local wasRoute = routing.isRunning()
+
+acknet.shutdown()
+routing.shutdown()
+
+print(("acknet:  %s"):format(wasAck and "flag cleared" or "was already clear"))
+print(("routing: %s"):format(wasRoute and "flag cleared" or "was already clear"))
+
+if wasAck or wasRoute then
+print()
+print("if a netstart is still open in another tab, stop it first --")
+print("this only cleared the flag, it did not stop anything")
+end

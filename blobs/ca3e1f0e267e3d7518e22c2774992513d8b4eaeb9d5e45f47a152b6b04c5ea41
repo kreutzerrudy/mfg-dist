@@ -1,0 +1,61 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+parameters = {
+{name = "controller", label = "Controller", type = "text", default = "mfg",
+maxLength = 64,
+help = "The hostname this node addresses the controller by."},
+
+{name = "source", label = "Source volume", type = "path", default = "/pool",
+help = "The volume batches draw from and a picker shows -- one volume, so "
+.. "what the operator saw is what the batch counts against."},
+
+{name = "feed.mode", label = "Feed", type = "choice", default = "pull",
+choices = {"pull", "push"},
+help = "pull: the turtle sucks from the chest in front. push: a chute "
+.. "delivers into it."},
+
+{name = "feed.side", label = "Feed lock side", type = "choice",
+choices = {"left", "right", "top", "bottom", "front", "back"},
+help = "Redstone side that locks a chute. Unset means no lock."},
+
+{name = "parent", label = "Parent", type = "text", maxLength = 32,
+help = "The computer id or address of the station this controller is "
+.. "delegated under. Unset means it discovers, or has none."},
+
+
+
+
+{name = "dist", label = "Dist repo", type = "text", maxLength = 200,
+default = "https://raw.githubusercontent.com/kreutzerrudy/mfg-dist/main",
+help = "The dist repo's base URL: blobs/<sha256> and builds/<build>/ under it."},
+},
+}

@@ -1,0 +1,42 @@
+local rpc = require("mfg.common.rpc")
+local roles = require("mfg.common.roles")
+local configs = require("mfg.controller.configs")
+
+
+
+
+
+
+
+
+
+
+
+
+local names = {}
+for name in pairs(roles) do names[#names + 1] = name end
+table.sort(names)
+
+return {
+name        = "assign_role",
+label       = "Assign a node's role",
+tier        = "node",
+manual      = true,
+destructive = true,
+
+parameters = {
+{name = "node", label = "Node", type = "node", required = true,
+help = "The node's name, as minted. It need not exist yet."},
+{name = "role", label = "Role", type = "choice", required = true,
+choices = names,
+help = "What it should be. Its profile in roles.lua decides the rest."},
+},
+
+returns = {node = "text", role = "text", rev = "number"},
+
+run = function(params)
+local record, why = configs.assign(params.node, params.role)
+if not record then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {node = params.node, role = record.role, rev = record.rev}
+end,
+}

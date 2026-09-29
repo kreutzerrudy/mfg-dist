@@ -1,0 +1,47 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+local dispatch = require("mfg.controller.dispatch")
+local holds = require("mfg.controller.holds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "hold",
+label       = "Hold stock for a cart",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "lines", label = "Lines", type = "items", required = true,
+help = "item -> count: the cart's whole state. Empty releases everything."},
+},
+
+
+returns = {held = "items", short = "items"},
+
+run = function(params, ctx)
+local holder = ctx and ctx.by
+if not holder then
+return rpc.REJECTED, {reason = "a hold is kept for the device that asks, "
+.. "and this request came from none"}
+end
+local pool = require("mfg.common.config").setting("source")
+local stock, why = store.stock(pool)
+if not stock then return rpc.REJECTED, {reason = tostring(why)} end
+
+local held, short = holds.set(holder, params.lines, stock, dispatch.claims())
+if not held then return rpc.REJECTED, {reason = short} end
+return rpc.COMPLETED, {held = held, short = short}
+end,
+}

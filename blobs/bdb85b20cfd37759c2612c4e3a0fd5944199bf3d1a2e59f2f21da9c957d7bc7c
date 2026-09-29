@@ -1,0 +1,47 @@
+local rpc = require("mfg.common.rpc")
+local node = require("mfg.turtle.node")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "craft",
+label       = "Craft",
+role        = "turtle",
+tier        = "node",
+
+
+
+
+
+manual      = true,
+destructive = true,
+
+
+needs       = {"minecraft:crafting_table"},
+requires    = {state = "idle"},
+parameters  = {},
+returns     = {produced = "items", consumed = "items"},
+
+run = function()
+local ok, result = node.craft()
+if not ok then return rpc.REJECTED, {reason = tostring(result)} end
+return rpc.COMPLETED, result
+end,
+}

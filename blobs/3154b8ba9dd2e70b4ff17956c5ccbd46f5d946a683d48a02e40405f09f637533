@@ -1,0 +1,1051 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = {}
+
+
+
+
+
+
+doc.REQUIRED = "required"
+
+
+
+
+doc.TRUNCATED = ".."
+
+local function element(kind, fields)
+local e = fields or {}
+e.kind = kind
+if e.keep == nil then e.keep = 1 end
+return e
+end
+
+function doc.text(value, opts)
+opts = opts or {}
+return element("text", {
+value = tostring(value == nil and "" or value),
+colour = opts.colour or "text",
+width = opts.width or "auto",
+align = opts.align or "left",
+truncate = opts.truncate,
+
+
+
+wrap = opts.wrap,
+keep = opts.keep,
+name = opts.name,
+action = opts.action,
+when = opts.when,
+
+
+bg = opts.bg,
+})
+end
+
+function doc.stack(children, opts)
+opts = opts or {}
+return element("stack", {children = children or {}, keep = opts.keep,
+name = opts.name, when = opts.when, height = opts.height, bg = opts.bg,
+width = opts.width})
+end
+
+function doc.row(children, opts)
+opts = opts or {}
+return element("row", {children = children or {}, keep = opts.keep,
+name = opts.name, when = opts.when, width = opts.width, bg = opts.bg})
+end
+
+
+function doc.gap(cells)
+return element("gap", {size = cells or 1, keep = doc.REQUIRED})
+end
+
+
+
+
+
+
+function doc.spacer(opts)
+opts = opts or {}
+return element("spacer", {width = "fill", keep = doc.REQUIRED,
+min = opts.min or 0})
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function doc.button(label, opts)
+opts = opts or {}
+return element("button", {
+label = tostring(label),
+key = opts.key and tostring(opts.key) or nil,
+
+
+
+
+keyLabel = opts.keyLabel and tostring(opts.keyLabel) or nil,
+colour = opts.colour or "action",
+width = opts.width or "auto",
+
+
+align = opts.align or (opts.width == "fill" and "centre" or "left"),
+keep = opts.keep,
+name = opts.name or tostring(label),
+action = opts.action,
+when = opts.when,
+
+
+
+
+style = opts.style,
+alt = opts.alt,
+bg = opts.bg,
+})
+end
+
+
+
+
+
+
+
+
+
+
+
+function doc.slider(opts)
+opts = opts or {}
+local min = tonumber(opts.min) or 0
+local max = tonumber(opts.max) or min
+if max < min then max = min end
+local value = tonumber(opts.value) or min
+if value < min then value = min end
+if value > max then value = max end
+return element("slider", {
+min = min, max = max, value = value,
+width = opts.width or "fill",
+colour = opts.colour or "selected",
+restColour = opts.restColour or "dim",
+keep = opts.keep,
+name = opts.name or "slider",
+
+action = opts.action,
+when = opts.when,
+})
+end
+
+
+
+
+
+
+
+
+local showKeys = false
+
+
+
+
+
+
+
+
+
+
+
+
+local contested = {}
+
+
+
+local function buttonInner(e)
+if showKeys and e.key and not contested[e.key] then
+return ("%s %s"):format(e.keyLabel or e.key, e.label)
+end
+return e.label
+end
+
+
+local function buttonText(e)
+return "[" .. buttonInner(e) .. "]"
+end
+
+function doc.rule(opts)
+opts = opts or {}
+return element("rule", {char = opts.char or "-", colour = opts.colour or "dim",
+keep = opts.keep, name = opts.name, when = opts.when})
+end
+
+
+function doc.field(opts)
+return element("field", {
+label = tostring(opts.label or ""),
+value = tostring(opts.value == nil and "" or opts.value),
+colour = opts.colour or "text",
+labelColour = opts.labelColour or "label",
+leader = opts.leader,
+width = opts.width or "auto",
+keep = opts.keep,
+name = opts.name or opts.label,
+action = opts.action,
+when = opts.when,
+})
+end
+
+
+
+function doc.table(opts)
+return element("table", {
+columns = opts.columns or {},
+rows = opts.rows or {},
+headColour = opts.headColour or "label",
+keep = opts.keep,
+name = opts.name,
+when = opts.when,
+gap = opts.gap or 1,
+})
+end
+
+
+
+local function truncateTo(text, width, marker)
+if width <= 0 then return "" end
+if #text <= width then return text end
+marker = marker or ""
+if #marker >= width then return text:sub(1, width) end
+return text:sub(1, width - #marker) .. marker
+end
+
+local function pad(text, width, align)
+local short = width - #text
+if short <= 0 then return text end
+if align == "right" then return (" "):rep(short) .. text end
+if align == "centre" or align == "center" then
+local left = math.floor(short / 2)
+return (" "):rep(left) .. text .. (" "):rep(short - left)
+end
+return text .. (" "):rep(short)
+end
+
+
+local function naturalWidth(e)
+if e.kind == "text" then return #e.value end
+if e.kind == "button" then return #buttonText(e) end
+if e.kind == "gap" then return e.size end
+if e.kind == "spacer" then return e.min end
+if e.kind == "rule" then return 1 end
+
+
+if e.kind == "slider" then return 3 end
+if e.kind == "field" then
+return #e.label + 1 + #e.value
+end
+if e.kind == "table" then
+local total = 0
+for i, column in ipairs(e.columns) do
+total = total + (tonumber(column.width) or #tostring(column.head or ""))
+if i > 1 then total = total + e.gap end
+end
+return total
+end
+if e.kind == "row" then
+local total = 0
+for _, child in ipairs(e.children) do total = total + naturalWidth(child) end
+return total
+end
+if e.kind == "stack" then
+local widest = 0
+for _, child in ipairs(e.children) do
+widest = math.max(widest, naturalWidth(child))
+end
+return widest
+end
+return 0
+end
+
+
+
+
+
+local function naturalHeight(e, width)
+
+
+
+if e.kind == "spacer" then return 0 end
+if e.kind == "text" and e.wrap and width and width > 0 then
+return math.max(1, math.ceil(#e.value / width))
+end
+if e.kind == "stack" then
+local total = 0
+for _, child in ipairs(e.children) do
+total = total + naturalHeight(child, tonumber(e.width) or width)
+end
+return total
+end
+if e.kind == "row" then
+local tallest = 1
+for _, child in ipairs(e.children) do
+tallest = math.max(tallest, naturalHeight(child, width))
+end
+return tallest
+end
+if e.kind == "table" then
+local rows = #e.rows
+local head = 0
+for _, column in ipairs(e.columns) do
+if column.head then head = 1 break end
+end
+return rows + head
+end
+return 1
+end
+
+
+
+
+local function leastHeight(e, width)
+if e.kind ~= "stack" then return naturalHeight(e, width) end
+local total = 0
+for _, child in ipairs(e.children) do
+if child.keep == doc.REQUIRED then
+total = total + leastHeight(child, tonumber(e.width) or width)
+end
+end
+return total
+end
+
+
+
+
+
+
+
+
+local function widthOf(e)
+return tonumber(e.width) or naturalWidth(e)
+end
+
+
+
+local function newReport()
+return {dropped = {}, truncated = {}, collisions = {}, failed = nil, ok = true}
+end
+
+local function nameOf(e, fallback)
+return e.name or (e.kind == "text" and e.value) or e.kind or fallback or "?"
+end
+
+
+
+
+
+local function visible(e, width, height)
+if not e.when then return true end
+if e.when.minWidth and width < e.when.minWidth then return false end
+if e.when.minHeight and height < e.when.minHeight then return false end
+if e.when.maxWidth and width > e.when.maxWidth then return false end
+return true
+end
+
+
+
+
+
+
+
+local function newGrid(width, height)
+return {width = width, height = height, rows = {}, targets = {},
+keys = {}}
+end
+
+
+
+local function put(grid, x, y, text, colour, extra)
+if y < 1 or y > grid.height then return end
+if text == "" then return end
+
+
+
+if x < 1 then
+text = text:sub(2 - x)
+x = 1
+end
+local room = grid.width - x + 1
+if room <= 0 then return end
+if #text > room then text = text:sub(1, room) end
+
+grid.rows[y] = grid.rows[y] or {}
+local row = grid.rows[y]
+local run = {x = x, text = text, colour = colour or "text"}
+if extra then
+run.bg, run.role, run.style, run.alt = extra.bg, extra.role, extra.style,
+extra.alt
+end
+row[#row + 1] = run
+end
+
+
+
+
+
+local function fillUnder(grid, x, y, width, lines, bg)
+for line = y, y + lines - 1 do
+if line >= 1 and line <= grid.height then
+local from, to = math.max(x, 1), math.min(x + width - 1, grid.width)
+if to >= from then
+grid.rows[line] = grid.rows[line] or {}
+table.insert(grid.rows[line], 1, {x = from,
+text = (" "):rep(to - from + 1), colour = "text", bg = bg,
+fill = true})
+end
+end
+end
+end
+
+local function target(grid, x, y, w, h, action)
+if not action or w <= 0 or h <= 0 then return end
+grid.targets[#grid.targets + 1] = {x1 = x, y1 = y, x2 = x + w - 1,
+y2 = y + h - 1, action = action}
+end
+
+
+
+local MARKER = {bad = "!", warn = "*", stale = "~"}
+
+local function markerFor(colour, mono)
+if not mono then return nil end
+return MARKER[colour]
+end
+
+local drawElement
+
+
+local function drawRow(e, grid, x, y, width, height, report, mono)
+local kids = {}
+for _, child in ipairs(e.children) do
+if visible(child, grid.width, grid.height) then kids[#kids + 1] = child end
+end
+
+
+local function fixedTotal(list)
+local total = 0
+for _, child in ipairs(list) do
+if child.width ~= "fill" then total = total + widthOf(child) end
+end
+return total
+end
+
+while fixedTotal(kids) > width do
+
+local worst, worstAt = nil, nil
+for index, child in ipairs(kids) do
+if child.keep ~= doc.REQUIRED then
+if not worst or child.keep < worst.keep then
+worst, worstAt = child, index
+end
+end
+end
+if not worst then
+
+
+for _, child in ipairs(kids) do
+if child.keep == doc.REQUIRED and widthOf(child) > width then
+report.failed = {name = nameOf(child),
+why = ("needs %d cells, has %d"):format(
+widthOf(child), width)}
+report.ok = false
+return 1
+end
+end
+report.failed = {name = nameOf(e, "row"),
+why = ("required children need %d cells, row has %d"):format(
+fixedTotal(kids), width)}
+report.ok = false
+return 1
+end
+report.dropped[#report.dropped + 1] = {name = nameOf(worst),
+why = ("row is %d cells; would have needed %d"):format(
+width, fixedTotal(kids))}
+table.remove(kids, worstAt)
+
+
+
+
+local before = kids[worstAt - 1]
+if before and before.kind == "gap" then
+table.remove(kids, worstAt - 1)
+elseif worstAt == 1 and kids[1] and kids[1].kind == "gap" then
+table.remove(kids, 1)
+end
+end
+
+
+local fills = 0
+for _, child in ipairs(kids) do
+if child.width == "fill" then fills = fills + 1 end
+end
+local remainder = width - fixedTotal(kids)
+if remainder < 0 then remainder = 0 end
+
+local cursor = x
+local tallest = 1
+local given = 0
+local seen = 0
+for _, child in ipairs(kids) do
+local childWidth
+if child.width == "fill" then
+seen = seen + 1
+if seen == fills then
+childWidth = remainder - given
+else
+childWidth = math.floor(remainder / fills)
+given = given + childWidth
+end
+else
+childWidth = widthOf(child)
+end
+
+local used = drawElement(child, grid, cursor, y, childWidth, height,
+report, mono)
+tallest = math.max(tallest, used or 1)
+cursor = cursor + childWidth
+end
+
+return tallest
+end
+
+local function drawStack(e, grid, x, y, width, height, report, mono)
+local kids = {}
+for _, child in ipairs(e.children) do
+if visible(child, grid.width, grid.height) then kids[#kids + 1] = child end
+end
+
+
+
+
+
+
+
+
+
+local function heightTotal(list)
+local total = 0
+for _, child in ipairs(list) do
+total = total + leastHeight(child, width)
+end
+return total
+end
+
+while heightTotal(kids) > height do
+local worst, worstAt = nil, nil
+for index, child in ipairs(kids) do
+if child.keep ~= doc.REQUIRED then
+if not worst or child.keep < worst.keep then
+worst, worstAt = child, index
+end
+end
+end
+if not worst then
+report.failed = {name = nameOf(e, "stack"),
+why = ("required rows need %d lines, has %d"):format(
+heightTotal(kids), height)}
+report.ok = false
+return 0
+end
+report.dropped[#report.dropped + 1] = {name = nameOf(worst),
+why = ("only %d lines available"):format(height)}
+table.remove(kids, worstAt)
+end
+
+
+
+
+
+
+
+local spacers, fixed = 0, 0
+for _, child in ipairs(kids) do
+if child.kind == "spacer" then
+spacers = spacers + 1
+else
+fixed = fixed + naturalHeight(child, width)
+end
+end
+
+local slack = height - fixed
+if slack < 0 then slack = 0 end
+
+
+
+local after = {}
+local below = 0
+for index = #kids, 1, -1 do
+after[index] = below
+below = below + leastHeight(kids[index], width)
+end
+
+local cursor = y
+local given, seen = 0, 0
+for index, child in ipairs(kids) do
+if report.failed then break end
+local used
+if child.kind == "stack" then
+used = drawElement(child, grid, x, cursor, width,
+height - (cursor - y) - after[index], report, mono)
+elseif child.kind == "spacer" then
+seen = seen + 1
+if seen == spacers then
+used = slack - given
+else
+used = math.floor(slack / spacers)
+given = given + used
+end
+if used < 0 then used = 0 end
+else
+used = drawElement(child, grid, x, cursor, width,
+height - (cursor - y), report, mono)
+end
+cursor = cursor + (used or 1)
+end
+return cursor - y
+end
+
+local function drawTable(e, grid, x, y, width, height, report, mono)
+local widths = {}
+for index, column in ipairs(e.columns) do
+widths[index] = tonumber(column.width) or #tostring(column.head or "")
+end
+
+local line = y
+local hasHead = false
+for _, column in ipairs(e.columns) do
+if column.head then hasHead = true break end
+end
+
+if hasHead then
+local cursor = x
+for index, column in ipairs(e.columns) do
+local head = truncateTo(tostring(column.head or ""), widths[index])
+put(grid, cursor, line, pad(head, widths[index], column.align),
+e.headColour)
+cursor = cursor + widths[index] + e.gap
+end
+line = line + 1
+end
+
+for _, row in ipairs(e.rows) do
+if (line - y) >= height then
+report.truncated[#report.truncated + 1] = {
+name = nameOf(e, "table"),
+from = ("%d rows"):format(#e.rows),
+to = ("%d shown"):format(line - y - (hasHead and 1 or 0)),
+}
+break
+end
+local cursor = x
+for index, column in ipairs(e.columns) do
+local cell = row[index]
+local value, colour
+if type(cell) == "table" then
+value, colour = tostring(cell.value or ""), cell.colour
+else
+value, colour = tostring(cell == nil and "" or cell), nil
+end
+
+local marker = markerFor(colour, mono)
+if marker then value = marker .. value end
+
+local shown = truncateTo(value, widths[index], doc.TRUNCATED)
+if #value > widths[index] then
+report.truncated[#report.truncated + 1] = {
+name = column.head or ("column " .. index),
+from = value, to = shown,
+}
+end
+put(grid, cursor, line, pad(shown, widths[index], column.align),
+colour or "text")
+cursor = cursor + widths[index] + e.gap
+end
+if row.action then
+target(grid, x, line, width, 1, row.action)
+end
+line = line + 1
+end
+
+return line - y
+end
+
+function drawElement(e, grid, x, y, width, height, report, mono)
+if report.failed then return 0 end
+if not visible(e, grid.width, grid.height) then return 0 end
+
+if e.kind == "gap" or e.kind == "spacer" then
+return 1
+end
+
+if e.kind == "rule" then
+put(grid, x, y, (e.char):rep(math.max(0, width)), e.colour, {role = "rule"})
+return 1
+end
+
+if e.kind == "text" then
+local value = e.value
+local marker = markerFor(e.colour, mono)
+if marker then value = marker .. value end
+
+
+
+if e.wrap and #value > width and width > 0 then
+local lines, rest = {}, value
+while #rest > width do
+local cut = rest:sub(1, width + 1):match(".*%s()")
+if not cut or cut <= 1 then cut = width + 1 end
+lines[#lines + 1] = (rest:sub(1, cut - 1):gsub("%s+$", ""))
+rest = (rest:sub(cut):gsub("^%s+", ""))
+end
+if #rest > 0 then lines[#lines + 1] = rest end
+
+local room = math.min(#lines, math.max(height, 1))
+for i = 1, room do
+put(grid, x, y + i - 1, pad(lines[i], width, e.align), e.colour,
+{bg = e.bg})
+end
+if room < #lines then
+report.truncated[#report.truncated + 1] = {name = nameOf(e),
+from = value, to = ("%d of %d lines"):format(room, #lines)}
+end
+target(grid, x, y, width, room, e.action)
+return room
+end
+
+if #value > width then
+if e.keep == doc.REQUIRED and not e.truncate then
+report.failed = {name = nameOf(e),
+why = ("needs %d cells, has %d"):format(#value, width)}
+report.ok = false
+return 1
+end
+local shown = truncateTo(value, width, e.truncate or doc.TRUNCATED)
+report.truncated[#report.truncated + 1] = {name = nameOf(e),
+from = value, to = shown}
+value = shown
+end
+
+put(grid, x, y, pad(value, width, e.align), e.colour, {bg = e.bg})
+target(grid, x, y, width, 1, e.action)
+return 1
+end
+
+if e.kind == "button" then
+local value = buttonText(e)
+if #value > width then
+if e.keep == doc.REQUIRED then
+report.failed = {name = nameOf(e),
+why = ("needs %d cells, has %d"):format(#value, width)}
+report.ok = false
+return 1
+end
+local inner = buttonInner(e)
+local shown = width >= 2
+and ("[" .. truncateTo(inner, width - 2, doc.TRUNCATED) .. "]")
+or truncateTo(value, width, doc.TRUNCATED)
+report.truncated[#report.truncated + 1] = {name = nameOf(e),
+from = value, to = shown}
+value = shown
+elseif e.width == "fill" and width > #value then
+
+
+value = "[" .. pad(buttonInner(e), width - 2, e.align) .. "]"
+end
+
+put(grid, x, y, pad(value, width, e.align), e.colour,
+{role = "button", style = e.style, alt = e.alt, bg = e.bg})
+target(grid, x, y, width, 1, e.action)
+
+
+
+
+
+if e.key and e.action and not contested[e.key] then
+grid.keys[e.key] = e.action
+end
+return 1
+end
+
+if e.kind == "field" then
+local label, value = e.label, e.value
+local marker = markerFor(e.colour, mono)
+if marker then value = marker .. value end
+
+local need = #label + 1 + #value
+if need > width then
+
+local room = width - #value - 1
+if room >= 1 then
+local shown = truncateTo(label, room, "")
+report.truncated[#report.truncated + 1] = {name = nameOf(e),
+from = label, to = shown}
+label = shown
+else
+if e.keep == doc.REQUIRED then
+report.failed = {name = nameOf(e),
+why = ("needs %d cells, has %d"):format(need, width)}
+report.ok = false
+return 1
+end
+local shown = truncateTo(value, width, doc.TRUNCATED)
+report.truncated[#report.truncated + 1] = {name = nameOf(e),
+from = value, to = shown}
+put(grid, x, y, shown, e.colour)
+target(grid, x, y, width, 1, e.action)
+return 1
+end
+end
+
+put(grid, x, y, label, e.labelColour)
+local leaderStart = x + #label
+local valueAt = x + width - #value
+if e.leader and valueAt > leaderStart then
+put(grid, leaderStart, y, (e.leader):rep(valueAt - leaderStart), "dim")
+end
+put(grid, valueAt, y, value, e.colour)
+target(grid, x, y, width, 1, e.action)
+return 1
+end
+
+if e.kind == "slider" then
+if width < 1 then return 1 end
+local span = e.max - e.min
+
+
+
+
+local function valueAt(cell)
+if width == 1 or span == 0 then return e.min end
+return e.min + math.floor((cell - 1) / (width - 1) * span + 0.5)
+end
+local at = 1
+if width > 1 and span > 0 then
+at = 1 + math.floor((e.value - e.min) / span * (width - 1) + 0.5)
+end
+
+
+
+if at > 1 then
+put(grid, x, y, ("="):rep(at - 1), e.colour)
+end
+put(grid, x + at - 1, y, "|", e.colour)
+if at < width then
+put(grid, x + at, y, ("-"):rep(width - at), e.restColour)
+end
+
+if e.action then
+for cell = 1, width do
+local each = {}
+for k, v in pairs(e.action) do each[k] = v end
+each.value = valueAt(cell)
+target(grid, x + cell - 1, y, 1, 1, each)
+end
+end
+return 1
+end
+
+if e.kind == "row" or e.kind == "stack" then
+local used = (e.kind == "row" and drawRow or drawStack)(e, grid, x, y, width,
+height, report, mono)
+if e.bg and not report.failed then fillUnder(grid, x, y, width, used or 1, e.bg) end
+return used
+end
+if e.kind == "table" then
+return drawTable(e, grid, x, y, width, height, report, mono)
+end
+
+report.failed = {name = tostring(e.kind), why = "unknown element"}
+report.ok = false
+return 0
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function claimKeys(e, width, height, claims)
+if not e or not e.kind then return claims end
+if not visible(e, width, height) then return claims end
+
+if e.kind == "button" and e.key then
+claims[e.key] = (claims[e.key] or 0) + 1
+end
+for _, child in ipairs(e.children or {}) do
+claimKeys(child, width, height, claims)
+end
+return claims
+end
+
+function doc.render(document, width, height, opts)
+opts = opts or {}
+local report = newReport()
+
+if type(document) ~= "table" or not document.kind then
+report.failed = {name = "document", why = "not a document"}
+report.ok = false
+return nil, report
+end
+if not width or not height or width < 1 or height < 1 then
+report.failed = {name = "screen", why = "a screen needs a positive size"}
+report.ok = false
+return nil, report
+end
+
+showKeys = opts.keys == true
+
+contested = {}
+for key, count in pairs(claimKeys(document, width, height, {})) do
+if count > 1 then
+contested[key] = true
+report.collisions[#report.collisions + 1] = {key = key, claims = count}
+end
+end
+
+local grid = newGrid(width, height)
+grid.showsKeys = showKeys
+drawElement(document, grid, 1, 1, width, height, report,
+opts.colour == false)
+showKeys = false
+contested = {}
+
+if report.failed then return nil, report end
+return grid, report
+end
+
+
+
+
+function doc.hit(grid, x, y)
+if not grid then return nil end
+
+
+local found = nil
+for _, t in ipairs(grid.targets) do
+if x >= t.x1 and x <= t.x2 and y >= t.y1 and y <= t.y2 then
+found = t.action
+end
+end
+return found
+end
+
+
+
+
+
+
+function doc.picture(grid)
+if not grid then return "" end
+local out = {}
+for y = 1, grid.height do
+local cells = {}
+for x = 1, grid.width do cells[x] = " " end
+for _, run in ipairs(grid.rows[y] or {}) do
+for i = 1, run.fill and 0 or #run.text do
+local at = run.x + i - 1
+if at >= 1 and at <= grid.width then
+cells[at] = run.text:sub(i, i)
+end
+end
+end
+out[y] = (table.concat(cells):gsub("%s+$", ""))
+end
+return table.concat(out, "\n")
+end
+
+
+
+local LETTER = {
+text = "t", title = "T", label = "l", dim = ".", good = "g", warn = "w",
+bad = "b", stale = "s", action = "a", selected = "S", flow = "f",
+}
+
+function doc.colourPicture(grid)
+if not grid then return "" end
+local out = {}
+for y = 1, grid.height do
+local cells = {}
+for x = 1, grid.width do cells[x] = " " end
+for _, run in ipairs(grid.rows[y] or {}) do
+local letter = LETTER[run.colour] or "?"
+for i = 1, run.fill and 0 or #run.text do
+local at = run.x + i - 1
+if at >= 1 and at <= grid.width then cells[at] = letter end
+end
+end
+out[y] = (table.concat(cells):gsub("%s+$", ""))
+end
+return table.concat(out, "\n")
+end
+
+
+function doc.explain(report)
+if not report then return "no report" end
+if report.failed then
+return ("FAILED: %s -- %s"):format(tostring(report.failed.name),
+tostring(report.failed.why))
+end
+local parts = {}
+for _, d in ipairs(report.dropped) do
+parts[#parts + 1] = ("dropped %s"):format(tostring(d.name))
+end
+for _, t in ipairs(report.truncated) do
+parts[#parts + 1] = ("truncated %s"):format(tostring(t.name))
+end
+for _, c in ipairs(report.collisions or {}) do
+parts[#parts + 1] = ("key %s claimed %d times, so it does nothing")
+:format(tostring(c.key), c.claims)
+end
+if #parts == 0 then return "fits" end
+return table.concat(parts, ", ")
+end
+
+return doc

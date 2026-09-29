@@ -1,0 +1,33 @@
+
+
+
+
+
+
+
+local points = {}
+
+
+
+
+
+
+
+points.VERSION = 5
+
+
+
+
+points.PROBE = 2
+
+
+
+function points.understood(version)
+return type(version) == "number" and version <= points.VERSION
+end
+
+function points.outdated(version)
+return type(version) == "number" and version < points.PROBE
+end
+
+return points

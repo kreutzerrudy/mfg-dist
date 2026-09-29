@@ -1,0 +1,37 @@
+local rpc = require("mfg.common.rpc")
+local signals = require("mfg.controller.signals")
+
+
+
+
+
+return {
+name        = "signals",
+label       = "Signal ports",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {},
+
+returns = {signals = "table"},
+
+run = function()
+local owners = signals.owners()
+local out = {}
+for _, record in ipairs(signals.all()) do
+local level, why = signals.read(record.path)
+out[#out + 1] = {
+path = record.path, kind = record.kind, direction = record.direction,
+machine = record.machine,
+device = record.devices and record.devices[1], face = record.face,
+bound = record.face ~= nil and record.devices ~= nil
+and record.devices[1] ~= nil,
+level = level, problem = not level and why or nil,
+safe = record.direction == "output" and signals.safe(record) or nil,
+owner = owners[record.path],
+}
+end
+return rpc.COMPLETED, {signals = out}
+end,
+}

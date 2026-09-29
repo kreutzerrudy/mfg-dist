@@ -1,0 +1,211 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local hal = require("mfg.common.hal")
+local mount = require("mfg.storage.mount")
+
+local signals = {}
+
+local OWNERS = "signal-owners"
+
+
+local function levelOf(record, value)
+if type(value) == "boolean" then return value and 15 or 0 end
+value = math.floor(tonumber(value) or 0)
+if value < 0 then value = 0 end
+if value > 15 then value = 15 end
+if record.kind == "flag" then return value > 0 and 15 or 0 end
+return value
+end
+
+
+function signals.get(path)
+local record = mount.get(path)
+if not record then return nil, ("no such signal: %s"):format(tostring(path)) end
+if not mount.isSignal(record) then
+return nil, ("%s is a volume, not a signal"):format(path)
+end
+return record
+end
+
+
+local function wire(path)
+local record, why = signals.get(path)
+if not record then return nil, why end
+local device = record.devices and record.devices[1]
+if not device or not record.face then
+return nil, ("%s is declared but UNBOUND -- mfgctl bind %s <relay> <face>")
+:format(path, path)
+end
+if not hal.redstone().isPresent(device) then
+return nil, ("%s: %s is not on the network"):format(path, device)
+end
+return record, device, record.face
+end
+
+
+function signals.all()
+local out = {}
+for _, path in ipairs(mount.list(nil, "signal")) do
+out[#out + 1] = mount.get(path)
+end
+return out
+end
+
+
+function signals.safe(record)
+return levelOf(record, record.safe or 0)
+end
+
+
+
+local function owners()
+local data = state.read(OWNERS, {})
+if type(data) ~= "table" then return {} end
+return data
+end
+
+function signals.owner(path)
+return owners()[path]
+end
+
+function signals.owners()
+return owners()
+end
+
+
+function signals.claim(path, holder)
+local all = owners()
+if all[path] and all[path] ~= holder then return nil, all[path] end
+all[path] = holder
+state.write(OWNERS, all)
+return true
+end
+
+
+
+
+function signals.read(path)
+local record, device, face = wire(path)
+if not record then return nil, device end
+local rs = hal.redstone()
+local ok, level = pcall(function()
+if record.direction == "output" then return rs.getAnalogOutput(device, face) end
+if record.kind == "flag" then return rs.getInput(device, face) and 15 or 0 end
+return rs.getAnalogInput(device, face)
+end)
+if not ok then return nil, ("%s: %s"):format(path, tostring(level)) end
+level = levelOf(record, level)
+return level, level > 0
+end
+
+local function drive(record, device, face, level)
+local rs = hal.redstone()
+return pcall(function()
+if record.kind == "flag" then
+rs.setOutput(device, face, level > 0)
+else
+rs.setAnalogOutput(device, face, level)
+end
+end)
+end
+
+
+
+
+
+
+function signals.write(path, value, holder)
+local record, device, face = wire(path)
+if not record then return nil, device end
+if record.direction ~= "output" then
+return nil, ("%s is an input -- it is read, not driven"):format(path)
+end
+holder = holder or "operator"
+local ok, held = signals.claim(path, holder)
+if not ok then return nil, ("%s is held by %s"):format(path, held) end
+
+local rs = hal.redstone()
+local was = rs.getAnalogOutput(device, face)
+local lived, err = drive(record, device, face, levelOf(record, value))
+if not lived then return nil, ("%s: %s"):format(path, tostring(err)) end
+return was
+end
+
+
+
+function signals.pulse(path, value, ticks, holder)
+local was, why = signals.write(path, value, holder)
+if not was then return nil, why end
+sleep(ticks / 20)
+local record, device, face = wire(path)
+if not record then return nil, device end
+local lived, err = drive(record, device, face, was)
+if not lived then return nil, ("%s: %s"):format(path, tostring(err)) end
+return was
+end
+
+
+
+function signals.release(path, holder)
+local all = owners()
+if holder and all[path] and all[path] ~= holder then
+return nil, ("%s is held by %s"):format(path, all[path])
+end
+all[path] = nil
+state.write(OWNERS, all)
+
+local record, device, face = wire(path)
+if not record then return nil, device end
+if record.direction ~= "output" then return true end
+local lived, err = drive(record, device, face, signals.safe(record))
+if not lived then return nil, ("%s: %s"):format(path, tostring(err)) end
+return true
+end
+
+
+function signals.releaseAll(holder)
+local released = {}
+for path, owner in pairs(owners()) do
+if owner == holder then
+signals.release(path, holder)
+released[#released + 1] = path
+end
+end
+table.sort(released)
+return released
+end
+
+
+
+function signals.boot()
+state.write(OWNERS, {})
+local written = {}
+for _, record in ipairs(signals.all()) do
+if record.direction == "output" then
+local _, device, face = wire(record.path)
+if device and face then
+drive(record, device, face, signals.safe(record))
+written[#written + 1] = record.path
+end
+end
+end
+return written
+end
+
+return signals

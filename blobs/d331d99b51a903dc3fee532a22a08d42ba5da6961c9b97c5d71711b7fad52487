@@ -1,0 +1,141 @@
+
+
+
+
+
+
+
+
+
+local ip = {}
+
+local OCTET = 256
+local SPACE = 4294967296
+
+
+
+
+
+local LINK_LOCAL = 169 * 16777216 + 254 * 65536
+local LINK_LOCAL_HOSTS = 65536
+
+ip.BROADCAST = SPACE - 1
+ip.ANY = 0
+ip.SPACE = SPACE
+
+
+
+
+function ip.parse(text)
+if type(text) ~= "string" then return nil end
+
+local a, b, c, d = text:match("^%s*(%d+)%.(%d+)%.(%d+)%.(%d+)%s*$")
+if not a then return nil end
+
+a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+
+return ((a * OCTET + b) * OCTET + c) * OCTET + d
+end
+
+function ip.format(addr)
+if type(addr) ~= "number" or addr < 0 or addr >= SPACE then
+return "?" .. tostring(addr)
+end
+
+local n = math.floor(addr)
+local d = n % OCTET; n = math.floor(n / OCTET)
+local c = n % OCTET; n = math.floor(n / OCTET)
+local b = n % OCTET; n = math.floor(n / OCTET)
+return ("%d.%d.%d.%d"):format(n, b, c, d)
+end
+
+
+
+
+
+function ip.parseCidr(text)
+if type(text) ~= "string" then return nil, "expected a string" end
+
+local addr, prefix = text:match("^%s*([%d%.]+)%s*/%s*(%d+)%s*$")
+if not addr then
+return nil, ("'%s' is not <address>/<prefix>"):format(text)
+end
+
+local n = ip.parse(addr)
+if not n then return nil, ("'%s' is not a dotted quad"):format(addr) end
+
+prefix = tonumber(prefix)
+if prefix < 0 or prefix > 32 then return nil, "prefix must be 0-32" end
+
+return n, prefix
+end
+
+function ip.formatCidr(addr, prefix)
+return ("%s/%d"):format(ip.format(addr), prefix)
+end
+
+
+
+local function hostSpan(prefix)
+return 2 ^ (32 - prefix)
+end
+
+
+function ip.network(addr, prefix)
+local span = hostSpan(prefix)
+return addr - (addr % span)
+end
+
+function ip.contains(network, prefix, addr)
+if type(addr) ~= "number" then return false end
+return ip.network(addr, prefix) == ip.network(network, prefix)
+end
+
+
+
+
+function ip.within(inner, innerPrefix, outer, outerPrefix)
+if type(innerPrefix) ~= "number" or type(outerPrefix) ~= "number" then
+return false
+end
+if innerPrefix < outerPrefix then return false end
+return ip.network(inner, outerPrefix) == ip.network(outer, outerPrefix)
+end
+
+
+
+function ip.broadcastOf(network, prefix)
+return ip.network(network, prefix) + hostSpan(prefix) - 1
+end
+
+function ip.hostCount(prefix)
+return hostSpan(prefix)
+end
+
+
+
+
+
+function ip.linkLocal(computerId)
+if type(computerId) ~= "number" or computerId < 0
+or computerId >= LINK_LOCAL_HOSTS then
+error(("ip.linkLocal: computer id %s does not fit in 169.254.0.0/16")
+:format(tostring(computerId)), 2)
+end
+return LINK_LOCAL + computerId
+end
+
+function ip.isLinkLocal(addr)
+return type(addr) == "number"
+and addr >= LINK_LOCAL and addr < LINK_LOCAL + LINK_LOCAL_HOSTS
+end
+
+
+
+function ip.computerIdFor(addr)
+if not ip.isLinkLocal(addr) then return nil end
+return addr - LINK_LOCAL
+end
+
+return ip

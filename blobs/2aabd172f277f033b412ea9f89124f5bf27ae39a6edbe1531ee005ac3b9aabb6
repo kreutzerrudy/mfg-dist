@@ -1,0 +1,136 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local acknet = require("acknet")
+local ip = require("ip")
+
+local bootrelay = {}
+
+local PROTOCOL = "acknet_hs"
+local HOSTNAME = "server"
+
+
+local PENDING_TTL = 60
+
+local running = false
+
+
+
+
+local pending = {}
+
+local upstream = nil
+local segment = nil
+
+
+
+function bootrelay.setUpstream(fn)
+upstream = fn
+end
+
+function bootrelay.setSegment(fn)
+segment = fn
+end
+
+local function sweep()
+local now = os.epoch("utc")
+for key, entry in pairs(pending) do
+if now > entry.expires then pending[key] = nil end
+end
+end
+
+local function outbound(packet, body, server)
+
+
+
+pending[body.e] = {
+client = packet.sender_id,
+expires = os.epoch("utc") + PENDING_TTL * 1000,
+}
+
+acknet.send(server, {
+t = body.t,
+e = body.e,
+d = body.d,
+
+
+r = segment and segment(packet.sender_id) or nil,
+}, PROTOCOL)
+end
+
+local function inbound(body)
+local entry = pending[body.e]
+
+
+if not entry then return end
+
+acknet.send(entry.client, {t = body.t, e = body.e, d = body.d}, PROTOCOL)
+end
+
+local function loop()
+
+
+
+acknet.host(PROTOCOL, HOSTNAME)
+
+while true do
+local packet = acknet.receive(PROTOCOL)
+sweep()
+
+local body = packet.body
+if type(body) == "table" and type(body.e) == "string" then
+local server = upstream and upstream()
+
+if (body.t == 1 or body.t == 3)
+and ip.isLinkLocal(packet.sender_id) then
+
+
+if server then outbound(packet, body, server) end
+
+elseif body.t == 2 or body.t == 4 then
+inbound(body)
+end
+end
+end
+end
+
+function bootrelay.runtime()
+if running then
+error("bootrelay: daemon already running", 0)
+end
+running = true
+
+local ok, err = pcall(loop)
+
+running = false
+acknet.unhost(PROTOCOL)
+if not ok then error(err, 0) end
+end
+
+function bootrelay.isRunning()
+return running == true
+end
+
+function bootrelay.shutdown()
+running = false
+pending = {}
+acknet.unhost(PROTOCOL)
+end
+
+return bootrelay

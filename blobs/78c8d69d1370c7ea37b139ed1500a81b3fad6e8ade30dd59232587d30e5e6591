@@ -1,0 +1,99 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+
+return {
+name        = "transmit",
+label       = "Transmit",
+tier        = "node",
+base        = true,
+destructive = false,
+
+parameters = {
+{name = "target", label = "Target", type = "node", required = true,
+help = "The hostname to send to. A derived action usually fills this "
+.. "from a node it has already resolved."},
+
+
+
+
+{name = "protocol", label = "Protocol", type = "choice", required = true,
+choices = {"mfg-control", "mfg-scada", "mfg-order", "mfg-report"},
+help = "Which service on the target. mfg-control is a node, mfg-scada "
+.. "an operator surface, mfg-order a counterparty."},
+
+{name = "content", label = "Content", type = "text", required = true,
+help = "The body, serialised. A derived action pre-fills this and the "
+.. "operator never sees it."},
+
+{name = "timeout", label = "Timeout", type = "number", min = 1, max = 60,
+default = rpc.DEFAULT_TIMEOUT,
+help = "Seconds to wait for each attempt."},
+
+{name = "attempts", label = "Attempts", type = "number", integer = true,
+min = 1, max = 5, default = rpc.DEFAULT_ATTEMPTS,
+help = "Bounded, and the rpc id is stable across them, so a duplicate "
+.. "reaching a handler that already ran is recognisable as a "
+.. "repeat rather than a second command."},
+},
+
+returns = {
+status = "text",
+reply = "text",
+},
+
+
+
+
+
+
+run = function(params)
+local body = params.content
+if body:sub(1, 1) == "{" then
+local parsed = textutils.unserialize(body)
+if type(parsed) ~= "table" then
+return rpc.REJECTED, {reason = "content is not a readable table"}
+end
+body = parsed
+else
+body = {command = body}
+end
+
+local answer = rpc.request(params.target, params.protocol, body, {
+timeout = params.timeout,
+attempts = params.attempts,
+})
+
+
+
+
+return answer.status, {
+reason = answer.reason,
+reply = answer,
+attempts = answer.attempts,
+}
+end,
+}

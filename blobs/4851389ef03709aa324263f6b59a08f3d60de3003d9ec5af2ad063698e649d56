@@ -1,0 +1,268 @@
+
+
+
+
+
+
+
+
+
+
+local store = require("mfg.storage")
+
+local handoff = {}
+
+
+
+
+
+local config = require("mfg.common.config")
+
+local CONFIRM_FLOOR = 4
+local POLL = 0.5
+
+local function inputOf(node)
+return node.input or ("/%s/in"):format(node.id)
+end
+
+local function outputOf(node)
+return node.output or ("/%s/out"):format(node.id)
+end
+
+
+
+
+
+local function legacyPath(node)
+for _, path in ipairs({inputOf(node), outputOf(node)}) do
+if path:sub(1, 1) ~= "/" then
+return ("%s is a device name, not a mount path: this record for %s "
+.. "predates the storage layer. Re-register it: mfgctl register.")
+:format(path, tostring(node.id))
+end
+end
+return nil
+end
+
+local function sourceOf(node, opts)
+return node.source or (opts and opts.source) or config.setting("source")
+end
+
+
+
+
+
+handoff.inputOf = inputOf
+handoff.outputOf = outputOf
+handoff.sourceOf = sourceOf
+handoff.legacyPath = legacyPath
+
+
+
+
+
+
+
+
+
+
+
+local function alreadyWith(node, held, item)
+local inInput = store.count(inputOf(node), item) or 0
+return inInput + (held and (held[item] or 0) or 0)
+end
+
+
+
+
+
+
+
+
+
+
+
+local function resolve(source, selector)
+if type(selector) ~= "string" or selector:sub(1, 1) ~= "#" then
+return selector, nil
+end
+return store.resolve(source, selector)
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function handoff.deliver(node, requirements, opts)
+opts = opts or {}
+
+local stale = legacyPath(node)
+if stale then
+return false, {}, {[tostring(node.id)] = {reason = stale}},
+{stale = stale, confirmed = false}
+end
+
+local source = sourceOf(node, opts)
+local input = inputOf(node)
+
+local report = nil
+if type(opts.report) == "function" then report = opts.report() end
+local held = report and report.held or nil
+local feed = report and report.feed or nil
+
+local delivered, shortfall, resolved = {}, {}, {}
+local complete = true
+
+for selector, wanted in pairs(requirements) do
+local item, err = resolve(source, selector)
+if not item then
+complete = false
+shortfall[selector] = {wanted = wanted, got = 0, reason = err}
+else
+if item ~= selector then resolved[selector] = item end
+
+local present = alreadyWith(node, held, item)
+local need = wanted - present
+
+if need <= 0 then
+delivered[item] = present
+else
+local moved, moveErr = store.move(source, input, item, need)
+delivered[item] = present + (moved or 0)
+if (moved or 0) < need then
+complete = false
+shortfall[item] = {wanted = wanted, got = delivered[item],
+reason = moveErr}
+end
+end
+end
+end
+
+local info = {source = source, input = input, resolved = resolved,
+confirmed = false, feed = feed}
+
+
+
+if not complete or feed ~= "push" or type(opts.report) ~= "function" then
+info.confirmed = (feed == "pull") or false
+return complete, delivered, shortfall, info
+end
+
+local confirmed, stranded, transit = handoff.confirm(node, requirements,
+resolved, opts)
+info.confirmed = confirmed
+info.transit = transit
+
+if not confirmed then
+
+
+
+
+info.relayStalled = true
+info.stranded = stranded
+for item, count in pairs(stranded) do
+shortfall[item] = {wanted = requirements[item], got = 0,
+reason = ("relay stalled: %d stranded in %s"):format(count, input)}
+end
+return false, delivered, shortfall, info
+end
+
+return true, delivered, shortfall, info
+end
+
+
+
+
+
+
+function handoff.confirm(node, requirements, resolved, opts)
+opts = opts or {}
+local input = inputOf(node)
+
+
+
+
+
+local timeout = opts.confirmTimeout
+if not timeout and node.transit then timeout = node.transit * 3 end
+if not timeout then timeout = CONFIRM_FLOOR * 2 end
+if timeout < CONFIRM_FLOOR then timeout = CONFIRM_FLOOR end
+
+
+local awaiting = {}
+for selector, wanted in pairs(requirements) do
+awaiting[resolved[selector] or selector] = wanted
+end
+
+local started = os.epoch("utc")
+local deadline = started + timeout * 1000
+
+repeat
+local report = opts.report()
+local held = (report and report.held) or {}
+local satisfied = true
+for item, wanted in pairs(awaiting) do
+if (held[item] or 0) < wanted then satisfied = false end
+end
+if satisfied then
+return true, nil, (os.epoch("utc") - started) / 1000
+end
+sleep(POLL)
+until os.epoch("utc") >= deadline
+
+
+local stranded = {}
+for item in pairs(awaiting) do
+local left = store.count(input, item) or 0
+if left > 0 then stranded[item] = left end
+end
+return false, stranded, nil
+end
+
+
+
+
+
+
+
+
+
+function handoff.collect(node, opts)
+local stale = legacyPath(node)
+if stale then return nil, stale end
+return store.drain(outputOf(node), sourceOf(node, opts))
+end
+
+
+
+
+
+
+function handoff.returnUnused(node, opts)
+local stale = legacyPath(node)
+if stale then return nil, stale end
+return store.drain(inputOf(node), sourceOf(node, opts))
+end
+
+return handoff

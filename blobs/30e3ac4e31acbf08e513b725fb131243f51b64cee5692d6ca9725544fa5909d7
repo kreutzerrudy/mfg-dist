@@ -1,0 +1,60 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local ip = require("ip")
+
+local args = {...}
+local address = ip.parse(args[1] or "")
+local force = args[2] == "new"
+
+if not address then
+print("usage: peertest <address> [new]")
+return
+end
+
+local shown = ip.format(address)
+
+if force then
+
+
+os.queueEvent("peer_forget", address)
+print("dropping any session with " .. shown .. "...")
+end
+
+print("requesting a session with " .. shown .. "...")
+os.queueEvent("peer_connect", address)
+
+local timer = os.startTimer(30)
+while true do
+local event, p1, p2, p3, p4 = os.pullEvent()
+
+if event == "peer_session" and p1 == address then
+if p2 then
+
+
+print(p4 and "reused existing session" or "new handshake completed")
+print("fingerprint: " .. tostring(p3))
+print("this must match on the other computer")
+if p4 then
+print()
+print("if it does not match, run: peertest " .. shown .. " new")
+end
+else
+printError("failed: " .. tostring(p3))
+end
+return
+
+elseif event == "timer" and p1 == timer then
+printError("timed out -- is netstart running, and is the peer up?")
+return
+end
+end

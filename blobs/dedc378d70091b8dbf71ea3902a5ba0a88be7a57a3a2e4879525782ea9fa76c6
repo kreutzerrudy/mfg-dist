@@ -1,0 +1,30 @@
+local rpc = require("mfg.common.rpc")
+local signals = require("mfg.controller.signals")
+
+
+
+
+
+
+
+
+return {
+name        = "read_signal",
+label       = "Read a signal",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "signal", label = "Signal", type = "path", required = true,
+choices = {source = "signals"}},
+},
+
+returns = {level = "number", on = "flag"},
+
+run = function(params)
+local level, on = signals.read(params.signal)
+if not level then return rpc.REJECTED, {reason = tostring(on)} end
+return rpc.COMPLETED, {level = level, on = on}
+end,
+}

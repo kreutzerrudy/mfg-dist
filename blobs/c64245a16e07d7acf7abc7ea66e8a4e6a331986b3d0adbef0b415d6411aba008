@@ -1,0 +1,26 @@
+
+local acknet = require("acknet")
+
+local function monitor()
+while true do
+local parts = table.pack(os.pullEvent("acknet_debug"))
+local out = {}
+for i = 2, parts.n do
+out[#out + 1] = tostring(parts[i])
+end
+print(("[%s] %s"):format(os.date("%T"), table.concat(out, "  ")))
+end
+end
+
+term.clear()
+term.setCursorPos(1, 1)
+print("acknet debug monitor -- ctrl+t to stop")
+if not acknet.isRunning() then
+printError("warning: daemon is not running, expect no events")
+end
+
+acknet.setDebug(true)
+local ok, err = pcall(monitor)
+acknet.setDebug(false)
+
+if not ok then error(err, 0) end

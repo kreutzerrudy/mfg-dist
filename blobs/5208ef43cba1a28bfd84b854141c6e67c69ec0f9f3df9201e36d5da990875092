@@ -1,0 +1,662 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local ip = require("ip")
+
+local ipnet = {}
+
+ipnet.messageEvent = "ipnet_message"
+
+local VERSION = 4
+local TTL_DEFAULT = 64
+
+
+
+local ARP_PROTOCOL = "ipnet_arp"
+local ARP_TTL = 120
+
+
+local ARP_INTERVAL = 1
+
+local config = _G.__ipnet
+if not config then
+config = {}
+_G.__ipnet = config
+end
+
+
+config.interfaces = config.interfaces or {}
+
+config.routes = config.routes or {}
+
+local substrate = nil
+local debug = false
+
+
+
+
+
+
+
+
+
+
+
+
+
+local neighbours = {}
+local asked = {}
+
+
+
+
+
+
+
+
+local ingress = {}
+
+
+
+
+local stats = {
+delivered = 0, forwarded = 0, dropped = 0,
+pending = 0, expired = 0, arp = 0,
+}
+
+
+
+local linkLocal = nil
+
+local function ourLinkLocal()
+if not linkLocal then linkLocal = ip.linkLocal(os.getComputerID()) end
+return linkLocal
+end
+
+local function log(...)
+if debug then os.queueEvent("ipnet_debug", ...) end
+end
+
+function ipnet.setDebug(enabled)
+debug = enabled
+end
+
+
+
+function ipnet.setSubstrate(mod)
+substrate = mod
+end
+
+function ipnet.substrate()
+return substrate
+end
+
+function ipnet.init()
+return substrate.init()
+end
+
+function ipnet.isOpen(modem)
+return substrate.isOpen(modem)
+end
+
+function ipnet.open(modem)
+return substrate.open(modem)
+end
+
+function ipnet.close(modem)
+return substrate.close(modem)
+end
+
+
+
+
+function ipnet.setKeyProvider(fn)
+if substrate.setKeyProvider then substrate.setKeyProvider(fn) end
+end
+
+
+
+
+
+
+
+
+function ipnet.setBands(map, fallback)
+if substrate.setBands then substrate.setBands(map, fallback) end
+end
+
+
+
+function ipnet.applyBands()
+local map, fallback = {}, config.band
+for _, iface in ipairs(config.interfaces) do
+if iface.band and iface.modem then map[iface.modem] = iface.band end
+if iface.band and not iface.modem then fallback = iface.band end
+end
+ipnet.setBands(map, fallback)
+end
+
+function ipnet.band()
+return config.band
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function ipnet.setInterfaces(list)
+config.interfaces = {}
+config.gateway = nil
+config.routes = {}
+config.declared = #list > 0
+
+for _, iface in ipairs(list) do
+config.interfaces[#config.interfaces + 1] = {
+modem = iface.modem,
+address = iface.address,
+prefix = iface.prefix,
+
+
+band = iface.band,
+}
+end
+
+ipnet.applyBands()
+end
+
+
+
+
+
+
+
+
+function ipnet.configure(address, prefix, gateway, assignedBand)
+config.gateway = gateway
+
+
+
+
+
+
+if assignedBand then
+config.band = assignedBand
+log("band", assignedBand.base, assignedBand.size)
+end
+
+if config.declared then
+log("gateway only", gateway and ip.format(gateway))
+ipnet.applyBands()
+return
+end
+
+config.interfaces = {{modem = nil, address = address, prefix = prefix,
+band = assignedBand}}
+log("configured", ip.format(address), prefix, gateway and ip.format(gateway))
+ipnet.applyBands()
+end
+
+function ipnet.setGateway(address)
+config.gateway = address
+end
+
+function ipnet.setRoutes(routes)
+config.routes = routes or {}
+end
+
+function ipnet.interfaces()
+return config.interfaces
+end
+
+function ipnet.routes()
+return config.routes
+end
+
+function ipnet.gateway()
+return config.gateway
+end
+
+
+
+
+function ipnet.localAddress()
+local first = config.interfaces[1]
+return first and first.address or ourLinkLocal()
+end
+
+function ipnet.prefix()
+local first = config.interfaces[1]
+return first and first.prefix or nil
+end
+
+
+function ipnet.addresses()
+local all = {}
+for _, iface in ipairs(config.interfaces) do all[#all + 1] = iface.address end
+all[#all + 1] = ourLinkLocal()
+return all
+end
+
+local function isOurs(addr)
+if addr == ip.BROADCAST then return true end
+if addr == ourLinkLocal() then return true end
+for _, iface in ipairs(config.interfaces) do
+if addr == iface.address then return true end
+end
+return false
+end
+
+ipnet.isOurs = isOurs
+
+
+local function ifaceFor(addr)
+local best, bestPrefix = nil, -1
+for _, iface in ipairs(config.interfaces) do
+if iface.prefix > bestPrefix and ip.contains(iface.address, iface.prefix, addr) then
+best, bestPrefix = iface, iface.prefix
+end
+end
+return best
+end
+
+
+
+
+
+
+
+function ipnet.setForwarding(enabled)
+config.forwarding = enabled and true or false
+end
+
+local function forwards()
+if config.forwarding ~= nil then return config.forwarding end
+return #config.interfaces > 1
+end
+
+function ipnet.forwarding()
+return forwards()
+end
+
+
+
+
+
+
+local function remember(addr, id, modem)
+local known = neighbours[addr]
+neighbours[addr] = {id = id, modem = modem, at = os.epoch("utc")}
+
+
+
+
+if not known or known.id ~= id then
+log("learned", ip.format(addr), id)
+os.queueEvent("net_link_changed")
+end
+end
+
+local function lookupNeighbour(addr)
+local id = ip.computerIdFor(addr)
+if id then return id, nil end
+
+local hit = neighbours[addr]
+if hit and os.epoch("utc") - hit.at < ARP_TTL * 1000 then
+return hit.id, hit.modem
+end
+return nil
+end
+
+
+
+
+
+local function arpFrame(src, dst, kind, target)
+return {
+v = VERSION,
+src = src,
+dst = dst,
+ttl = 1,
+proto = ARP_PROTOCOL,
+arp = kind,
+target = target,
+}
+end
+
+
+
+local function askFor(addr)
+local now = os.epoch("utc")
+if asked[addr] and now - asked[addr] < ARP_INTERVAL * 1000 then return end
+asked[addr] = now
+
+stats.arp = stats.arp + 1
+log("arp who", ip.format(addr))
+
+local iface = ifaceFor(addr)
+local src = iface and iface.address or ipnet.localAddress()
+substrate.broadcast(arpFrame(src, ip.BROADCAST, "who", addr), ARP_PROTOCOL)
+end
+
+function ipnet.neighbours()
+return neighbours
+end
+
+
+
+function ipnet.ingressOf(addr)
+return ingress[addr]
+end
+
+
+
+
+
+function ipnet.linkFor(addr)
+local id = lookupNeighbour(addr)
+return id
+end
+
+
+
+
+
+
+
+
+
+
+
+
+local function pathTo(dst)
+
+
+local id = ip.computerIdFor(dst)
+if id then return id, nil, ourLinkLocal() end
+
+local direct = ifaceFor(dst)
+if direct then
+local hop, modem = lookupNeighbour(dst)
+if not hop then
+askFor(dst)
+return nil, "no neighbour for " .. ip.format(dst) .. " yet", nil, true
+end
+return hop, modem or direct.modem, direct.address
+end
+
+
+local via, bestPrefix = nil, -1
+for _, route in ipairs(config.routes) do
+if route.prefix > bestPrefix and ip.contains(route.network, route.prefix, dst) then
+via, bestPrefix = route.via, route.prefix
+end
+end
+via = via or config.gateway
+if not via then return nil, "no route to " .. ip.format(dst) end
+
+
+
+local gwId = ip.computerIdFor(via)
+if gwId then return gwId, nil, ourLinkLocal() end
+
+local gwIface = ifaceFor(via)
+if not gwIface then
+return nil, ("next hop %s is not on any link"):format(ip.format(via))
+end
+
+local hop, modem = lookupNeighbour(via)
+if not hop then
+askFor(via)
+return nil, "no neighbour for " .. ip.format(via) .. " yet", nil, true
+end
+return hop, modem or gwIface.modem, gwIface.address
+end
+
+ipnet.pathTo = pathTo
+
+
+
+function ipnet.send(dst, message, protocol)
+if type(dst) ~= "number" then
+log("bad destination", tostring(dst))
+return false
+end
+
+
+
+
+if isOurs(dst) then
+os.queueEvent(ipnet.messageEvent, ipnet.localAddress(), message, protocol)
+return true
+end
+
+local nextHop, modem, src, resolving = pathTo(dst)
+if not nextHop then
+
+
+
+
+if resolving then
+stats.pending = stats.pending + 1
+else
+stats.dropped = stats.dropped + 1
+end
+log("no path", ip.format(dst), tostring(modem))
+return false
+end
+
+
+
+return substrate.send(nextHop, {
+v = VERSION,
+src = src,
+dst = dst,
+ttl = TTL_DEFAULT,
+proto = protocol,
+body = message,
+}, protocol, modem)
+end
+
+
+
+
+function ipnet.broadcast(message, protocol)
+return substrate.broadcast({
+v = VERSION,
+src = ourLinkLocal(),
+dst = ip.BROADCAST,
+ttl = 1,
+proto = protocol,
+body = message,
+}, protocol)
+end
+
+
+
+local function handleArp(frame, sender, modem)
+if frame.arp == "who" then
+if not isOurs(frame.target) then return end
+log("arp is", ip.format(frame.target))
+
+
+
+
+substrate.send(sender,
+arpFrame(frame.target, frame.src, "is", frame.target),
+ARP_PROTOCOL, modem)
+end
+
+
+end
+
+local function forward(frame, protocol)
+if not forwards() then
+stats.dropped = stats.dropped + 1
+log("not a router", ip.format(frame.dst))
+return
+end
+
+local ttl = (tonumber(frame.ttl) or 0) - 1
+if ttl <= 0 then
+stats.expired = stats.expired + 1
+log("ttl expired", ip.format(frame.src), ip.format(frame.dst))
+return
+end
+
+local nextHop, modem, _, resolving = pathTo(frame.dst)
+if not nextHop then
+if resolving then
+stats.pending = stats.pending + 1
+else
+stats.dropped = stats.dropped + 1
+end
+log("cannot forward", ip.format(frame.dst), tostring(modem))
+return
+end
+
+
+
+stats.forwarded = stats.forwarded + 1
+log("forward", ip.format(frame.dst), nextHop, ttl)
+
+substrate.send(nextHop, {
+v = VERSION,
+src = frame.src,
+dst = frame.dst,
+ttl = ttl,
+proto = frame.proto,
+body = frame.body,
+}, protocol, modem)
+end
+
+local function handleFrame(sender, frame, protocol, modem)
+
+
+
+if type(frame) ~= "table" or frame.v ~= VERSION then return end
+if type(frame.src) ~= "number" or type(frame.dst) ~= "number" then return end
+
+ingress[frame.src] = modem
+
+
+
+
+
+if not ip.isLinkLocal(frame.src) and ifaceFor(frame.src) then
+remember(frame.src, sender, modem)
+end
+
+if frame.arp then
+handleArp(frame, sender, modem)
+return
+end
+
+if isOurs(frame.dst) then
+stats.delivered = stats.delivered + 1
+os.queueEvent(ipnet.messageEvent, frame.src, frame.body, frame.proto)
+return
+end
+
+forward(frame, protocol)
+end
+
+
+
+local function daemonLoop()
+while true do
+
+
+local event, p1, p2, p3, p4 = os.pullEvent()
+
+if event == substrate.messageEvent then
+handleFrame(p1, p2, p3, p4)
+
+
+
+elseif event == "ipnet_status" then
+local seen = {}
+for addr, entry in pairs(neighbours) do
+seen[#seen + 1] = {address = addr, id = entry.id, modem = entry.modem}
+end
+os.queueEvent("ipnet_status_reply", {
+linkLocal = ourLinkLocal(),
+interfaces = config.interfaces,
+routes = config.routes,
+gateway = config.gateway,
+forwarding = forwards(),
+neighbours = seen,
+stats = stats,
+})
+end
+end
+end
+
+function ipnet.runtime()
+if config.running then
+error("ipnet: daemon already running", 0)
+end
+if not substrate then
+error("ipnet: no substrate -- call setSubstrate before runtime", 0)
+end
+config.running = true
+
+local ok, err = pcall(daemonLoop)
+
+config.running = false
+if not ok then error(err, 0) end
+end
+
+function ipnet.isRunning()
+return config.running == true
+end
+
+
+
+function ipnet.shutdown()
+config.running = false
+neighbours = {}
+asked = {}
+ingress = {}
+end
+
+return ipnet

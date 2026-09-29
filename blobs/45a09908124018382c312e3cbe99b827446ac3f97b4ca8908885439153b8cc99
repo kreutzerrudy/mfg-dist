@@ -1,0 +1,338 @@
+
+
+
+
+
+
+
+local recipes = require("mfg.controller.recipes")
+local state = require("mfg.common.state")
+
+local dispatch = {}
+
+local QUEUE_FILE = "queue"
+
+
+
+dispatch.KEEP_FINISHED = 10
+
+local FINISHED = {done = true, failed = true, cancelled = true}
+
+function dispatch.isOpen(job)
+return not FINISHED[job.state]
+end
+
+local function sortedKeys(t)
+local keys = {}
+for key in pairs(t) do keys[#keys + 1] = key end
+table.sort(keys)
+return keys
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+local explode
+
+
+local function need(item, quantity, available, seen, out)
+local have = available[item] or 0
+local taken = math.min(have, quantity)
+if taken > 0 then
+available[item] = have - taken
+out.draws[item] = (out.draws[item] or 0) + taken
+end
+local rest = quantity - taken
+if rest <= 0 then return true end
+
+local def = recipes.producing(item)
+if not def then
+out.short[item] = (out.short[item] or 0) + rest
+return true
+end
+return explode(def, math.ceil(rest / def.output.count), available, seen, out)
+end
+
+
+
+
+explode = function(def, sets, available, seen, out)
+if seen[def.id] then
+return nil, "recipe cycle through " .. def.output.item
+end
+seen[def.id] = true
+
+local inputs = {}
+for _, item in ipairs(sortedKeys(def.inputs)) do
+inputs[item] = def.inputs[item] * sets
+local ok, why = need(item, inputs[item], available, seen, out)
+if not ok then return nil, why end
+end
+
+out.steps[#out.steps + 1] = {
+recipe = def.id,
+label = def.label,
+sets = sets,
+produces = def.output.item,
+count = def.output.count * sets,
+inputs = inputs,
+}
+seen[def.id] = nil
+return true
+end
+
+
+
+
+
+
+
+
+function dispatch.plan(recipeOrId, quantity, available)
+local def = type(recipeOrId) == "table" and recipeOrId or recipes.get(recipeOrId)
+if not def then return nil, "no such recipe: " .. tostring(recipeOrId) end
+if type(quantity) ~= "number" or quantity < 1 then
+return nil, "a quantity of at least 1 is needed"
+end
+
+local sets, yield = recipes.setsFor(def, quantity)
+local out = {steps = {}, draws = {}, short = {}}
+local ok, why = explode(def, sets, dispatch.copy(available or {}), {}, out)
+if not ok then return nil, why end
+
+return {
+recipe = def.id, label = def.label, product = def.output.item,
+sets = sets, yield = yield,
+steps = out.steps, draws = out.draws, short = out.short,
+}
+end
+
+function dispatch.copy(t)
+local out = {}
+for k, v in pairs(t) do out[k] = v end
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function dispatch.claims(q)
+q = q or dispatch.queue()
+local total, byJob = {}, {}
+for _, job in ipairs(q.jobs) do
+if dispatch.isOpen(job) then
+local net = {}
+for index = job.position, #job.steps do
+local step = job.steps[index]
+local remaining = step.sets
+if index == job.position then
+remaining = step.sets - (job.stepDone or 0)
+end
+for item, count in pairs(step.inputs or {}) do
+net[item] = (net[item] or 0) + count / step.sets * remaining
+end
+net[step.produces] = (net[step.produces] or 0)
+- step.count / step.sets * remaining
+end
+for item, count in pairs(net) do
+if count > 0 then
+total[item] = (total[item] or 0) + count
+byJob[item] = byJob[item] or {}
+byJob[item][#byJob[item] + 1] = {job = job.id, count = count}
+end
+end
+end
+end
+return total, byJob
+end
+
+
+
+function dispatch.queue()
+local q = state.read(QUEUE_FILE, {jobs = {}, nextId = 1})
+if type(q) ~= "table" or type(q.jobs) ~= "table" then q = {jobs = {}, nextId = 1} end
+return q
+end
+
+
+local function prune(q)
+local finished = 0
+for index = #q.jobs, 1, -1 do
+if not dispatch.isOpen(q.jobs[index]) then
+finished = finished + 1
+if finished > dispatch.KEEP_FINISHED then table.remove(q.jobs, index) end
+end
+end
+end
+
+
+
+
+
+
+function dispatch.commit(plan, meta)
+meta = meta or {}
+local q = dispatch.queue()
+local id = q.nextId or 1
+prune(q)
+q.jobs[#q.jobs + 1] = {
+id = id,
+order = meta.order,
+by = meta.by,
+recipe = plan.recipe,
+label = plan.label,
+product = plan.product,
+requested = meta.requested,
+sets = plan.sets,
+yield = plan.yield,
+steps = plan.steps,
+position = 1,
+stepDone = 0,
+state = "queued",
+committed = os.epoch("utc"),
+}
+q.nextId = id + 1
+state.write(QUEUE_FILE, q)
+return id
+end
+
+function dispatch.job(id)
+for _, job in ipairs(dispatch.queue().jobs) do
+if job.id == id then return job end
+end
+return nil
+end
+
+
+function dispatch.jobs()
+return dispatch.queue().jobs
+end
+
+
+
+
+
+
+function dispatch.next(now)
+now = now or os.epoch("utc")
+for _, job in ipairs(dispatch.queue().jobs) do
+if dispatch.isOpen(job) and not (job.retryAt and job.retryAt > now) then
+local step = job.steps[job.position]
+if step then return job, step end
+end
+end
+return nil
+end
+
+
+
+
+local function change(jobId, fn)
+local q = dispatch.queue()
+for _, job in ipairs(q.jobs) do
+if job.id == jobId then
+local result, why = fn(job)
+if result == nil then return nil, why end
+state.write(QUEUE_FILE, q)
+return job
+end
+end
+return nil, "no such job: " .. tostring(jobId)
+end
+
+local function finishStep(job, result)
+job.history = job.history or {}
+job.history[#job.history + 1] = result
+job.position = job.position + 1
+job.stepDone = 0
+job.lastError, job.retryAt = nil, nil
+if job.position > #job.steps then
+job.state = "done"
+job.finished = os.epoch("utc")
+else
+job.state = "running"
+end
+end
+
+
+
+function dispatch.record(jobId, sets, result)
+return change(jobId, function(job)
+local step = job.steps[job.position]
+if not step then return nil, "the job has no step to record against" end
+job.stepDone = (job.stepDone or 0) + sets
+job.lastError, job.retryAt = nil, nil
+if job.stepDone >= step.sets then
+finishStep(job, result)
+else
+job.state = "running"
+end
+return true
+end)
+end
+
+
+function dispatch.advance(jobId, result)
+return change(jobId, function(job)
+finishStep(job, result)
+return true
+end)
+end
+
+
+
+
+
+function dispatch.fail(jobId, reason, fatal, retryAt)
+return change(jobId, function(job)
+job.lastError = reason
+job.attempts = (job.attempts or 0) + 1
+job.retryAt = (not fatal) and retryAt or nil
+job.state = fatal and "failed" or "blocked"
+if fatal then job.finished = os.epoch("utc") end
+return true
+end)
+end
+
+
+
+
+function dispatch.cancel(jobId, why)
+return change(jobId, function(job)
+if not dispatch.isOpen(job) then
+return nil, ("job %s is already %s"):format(tostring(jobId), job.state)
+end
+job.state = "cancelled"
+job.lastError = why
+job.finished = os.epoch("utc")
+return true
+end)
+end
+
+function dispatch.clear()
+state.write(QUEUE_FILE, {jobs = {}, nextId = 1})
+end
+
+return dispatch

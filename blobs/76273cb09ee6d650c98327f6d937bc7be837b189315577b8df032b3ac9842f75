@@ -1,0 +1,83 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local ed25519 = require("ccryptolib.ed25519")
+local ccutil = require("ccryptolib.util")
+
+local signed = {}
+
+
+
+
+
+
+
+
+
+signed.ANCHOR = "/boot/signer"
+
+local function isHexKey(hex, bytes)
+return type(hex) == "string" and #hex == bytes * 2 and not hex:find("%X")
+end
+
+
+
+function signed.sign(context, data)
+local netkeys = require("netkeys")
+
+
+
+
+
+local random = require("ccryptolib.random")
+if not random.isInit() then random.initWithTiming() end
+local sig = netkeys.sign(context, data)
+return ccutil.toHex(netkeys.signingKey()), ccutil.toHex(sig)
+end
+
+
+
+function signed.verify(context, data, signerHex, sigHex, anchors)
+if not isHexKey(signerHex, 32) then return nil, "no signer, or a malformed one" end
+if not isHexKey(sigHex, 64) then return nil, "no signature, or a malformed one" end
+
+local signer = ccutil.fromHex(signerHex)
+local trusted = false
+for _, anchor in ipairs(anchors or {}) do
+if anchor == signer then trusted = true break end
+end
+if not trusted then return nil, "signed by a key this node does not trust: " .. signerHex end
+
+if not ed25519.verify(signer, context .. data, ccutil.fromHex(sigHex)) then
+return nil, "bad signature"
+end
+return true
+end
+
+
+function signed.anchor(path)
+path = path or signed.ANCHOR
+local hex = require("mfg.common.state").readText(path)
+if not hex then return nil, "no firmware anchor at " .. path end
+hex = hex:gsub("%s", "")
+if not isHexKey(hex, 32) then return nil, "the firmware anchor at " .. path .. " is corrupt" end
+return ccutil.fromHex(hex)
+end
+
+return signed

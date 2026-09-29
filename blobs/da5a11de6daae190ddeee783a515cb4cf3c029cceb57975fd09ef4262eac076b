@@ -1,0 +1,47 @@
+local rpc = require("mfg.common.rpc")
+local node = require("mfg.turtle.node")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "return_unused",
+label       = "Return everything to input",
+role        = "turtle",
+tier        = "node",
+
+
+
+
+
+manual      = true,
+destructive = true,
+parameters  = {},
+returns     = {returned = "items"},
+
+run = function()
+local ok, result = node.returnUnused()
+if not ok then return rpc.REJECTED, {reason = tostring(result)} end
+return rpc.COMPLETED, result
+end,
+}

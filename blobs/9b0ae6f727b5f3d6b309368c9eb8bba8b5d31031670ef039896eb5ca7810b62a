@@ -1,0 +1,20 @@
+local rpc = require("mfg.common.rpc")
+local schedules = require("mfg.controller.schedules")
+
+
+
+return {
+name        = "schedules",
+label       = "Schedules",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {},
+
+returns = {entries = "table"},
+
+run = function()
+return rpc.COMPLETED, {entries = schedules.all()}
+end,
+}

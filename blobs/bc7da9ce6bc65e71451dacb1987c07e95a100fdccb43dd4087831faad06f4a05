@@ -1,0 +1,57 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local store = require("mfg.storage")
+local ports = require("mfg.controller.ports")
+local alarms = require("mfg.controller.alarms")
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "take_in",
+label       = "Take in what is in /io/in",
+tier        = "orchestrated",
+uses        = {"drain"},
+policy      = true,
+destructive = false,
+
+parameters = {},
+
+returns = {taken = "items", left = "items"},
+
+run = function(_, ctx)
+if not store.isBound(ports.IN) then
+return rpc.REJECTED, {reason = ("%s is not bound -- mfgctl bind %s "
+.. "<chest>"):format(ports.IN, ports.IN)}
+end
+local pool = require("mfg.common.config").setting("source")
+
+local status, fields = actions.invoke("drain", {from = ports.IN, to = pool}, ctx)
+if status ~= rpc.COMPLETED then
+return rpc.REJECTED, {reason = tostring(fields.reason)}
+end
+
+local left = ports.contents(ports.IN)
+local key = "io.intake.full"
+if next(left) then
+local parts = {}
+for item, count in pairs(left) do
+parts[#parts + 1] = ("%d %s"):format(count, item)
+end
+table.sort(parts)
+alarms.raise(key, ("%s is full: %s still waiting in %s"):format(pool,
+table.concat(parts, ", "), ports.IN), {source = ports.IN, severity = "hold"})
+else
+alarms.clear(key)
+end
+
+return rpc.COMPLETED, {taken = fields.drained or {}, left = left}
+end,
+}

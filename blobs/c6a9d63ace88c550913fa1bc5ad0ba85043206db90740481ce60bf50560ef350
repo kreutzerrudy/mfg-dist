@@ -1,0 +1,31 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+
+
+
+
+return {
+name        = "check_script",
+label       = "Check a script",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "source", label = "Script", type = "text", required = true},
+},
+
+returns = {ok = "flag", errors = "table", warnings = "table", footprint = "table",
+text = "text", machine = "text"},
+
+run = function(params)
+local report = scripts.check(params.source)
+return rpc.COMPLETED, {ok = report.ok, errors = report.errors,
+warnings = report.warnings, footprint = report.footprint,
+text = report.text, machine = report.tree and report.tree.machine}
+end,
+}

@@ -1,0 +1,266 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local signed = require("mfg.common.signed")
+local state = require("mfg.common.state")
+local validate = require("mfg.common.actions.validate")
+local schema = require("mfg.common.config.schema")
+
+local config = {}
+
+config.SCHEMA = 1
+config.CONTEXT = "mfg-config-v1|"
+config.PATH = "/boot/config"
+
+local byName = {}
+for _, param in ipairs(schema.parameters) do byName[param.name] = param end
+
+
+function config.declared(name)
+return byName[name]
+end
+
+
+
+
+
+local function checkDoc(doc)
+if type(doc) ~= "table" then return nil, "the config is not a document" end
+if doc.schema ~= config.SCHEMA then
+return nil, ("config schema %s; this software understands %d"):format(
+tostring(doc.schema), config.SCHEMA)
+end
+if type(doc.rev) ~= "number" or doc.rev < 1 then return nil, "the config carries no rev" end
+for _, field in ipairs({"node", "role", "platform"}) do
+if type(doc[field]) ~= "string" or doc[field] == "" then
+return nil, "the config names no " .. field
+end
+end
+if type(doc.actions) ~= "table" then return nil, "the config lists no actions" end
+if type(doc.equipment) ~= "table" then return nil, "the config lists no equipment" end
+if type(doc.settings) ~= "table" then return nil, "the config carries no settings" end
+if doc.aliases ~= nil then
+local ok, why = config.checkAliases(doc.aliases)
+if not ok then return nil, why end
+end
+return doc
+end
+
+
+function config.decode(envelope)
+if type(envelope) ~= "table" or type(envelope.doc) ~= "string" then
+return nil, "not a config envelope"
+end
+local ok, doc = pcall(textutils.unserialize, envelope.doc)
+if not ok or doc == nil then return nil, "the config document does not parse" end
+return checkDoc(doc)
+end
+
+
+function config.verify(envelope, anchors)
+if type(envelope) ~= "table" or not envelope.sig then
+return nil, "the config is not signed"
+end
+return signed.verify(config.CONTEXT, envelope.doc, envelope.signer, envelope.sig, anchors)
+end
+
+
+function config.seal(doc)
+local text = textutils.serialize(doc)
+local signer, sig = signed.sign(config.CONTEXT, text)
+return {doc = text, signer = signer, sig = sig}
+end
+
+
+function config.unsealed(doc)
+return {doc = textutils.serialize(doc), origin = "disk"}
+end
+
+
+
+
+
+function config.current(path)
+local envelope, why = state.readFile(path or config.PATH)
+if envelope == nil then return nil, why or "no config at " .. (path or config.PATH) end
+return config.decode(envelope)
+end
+
+
+
+
+
+function config.setting(name, path)
+local param = byName[name]
+if not param then error("no setting called " .. tostring(name), 2) end
+
+local doc = config.current(path)
+local value = doc and doc.settings[name]
+if value ~= nil then return value end
+return param.default
+end
+
+
+
+
+
+
+
+
+
+config.TURTLE_SLOTS = 2
+
+
+
+
+local function isModemEntry(entry)
+if #entry == 0 then return false end
+for _, id in ipairs(entry) do
+if not tostring(id):find("wireless_modem", 1, true) then return false end
+end
+return true
+end
+
+
+
+
+
+
+function config.checkAliases(aliases)
+if type(aliases) ~= "table" then return nil, "aliases is not a table" end
+for name, target in pairs(aliases) do
+if type(name) ~= "string" or not name:match("^[%w_%-]+$") then
+return nil, ("alias %s is not a plain command name"):format(tostring(name))
+end
+if type(target) ~= "string" or not target:match("^/[%w_%-/%.]+$") or target:find("%.%.") then
+return nil, ("alias %s must name an absolute program path"):format(name)
+end
+end
+return true
+end
+
+function config.checkProfile(name, spec)
+if type(spec) ~= "table" then return nil, "no role called " .. tostring(name) end
+if spec.aliases ~= nil then
+local ok, why = config.checkAliases(spec.aliases)
+if not ok then return nil, name .. ": " .. why end
+end
+local equipment = spec.equipment or {}
+
+if spec.platform == "turtle" then
+if #equipment > config.TURTLE_SLOTS then
+return nil, ("%s needs %d pieces of equipment and a turtle has %d upgrade slots"):format(
+name, #equipment, config.TURTLE_SLOTS)
+end
+local pinned = false
+for _, entry in ipairs(equipment) do
+if type(entry) ~= "table" or #entry == 0 then
+return nil, name .. " has an equipment entry naming no item"
+end
+if entry.pinned then
+if not isModemEntry(entry) then
+return nil, name .. " pins equipment that is not a wireless modem"
+end
+pinned = true
+end
+end
+
+
+if not pinned then return nil, name .. " has no pinned wireless modem" end
+elseif spec.platform == "computer" then
+if #equipment > 0 then
+return nil, name .. " runs on a computer, which has no upgrade slots"
+end
+else
+return nil, ("%s declares no platform (turtle or computer)"):format(name)
+end
+return true
+end
+
+
+
+
+
+function config.resolve(args)
+local roles = args.roles or require("mfg.common.roles")
+local spec = roles[args.role]
+local ok, why = config.checkProfile(args.role, spec)
+if not ok then return nil, why end
+
+local settings, bad = config.settingsFor(spec.settings, args.overrides)
+if not settings then return nil, bad end
+
+local actions = {}
+for i, path in ipairs(spec.actions or {}) do actions[i] = path end
+local aliases = {}
+for name, target in pairs(spec.aliases or {}) do aliases[name] = target end
+local equipment = {}
+for i, entry in ipairs(spec.equipment or {}) do
+local copy = {pinned = entry.pinned}
+for j, id in ipairs(entry) do copy[j] = id end
+equipment[i] = copy
+end
+
+return {
+schema = config.SCHEMA,
+rev = args.rev,
+node = args.node,
+role = args.role,
+platform = spec.platform,
+firmware = args.firmware,
+actions = actions,
+equipment = equipment,
+settings = settings,
+aliases = aliases,
+issued = os.epoch("utc"),
+}
+end
+
+
+
+
+
+
+function config.settingsFor(names, values)
+local params, takes = {}, {}
+for _, name in ipairs(names or {}) do
+local param = byName[name]
+if not param then return nil, ("the role takes a setting nobody declared: %s"):format(name) end
+params[#params + 1] = param
+takes[name] = true
+end
+for name in pairs(values or {}) do
+if not byName[name] then return nil, ("no setting called %s"):format(name) end
+if not takes[name] then return nil, ("this role does not take %s"):format(name) end
+end
+local out, why = validate.check({parameters = params}, values or {})
+if not out then return nil, why end
+return out
+end
+
+return config

@@ -1,0 +1,41 @@
+local actions = require("mfg.common.actions")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "serve_control",
+label       = "Serve the control surface",
+role        = "turtle",
+tier        = "service",
+quiet       = true,
+destructive = false,
+
+parameters = {
+{name = "once", label = "Serve once", type = "flag", default = false,
+help = "One request then return, for an operating loop that has other "
+.. "work between requests."},
+},
+
+returns = {served = "number"},
+
+run = function(params, ctx)
+return actions.invoke("receive", {
+protocol = "mfg-control",
+once = params.once,
+}, ctx)
+end,
+}

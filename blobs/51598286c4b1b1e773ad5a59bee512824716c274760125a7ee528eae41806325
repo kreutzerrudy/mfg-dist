@@ -1,0 +1,70 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local requires = {}
+
+
+
+
+
+
+
+
+
+
+function requires.evaluate(decl, snapshot)
+local rules = decl and decl.requires
+if type(rules) ~= "table" or next(rules) == nil then
+return true, nil, true
+end
+if type(snapshot) ~= "table" then
+return true, nil, false
+end
+
+for point, expected in pairs(rules) do
+local actual = snapshot[point]
+
+if type(expected) == "table" then
+local matched = false
+for _, allowed in ipairs(expected) do
+if actual == allowed then matched = true end
+end
+if not matched then
+return false, ("%s is %s, needs one of %s"):format(
+point, tostring(actual),
+table.concat(requires.render(expected), ", ")), true
+end
+elseif actual ~= expected then
+
+
+
+return false, ("%s is %s, needs %s"):format(
+point, tostring(actual), tostring(expected)), true
+end
+end
+
+return true, nil, true
+end
+
+function requires.render(expected)
+local out = {}
+for _, value in ipairs(expected) do out[#out + 1] = tostring(value) end
+return out
+end
+
+return requires

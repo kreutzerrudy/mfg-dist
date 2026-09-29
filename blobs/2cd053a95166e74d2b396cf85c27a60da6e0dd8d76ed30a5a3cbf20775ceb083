@@ -1,0 +1,54 @@
+
+
+
+
+
+
+
+
+
+
+
+local store = require("mfg.storage")
+local actions = require("mfg.common.actions")
+local rpc = require("mfg.common.rpc")
+
+local ports = {}
+
+ports.IN = "/io/in"
+ports.OUT = "/io/out"
+ports.POLL = 5
+
+
+function ports.contents(path)
+if not store.isBound(path) then return {} end
+return store.stock(path) or {}
+end
+
+
+
+
+
+
+function ports.intake(opts)
+opts = opts or {}
+if not store.isBound(ports.IN) then return nil end
+if next(ports.contents(ports.IN)) == nil then return nil end
+local invoke = opts.invoke or actions.invoke
+return invoke("take_in", {}, {by = "intake"})
+end
+
+
+function ports.run(opts)
+while true do
+local ok, status, fields = pcall(ports.intake, opts)
+if not ok then
+print("intake: " .. tostring(status))
+elseif status and status ~= rpc.COMPLETED then
+print("intake: " .. tostring(fields and fields.reason))
+end
+sleep(ports.POLL)
+end
+end
+
+return ports

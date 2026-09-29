@@ -1,0 +1,104 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local rpc = require("mfg.common.rpc")
+local join = require("mfg.common.join")
+local odometry = require("mfg.turtle.odometry")
+local builder = require("mfg.turtle.builder")
+
+odometry.load()
+
+local map, mapErr = builder.load()
+if not map then
+printError("no schematic: " .. tostring(mapErr))
+printError("put one at /mfg/schematic -- this builder cannot move without it")
+else
+print(("map %s loaded, home bay %s"):format(tostring(map.name),
+tostring(builder.home())))
+end
+
+if map then
+local located, how = builder.ready()
+if located then
+local at = odometry.position()
+print(("at %d,%d,%d facing %s (%s)"):format(at.x, at.y, at.z,
+odometry.facing(), tostring(how or "already trusted")))
+else
+
+
+
+printError("position unknown: " .. tostring(how))
+printError("put it in its bay and reboot, or use 'mfgctl recover'")
+end
+end
+
+local cfg = join.config()
+
+parallel.waitForAny(
+function()
+if cfg and cfg.controller then
+shell.run("/netstart", tostring(cfg.controller))
+else
+shell.run("/netstart")
+end
+end,
+
+function()
+local acknet = require("acknet")
+local netkeys = require("netkeys")
+local net = require("net")
+
+for _ = 1, 60 do
+if acknet.isRunning() then break end
+sleep(1)
+end
+
+if cfg and cfg.secret and cfg.secret ~= "(spent)" then
+netkeys.init()
+print("enrolling with controller " .. tostring(cfg.controller))
+local reply, why = join.enroll(cfg, 30, 2)
+if reply then
+print("admitted as " .. tostring(reply.name))
+else
+printError("enrollment failed: " .. tostring(why))
+end
+end
+
+for _ = 1, 120 do
+if net.ready() and net.address() then break end
+sleep(1)
+end
+print("joined as " .. tostring(net.hostname() or net.address()))
+
+net.serve("mfg-control")
+net.serve("mfg-report")
+print("serving -- idle")
+
+
+
+
+while true do
+builder.pump()
+rpc.serveOnce("mfg-control", builder.handle, 1)
+end
+end
+)

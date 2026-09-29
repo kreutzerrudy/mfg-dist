@@ -1,0 +1,239 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local ipnet = require("ipnet")
+local ip = require("ip")
+
+local icmp = {}
+
+icmp.PROTOCOL = "icmp"
+
+icmp.ECHO_REQUEST = "echo_request"
+icmp.ECHO_REPLY = "echo_reply"
+
+
+
+icmp.MAX_PAYLOAD = 64
+
+
+
+
+
+icmp.MAX_REPLIES_PER_WINDOW = 20
+icmp.WINDOW_MS = 1000
+
+local running = false
+local replies = {}
+
+local function allowed(source)
+local now = os.epoch("utc")
+local bucket = replies[source]
+
+if not bucket or now - bucket.windowStart > icmp.WINDOW_MS then
+replies[source] = {count = 1, windowStart = now}
+return true
+end
+
+if bucket.count >= icmp.MAX_REPLIES_PER_WINDOW then
+return false
+end
+bucket.count = bucket.count + 1
+return true
+end
+
+icmp.allowed = allowed
+
+local function truncate(payload)
+if type(payload) ~= "string" then return "" end
+if #payload > icmp.MAX_PAYLOAD then
+return payload:sub(1, icmp.MAX_PAYLOAD)
+end
+return payload
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+icmp.REQUEST_EVENT = "icmp_send"
+icmp.REPLY_EVENT = "icmp_reply"
+
+
+
+
+
+function icmp.request(target, id, seq, payload)
+local address = target
+if type(target) == "string" then
+address = ip.parse(target)
+if not address then return false, "not an address: " .. target end
+end
+
+os.queueEvent(icmp.REQUEST_EVENT, address, id, seq, truncate(payload))
+return true
+end
+
+
+
+local function transmit(address, id, seq, payload)
+return ipnet.send(address, {
+icmp = icmp.ECHO_REQUEST,
+id = id,
+seq = seq,
+payload = truncate(payload),
+sent = os.epoch("utc"),
+}, icmp.PROTOCOL)
+end
+
+
+
+
+
+
+
+
+function icmp.runtime()
+if running then error("icmp: daemon already running", 0) end
+running = true
+
+local ok, err = pcall(function()
+while true do
+local event, a, b, c, d = os.pullEvent()
+
+if event == ipnet.messageEvent then
+
+local source, message, protocol = a, b, c
+if protocol == icmp.PROTOCOL and type(message) == "table" then
+if message.icmp == icmp.ECHO_REQUEST then
+if allowed(source) then
+
+
+
+
+ipnet.send(source, {
+icmp = icmp.ECHO_REPLY,
+id = message.id,
+seq = message.seq,
+payload = truncate(message.payload),
+sent = message.sent,
+}, icmp.PROTOCOL)
+end
+elseif message.icmp == icmp.ECHO_REPLY then
+
+os.queueEvent(icmp.REPLY_EVENT, source,
+message.id, message.seq, message.payload)
+end
+end
+
+elseif event == icmp.REQUEST_EVENT then
+transmit(a, b, c, d)
+end
+end
+end)
+
+running = false
+if not ok then error(err, 0) end
+end
+
+function icmp.isRunning()
+return running
+end
+
+function icmp.shutdown()
+running = false
+replies = {}
+end
+
+
+
+
+
+
+
+
+
+function icmp.ping(target, opts)
+opts = opts or {}
+local timeout = opts.timeout or 2
+local id = opts.id or os.getComputerID()
+local seq = opts.seq or 1
+
+local address = target
+if type(target) == "string" then
+address = ip.parse(target)
+if not address then return nil, "not an address: " .. tostring(target) end
+end
+
+local startedAt = os.epoch("utc")
+local sent, sendErr = icmp.request(address, id, seq, opts.payload or "")
+if not sent then return nil, tostring(sendErr) end
+
+local deadline = os.startTimer(timeout)
+while true do
+local event, a, b, c, d = os.pullEvent()
+
+if event == icmp.REPLY_EVENT and b == id and c == seq then
+os.cancelTimer(deadline)
+return (os.epoch("utc") - startedAt) / 1000,
+{id = b, seq = c, payload = d, src = a}
+
+elseif event == "timer" and a == deadline then
+
+
+
+return nil, "timed out"
+end
+end
+end
+
+
+
+
+
+
+
+function icmp.reachable(target, opts)
+opts = opts or {}
+local attempts = opts.attempts or 2
+
+for seq = 1, attempts do
+local rtt = icmp.ping(target, {
+timeout = opts.timeout or 2,
+seq = seq,
+id = opts.id,
+})
+if rtt then return true, rtt end
+end
+return false
+end
+
+return icmp

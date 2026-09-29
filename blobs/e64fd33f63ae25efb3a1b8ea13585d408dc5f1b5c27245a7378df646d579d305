@@ -1,0 +1,255 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+
+local input = {}
+
+
+
+
+
+
+
+
+
+
+
+
+function input.normalise(event, a, b, c)
+if type(event) == "table" then return event end
+
+if event == "monitor_touch" then
+return {kind = "touch", x = b, y = c, side = a}
+elseif event == "mouse_click" then
+return {kind = "touch", x = b, y = c, button = a}
+elseif event == "key" then
+return {kind = "key", key = a}
+elseif event == "char" then
+return {kind = "char", char = a}
+end
+return nil
+end
+
+
+
+
+function input.keys(grid)
+if not grid then return {} end
+return grid.keys or {}
+end
+
+
+
+
+
+
+
+function input.scoped(leader, key)
+if not leader then return tostring(key) end
+return ("%s %s"):format(tostring(leader), tostring(key))
+end
+
+
+
+local DIGITS = {
+one = "1", two = "2", three = "3", four = "4", five = "5",
+six = "6", seven = "7", eight = "8", nine = "9", zero = "0",
+
+numPadEnter = "enter",
+}
+
+
+function input.keyName(event)
+if not event then return nil end
+if event.kind == "char" then return event.char end
+if event.kind == "key" and event.key and keys then
+local name = keys.getName and keys.getName(event.key)
+if not name then return nil end
+return DIGITS[name] or name
+end
+return nil
+end
+
+
+
+
+
+
+input.NAMED = {
+enter = true, backspace = true, delete = true, left = true, right = true,
+up = true, down = true, pageUp = true, pageDown = true, home = true,
+["end"] = true,
+}
+
+
+
+function input.heard(event)
+if not event then return false end
+if event.kind ~= "key" then return true end
+return input.NAMED[input.keyName(event)] == true
+end
+
+
+
+
+
+
+
+function input.actionFor(grid, event, opts)
+if not grid or not event then return nil end
+opts = opts or {}
+
+if event.kind == "touch" then
+if not event.x or not event.y then return nil end
+return doc.hit(grid, event.x, event.y)
+end
+
+local name = input.keyName(event)
+if not name then return nil end
+
+
+
+
+
+if opts.leader then
+return input.keys(grid)[input.scoped(opts.leader, name)]
+end
+
+return input.keys(grid)[name]
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function input.drive(display, render, handle, opts)
+opts = opts or {}
+local wait = opts.wait or 1
+local held = nil
+
+local function letGo()
+held = nil
+if display.press then display.press(nil) end
+end
+
+while true do
+local grid = render and render() or nil
+local event = display.input(wait)
+local outcome
+if not event then
+
+elseif event.kind == "press" then
+local t = input.targetAt(grid, event.x, event.y)
+local action = t and t.action
+if event.button == 2 then
+
+if action and action.alt then
+outcome = handle({kind = "act", action = action.alt}, grid)
+end
+elseif action and action.kind == "scrollbar" then
+
+
+
+held = {target = t, x = event.x, y = event.y, dragging = true}
+outcome = handle({kind = "touch", x = event.x, y = event.y}, grid)
+elseif t then
+held = {target = t, x = event.x, y = event.y,
+carry = action and action.drag}
+if display.press then display.press(t) end
+end
+elseif event.kind == "drag" then
+if held and held.dragging then
+
+
+local t = input.targetAt(grid, held.x, event.y)
+if t and t.action and t.action.kind == "scrollbar" then
+outcome = handle({kind = "touch", x = held.x, y = event.y}, grid)
+end
+elseif held and held.carry then
+
+
+
+local t = input.targetAt(grid, event.x, event.y)
+local place = t and (t.x1 .. "," .. t.y1) or "none"
+if not held.moved or place ~= held.over then
+held.moved, held.over = true, place
+outcome = handle({kind = "carry", drag = held.carry,
+over = t and t.action and t.action.drop,
+x = event.x, y = event.y}, grid)
+end
+end
+elseif event.kind == "release" then
+if held and held.dragging then
+held = nil
+elseif held and held.moved then
+local t = input.targetAt(grid, event.x, event.y)
+local carried = held.carry
+letGo()
+outcome = handle({kind = "drop", drag = carried,
+over = t and t.action and t.action.drop,
+x = event.x, y = event.y}, grid)
+elseif held then
+local t, x, y = held.target, event.x, event.y
+local over = x and y and x >= t.x1 and x <= t.x2 and y >= t.y1 and y <= t.y2
+local at = {kind = "touch", x = held.x, y = held.y}
+letGo()
+if over then outcome = handle(at, grid) end
+end
+else
+outcome = handle(event, grid)
+end
+if outcome == "quit" then return "quit" end
+end
+end
+
+
+
+function input.targetAt(grid, x, y)
+if not grid or not x or not y then return nil end
+local found = nil
+for _, t in ipairs(grid.targets or {}) do
+if x >= t.x1 and x <= t.x2 and y >= t.y1 and y <= t.y2 then found = t end
+end
+return found
+end
+
+return input

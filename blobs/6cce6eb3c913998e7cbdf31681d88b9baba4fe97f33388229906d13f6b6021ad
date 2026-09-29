@@ -1,0 +1,35 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "stock",
+label       = "What a volume holds",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "path", label = "Volume", type = "path", required = true,
+choices = {source = "volumes"},
+help = "A mount point such as /pool or /t1/in -- never a device name."},
+},
+
+returns = {stock = "items", degraded = "text"},
+
+run = function(params)
+local totals, degraded = store.stock(params.path)
+if not totals then return rpc.REJECTED, {reason = tostring(degraded)} end
+return rpc.COMPLETED, {stock = totals, degraded = degraded}
+end,
+}

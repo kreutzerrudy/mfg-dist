@@ -1,0 +1,448 @@
+
+
+
+
+
+
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local THEME = {
+white = 0xFFFFFF,
+orange = 0xD98A55,
+magenta = 0x7ED957,
+lightBlue = 0x4FD6D0,
+yellow = 0xE8C84A,
+lime = 0x3C8527,
+pink = 0xA05A00,
+gray = 0x8B8B8B,
+lightGray = 0xC6C6C6,
+cyan = 0x5B7FB8,
+purple = 0xD2D2D2,
+blue = 0x2F4FB0,
+brown = 0x9C7A4B,
+green = 0x626262,
+red = 0xB02E26,
+black = 0x3F3F3F,
+}
+
+
+local BG = {
+panel = "lightGray", zebra = "purple", bar = "black", button = "green",
+primary = "lime", danger = "red", disabled = "purple", selected = "cyan",
+field = "white", slot = "gray", pressed = "black",
+track = "gray", thumb = "black",
+}
+
+
+local DARK = {black = true, green = true, lime = true, red = true, cyan = true,
+blue = true, brown = true, pink = true, gray = true}
+
+local ON_LIGHT = {
+text = "black", title = "black", label = "green", dim = "green", good = "lime",
+warn = "pink", bad = "red", stale = "green", action = "black", selected = "cyan",
+flow = "green",
+}
+local ON_DARK = {
+text = "white", title = "white", label = "lightGray", dim = "lightGray",
+good = "magenta", warn = "yellow", bad = "orange", stale = "lightGray",
+action = "white", selected = "white", flow = "lightGray",
+}
+
+
+
+local PALETTE = {
+text = colours.white,
+title = colours.white,
+label = colours.lightGrey,
+dim = colours.grey,
+good = colours.lime,
+warn = colours.yellow,
+bad = colours.red,
+stale = colours.grey,
+action = colours.lightBlue,
+selected = colours.white,
+flow = colours.grey,
+}
+
+
+
+local target = nil
+local isMonitor = false
+local painted = nil
+local themed = nil
+local pressedRect = nil
+
+local SCALE = 0.5
+
+
+
+
+
+local function forget()
+target, isMonitor, painted, themed = nil, false, nil, nil
+end
+
+local function resolve()
+if target then return target end
+
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.getType(name) == "monitor" then
+target = peripheral.wrap(name)
+isMonitor = true
+
+
+
+if target.setTextScale then pcall(target.setTextScale, SCALE) end
+return target
+end
+end
+
+target = term.current()
+isMonitor = false
+return target
+end
+
+function backend.attached()
+resolve()
+return isMonitor and "monitor" or "terminal"
+end
+
+function backend.size()
+local screen = resolve()
+
+
+if isMonitor and screen.getTextScale then
+local ok, scale = pcall(screen.getTextScale)
+if ok and scale ~= SCALE then
+pcall(screen.setTextScale, SCALE)
+painted = nil
+end
+end
+local width, height = screen.getSize()
+return width, height
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function buttonLook(run, under)
+local style, colour = run.style, run.colour
+if style == "row" then
+if colour == "selected" then return BG.selected, "white" end
+return run.alt and BG.zebra or under, nil
+elseif style == "tab" then
+if colour == "selected" then return BG.panel, "black" end
+return BG.bar, colour == "dim" and "green" or "lightGray"
+elseif style == "slot" then
+if colour == "selected" then return BG.selected, "white" end
+return BG.slot, "white"
+end
+if run.bg then return BG[run.bg] or run.bg, nil end
+if colour == "good" then return BG.primary, "white" end
+if colour == "bad" then return BG.danger, "white" end
+if colour == "selected" then return BG.selected, "white" end
+if colour == "dim" then return BG.disabled, "green" end
+return BG.button, "white"
+end
+
+
+
+local RULE = string.char(140)
+
+
+
+
+
+
+
+function backend.cellsOf(grid)
+local cells = {}
+for y = 1, grid.height do
+local row = {}
+for _, run in ipairs(grid.rows[y] or {}) do
+local text, n = run.text, #run.text
+for i = 1, n do
+local x = run.x + i - 1
+local under = row[x] and row[x].bg or BG.panel
+local ch, bg, fg = text:sub(i, i), nil, nil
+if run.role == "button" then
+bg, fg = buttonLook(run, under)
+if (i == 1 and ch == "[") or (i == n and ch == "]") then ch = " " end
+elseif run.fill then
+bg = BG[run.bg] or run.bg
+elseif run.role == "rule" then
+ch, fg = RULE, "gray"
+elseif run.bg then
+bg = BG[run.bg] or run.bg
+end
+bg = bg or under
+if not fg then
+fg = (DARK[bg] and ON_DARK or ON_LIGHT)[run.colour]
+or (DARK[bg] and "white" or "black")
+end
+row[x] = {char = ch, fg = fg, bg = bg}
+end
+end
+cells[y] = row
+end
+
+local r = pressedRect
+if r then
+for y = r.y1, r.y2 do
+for x = r.x1, r.x2 do
+local cell = cells[y] and cells[y][x]
+if cell then cell.bg, cell.fg = BG.pressed, "white" end
+end
+end
+end
+return cells
+end
+
+
+local function theme(screen)
+if themed == screen or not screen.setPaletteColour then return end
+for name, rgb in pairs(THEME) do
+pcall(screen.setPaletteColour, colors[name], rgb)
+end
+themed = screen
+end
+
+local HEX = {}
+local function hex(name)
+local c = HEX[name]
+if not c then
+c = colors.toBlit(colors[name] or colors.black)
+HEX[name] = c
+end
+return c
+end
+
+local BLANK = {char = " ", fg = "black", bg = BG.panel}
+
+local function same(a, b)
+return a.char == b.char and a.fg == b.fg and a.bg == b.bg
+end
+
+function backend.paint(grid)
+local screen = resolve()
+local colour = screen.isColour and screen.isColour() or false
+local width, height = screen.getSize()
+if not colour then return backend.paintMono(grid, screen, width, height) end
+theme(screen)
+
+local cells = backend.cellsOf(grid)
+
+
+
+if not painted or painted.mono or painted.width ~= width or painted.height ~= height then
+screen.setBackgroundColour(colors[BG.panel])
+screen.clear()
+painted = {width = width, height = height, cells = {}, mono = false}
+end
+
+for y = 1, height do
+local now = cells[y] or {}
+local before = painted.cells[y] or {}
+local x = 1
+while x <= width do
+if same(now[x] or BLANK, before[x] or BLANK) then
+x = x + 1
+else
+local from = x
+local chars, fgs, bgs = {}, {}, {}
+while x <= width do
+local m = now[x] or BLANK
+if same(m, before[x] or BLANK) then break end
+chars[#chars + 1], fgs[#fgs + 1], bgs[#bgs + 1] =
+m.char, hex(m.fg), hex(m.bg)
+x = x + 1
+end
+screen.setCursorPos(from, y)
+screen.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
+end
+end
+local kept = {}
+for cx = 1, width do kept[cx] = now[cx] or BLANK end
+painted.cells[y] = kept
+end
+end
+
+
+
+function backend.paintMono(grid, screen, width, height)
+screen.setBackgroundColour(colours.black)
+screen.clear()
+painted = {width = width, height = height, cells = {}, mono = true}
+for y = 1, math.min(grid.height, height) do
+for _, run in ipairs(grid.rows[y] or {}) do
+if not run.fill then
+screen.setTextColour(PALETTE[run.colour] or colours.white)
+screen.setCursorPos(run.x, y)
+screen.write(run.text)
+end
+end
+end
+screen.setTextColour(colours.white)
+end
+
+
+function backend.press(rect)
+pressedRect = rect
+end
+
+
+
+
+
+
+function backend.invalidate()
+painted = nil
+themed = nil
+end
+
+
+
+function backend.restore()
+local screen = themed
+themed, painted, pressedRect = nil, nil, nil
+if not screen or not screen.setPaletteColour then return end
+for name in pairs(THEME) do
+pcall(screen.setPaletteColour, colors[name],
+term.nativePaletteColour(colors[name]))
+end
+pcall(screen.setBackgroundColour, colours.black)
+pcall(screen.setTextColour, colours.white)
+pcall(screen.clear)
+pcall(screen.setCursorPos, 1, 1)
+end
+
+
+
+
+
+
+
+local SOUNDS = {
+click = {"minecraft:ui.button.click", 0.5, 1.0},
+tab = {"minecraft:ui.button.click", 0.5, 1.4},
+added = {"minecraft:entity.item.pickup", 0.6, 1.0},
+done = {"minecraft:entity.experience_orb.pickup", 0.6, 1.0},
+refused = {"minecraft:block.note_block.bass", 1.0, 0.8},
+}
+
+local speaker = nil
+local speakerLooked = false
+
+function backend.sound(name)
+local s = SOUNDS[name]
+if not s then return end
+if not speakerLooked then
+speaker = peripheral.find and peripheral.find("speaker") or nil
+speakerLooked = true
+end
+if speaker then pcall(speaker.playSound, s[1], s[2], s[3]) end
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+function backend.touchable()
+local screen = resolve()
+if isMonitor then
+return screen.isColour and screen.isColour() or false
+end
+return term.isColour and term.isColour() or false
+end
+
+
+function backend.colour()
+local screen = resolve()
+return screen.isColour and screen.isColour() or false
+end
+
+
+
+
+
+
+function backend.input(seconds)
+local timer = os.startTimer(seconds or 2)
+while true do
+local event, a, b, c = os.pullEvent()
+
+if event == "timer" and a == timer then
+return nil
+elseif event == "monitor_touch" then
+
+return {kind = "touch", x = b, y = c}
+elseif event == "mouse_click" and not isMonitor then
+
+
+
+
+
+return {kind = "press", x = b, y = c, button = a}
+elseif event == "mouse_up" and not isMonitor then
+return {kind = "release", x = b, y = c, button = a}
+elseif event == "mouse_drag" and not isMonitor then
+
+return {kind = "drag", x = b, y = c, button = a}
+elseif event == "mouse_scroll" and not isMonitor then
+
+return {kind = "scroll", dir = a, x = b, y = c}
+elseif event == "key" then
+return {kind = "key", key = a}
+elseif event == "char" then
+return {kind = "char", char = a}
+elseif event == "monitor_resize" or event == "peripheral"
+or event == "peripheral_detach" then
+
+
+
+forget()
+speakerLooked = false
+return nil
+end
+end
+end
+
+return backend

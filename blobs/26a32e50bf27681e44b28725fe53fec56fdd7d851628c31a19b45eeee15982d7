@@ -1,0 +1,95 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+local machines = require("mfg.controller.machines")
+local mount = require("mfg.storage.mount")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function portsOf(machine)
+local signals = require("mfg.controller.signals")
+local out = {}
+for _, record in ipairs(machines.ports(machine)) do
+local kind = mount.kindOf(record)
+local port = {name = record.path:match("[^/]+$"), kind = kind,
+direction = record.direction, bound = #(record.devices or {}) > 0,
+chest = record.via == "interface" or nil, slots = record.slots}
+if kind ~= mount.VOLUME and port.bound then
+port.level = signals.read(record.path)
+end
+out[#out + 1] = port
+end
+return out
+end
+
+return {
+name        = "scripts",
+label       = "Machine scripts and machines",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "machine", label = "Machine", type = "text", required = false},
+{name = "script", label = "Script", type = "text", required = false,
+help = "One script's tree and source, for the editor."},
+{name = "brief", label = "Brief", type = "flag", required = false,
+help = "Leave out runs and handlers: the list, polled."},
+},
+
+returns = {scripts = "table", machines = "table", now = "number"},
+
+run = function(params)
+local types = {}
+for _, record in ipairs(scripts.all()) do
+local made = {}
+for _, m in ipairs(scripts.machines(record.name)) do made[#made + 1] = m.name end
+local one = params.script == record.name
+types[#types + 1] = {script = record.name, rev = record.rev,
+footprint = record.footprint, machines = made,
+tree = one and record.ast or nil, source = one and record.source or nil}
+end
+
+local out = {}
+for _, record in ipairs(scripts.machines()) do
+if not params.machine or record.name == params.machine then
+local script = scripts.get(record.script)
+local lastAt = nil
+for _, h in pairs(record.handlers or {}) do
+if h.at and (not lastAt or h.at > lastAt) then lastAt = h.at end
+end
+local brief = params.brief and not params.machine
+out[#out + 1] = {
+machine = record.name, script = record.script,
+rev = script and script.rev, device = record.device,
+chests = record.chests,
+enabled = record.enabled, state = record.state,
+faults = record.faults, lastError = record.lastError,
+limit = record.limit, pausedBy = record.pausedBy,
+lastAt = lastAt,
+runs = (not brief) and record.runs or nil,
+handlers = (not brief) and record.handlers or nil,
+source = params.machine and script and script.source or nil,
+ports = params.machine and portsOf(record.name) or nil,
+}
+end
+end
+if params.machine and #out == 0 then
+return rpc.REJECTED, {reason = "no machine called " .. params.machine}
+end
+return rpc.COMPLETED, {scripts = types, machines = out, now = os.epoch("utc")}
+end,
+}

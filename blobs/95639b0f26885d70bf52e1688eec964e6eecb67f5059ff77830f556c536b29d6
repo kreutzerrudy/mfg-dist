@@ -1,0 +1,526 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local schematic = {}
+
+
+
+local STEP = {
+north = {x = 0, y = 0, z = -1},
+south = {x = 0, y = 0, z = 1},
+east = {x = 1, y = 0, z = 0},
+west = {x = -1, y = 0, z = 0},
+up = {x = 0, y = 1, z = 0},
+down = {x = 0, y = -1, z = 0},
+}
+
+schematic.STEP = STEP
+
+local CARDINALS = {north = true, east = true, south = true, west = true}
+
+schematic.CARDINALS = CARDINALS
+
+
+local ORDER = {"north", "east", "south", "west"}
+local INDEX = {}
+for i, name in ipairs(ORDER) do INDEX[name] = i end
+
+function schematic.right(facing)
+local i = INDEX[facing]
+if not i then return nil end
+return ORDER[(i % 4) + 1]
+end
+
+function schematic.left(facing)
+local i = INDEX[facing]
+if not i then return nil end
+return ORDER[((i + 2) % 4) + 1]
+end
+
+function schematic.opposite(facing)
+if facing == "up" then return "down" end
+if facing == "down" then return "up" end
+local i = INDEX[facing]
+if not i then return nil end
+return ORDER[((i + 1) % 4) + 1]
+end
+
+
+
+function schematic.turnsBetween(from, to)
+local a, b = INDEX[from], INDEX[to]
+if not a or not b then return nil end
+local diff = (b - a) % 4
+if diff == 3 then return -1 end
+return diff
+end
+
+
+
+local function key(x, y, z)
+return ("%d,%d,%d"):format(x, y, z)
+end
+
+schematic.key = key
+
+function schematic.same(a, b)
+if not a or not b then return false end
+return a.x == b.x and a.y == b.y and a.z == b.z
+end
+
+function schematic.step(position, direction)
+local delta = STEP[direction]
+if not delta or not position then return nil end
+return {x = position.x + delta.x, y = position.y + delta.y,
+z = position.z + delta.z}
+end
+
+function schematic.adjacent(a, b)
+if not a or not b then return false end
+local dx = math.abs(a.x - b.x)
+local dy = math.abs(a.y - b.y)
+local dz = math.abs(a.z - b.z)
+return (dx + dy + dz) == 1
+end
+
+
+function schematic.directionFrom(from, to)
+if not schematic.adjacent(from, to) then return nil end
+for name, delta in pairs(STEP) do
+if from.x + delta.x == to.x and from.y + delta.y == to.y
+and from.z + delta.z == to.z then
+return name
+end
+end
+return nil
+end
+
+
+
+local function words(line)
+local out = {}
+for word in line:gmatch("%S+") do out[#out + 1] = word end
+return out
+end
+
+
+
+local function coordsAfter(tokens, from)
+local x = tonumber(tokens[from + 1])
+local y = tonumber(tokens[from + 2])
+local z = tonumber(tokens[from + 3])
+if not (x and y and z) then return nil end
+return {x = x, y = y, z = z}
+end
+
+
+
+
+
+
+
+local function fail(number, line, why)
+return nil, ("line %d: %s\n  %s"):format(number, why, line)
+end
+
+function schematic.parse(text)
+if type(text) ~= "string" then return nil, "no schematic text" end
+
+local map = {
+name = nil,
+origin = nil,
+places = {},
+byLabel = {},
+corridors = {},
+occupied = {},
+}
+
+local number = 0
+for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+number = number + 1
+local trimmed = line:gsub("#.*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+if trimmed ~= "" then
+local t = words(trimmed)
+local kind = t[1]
+
+if kind == "schematic" then
+if not t[2] then return fail(number, line, "schematic needs a name") end
+map.name = t[2]
+
+elseif kind == "origin" then
+local position = coordsAfter(t, 1)
+if not position then
+return fail(number, line, "origin needs x y z")
+end
+local facing = t[5]
+if not facing or not CARDINALS[facing] then
+return fail(number, line,
+"origin needs a cardinal facing (north/east/south/west)")
+end
+map.origin = {x = position.x, y = position.y, z = position.z,
+facing = facing}
+
+elseif kind == "bay" or kind == "node" then
+local name = t[2]
+if not name then return fail(number, line, kind .. " needs a name") end
+if map.places[name] then
+return fail(number, line, "duplicate name: " .. name)
+end
+
+local entry = {name = name, kind = kind}
+
+local i = 3
+while i <= #t do
+local field = t[i]
+
+if field == "at" or field == "stand" then
+local position = coordsAfter(t, i)
+if not position then
+return fail(number, line, field .. " needs x y z")
+end
+entry[field] = position
+i = i + 4
+
+elseif field == "approach" then
+local position = coordsAfter(t, i)
+if not position then
+return fail(number, line, "approach needs x y z")
+end
+entry.approach = position
+i = i + 4
+
+elseif field == "facing" then
+local facing = t[i + 1]
+if not facing or not CARDINALS[facing] then
+return fail(number, line,
+"facing needs a cardinal direction")
+end
+entry.approachFacing = facing
+i = i + 2
+
+elseif field == "label" then
+if not t[i + 1] then
+return fail(number, line, "label needs a value")
+end
+entry.label = t[i + 1]
+i = i + 2
+
+elseif field == "modem" then
+local side = t[i + 1]
+if not side or not STEP[side] then
+return fail(number, line,
+"modem needs a side (up/down/north/...)")
+end
+entry.modem = side
+i = i + 2
+
+elseif field == "builder" then
+entry.builder = true
+i = i + 1
+
+else
+return fail(number, line, "unknown field: " .. tostring(field))
+end
+end
+
+
+
+
+if kind == "bay" and not entry.stand then
+return fail(number, line, "a bay needs `stand x y z`")
+end
+if kind == "node" and not entry.at then
+return fail(number, line, "a node needs `at x y z`")
+end
+if entry.approach and not entry.approachFacing then
+return fail(number, line,
+"an approach needs a facing -- arriving pointed the wrong "
+.. "way cannot interact with anything (W3.4)")
+end
+
+map.places[name] = entry
+if entry.label then
+if map.byLabel[entry.label] then
+return fail(number, line,
+"duplicate label: " .. entry.label)
+end
+map.byLabel[entry.label] = name
+end
+
+
+if entry.at then
+map.occupied[key(entry.at.x, entry.at.y, entry.at.z)] = name
+end
+
+elseif kind == "corridor" then
+local from, to = t[2], t[3]
+if not (from and to) then
+return fail(number, line, "corridor needs two endpoints")
+end
+
+local i = 4
+local floor = nil
+if t[i] == "floor" then
+floor = t[i + 1]
+if not floor then
+return fail(number, line, "floor needs a block name")
+end
+i = i + 2
+end
+
+
+local cells = {}
+local rest = {}
+for j = i, #t do rest[#rest + 1] = t[j] end
+local joined = table.concat(rest, " ")
+for chunk in joined:gmatch("[^:]+") do
+local parts = words(chunk)
+local x, y, z = tonumber(parts[1]), tonumber(parts[2]),
+tonumber(parts[3])
+if not (x and y and z) then
+return fail(number, line,
+"corridor cells are `x y z : x y z`")
+end
+cells[#cells + 1] = {x = x, y = y, z = z}
+end
+if #cells == 0 then
+return fail(number, line, "a corridor needs at least one cell")
+end
+
+map.corridors[from] = map.corridors[from] or {}
+map.corridors[from][to] = {cells = cells, floor = floor}
+
+else
+return fail(number, line, "unknown record: " .. tostring(kind))
+end
+end
+end
+
+if not map.name then return nil, "no `schematic <name>` line" end
+if not map.origin then return nil, "no `origin x y z facing` line" end
+
+return map
+end
+
+function schematic.load(path)
+local text, why = require("mfg.common.state").readText(path)
+if not text then return nil, why or ("no schematic at " .. tostring(path)) end
+return schematic.parse(text)
+end
+
+
+
+function schematic.place(map, name)
+if not map then return nil end
+return map.places[name]
+end
+
+
+
+function schematic.byLabel(map, label)
+if not map or not label then return nil end
+local name = map.byLabel[label]
+if not name then return nil end
+return map.places[name], name
+end
+
+
+
+function schematic.standAt(map, name)
+local entry = schematic.place(map, name)
+if not entry then return nil, "no such place: " .. tostring(name) end
+if not entry.stand then
+return nil, ("%s is a %s -- a turtle cannot stand where a block is (W3.1)")
+:format(name, entry.kind)
+end
+return entry.stand
+end
+
+
+function schematic.approachTo(map, name)
+local entry = schematic.place(map, name)
+if not entry then return nil, "no such place: " .. tostring(name) end
+if not entry.approach then
+return nil, ("%s declares no approach"):format(name)
+end
+return entry.approach, entry.approachFacing
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function schematic.landmarkCells(map, label)
+local entry, name = schematic.byLabel(map, label)
+if not entry then return nil end
+
+local out = {}
+if entry.at then
+out[#out + 1] = {cell = entry.at, what = "block", place = name}
+end
+if entry.stand then
+out[#out + 1] = {cell = entry.stand, what = "resident", place = name}
+if entry.modem then
+local cell = schematic.step(entry.stand, entry.modem)
+if cell then
+out[#out + 1] = {cell = cell, what = "modem", place = name}
+end
+end
+end
+return out, entry, name
+end
+
+
+
+
+
+
+
+
+function schematic.navigableCells(map)
+if not map then return {} end
+if map._navigable then return map._navigable end
+
+local set = {}
+for _, entry in pairs(map.places) do
+if entry.stand then
+set[key(entry.stand.x, entry.stand.y, entry.stand.z)] = true
+end
+if entry.approach then
+set[key(entry.approach.x, entry.approach.y, entry.approach.z)] = true
+end
+end
+for _, targets in pairs(map.corridors) do
+for _, corridor in pairs(targets) do
+for _, cell in ipairs(schematic.expand(corridor.cells) or {}) do
+set[key(cell.x, cell.y, cell.z)] = true
+end
+end
+end
+
+map._navigable = set
+return set
+end
+
+function schematic.navigable(map, cell)
+if not map or not cell then return false end
+
+if schematic.isOccupied(map, cell) then return false end
+return schematic.navigableCells(map)[key(cell.x, cell.y, cell.z)] == true
+end
+
+function schematic.isOccupied(map, position)
+if not map or not position then return false end
+return map.occupied[key(position.x, position.y, position.z)] ~= nil
+end
+
+function schematic.corridor(map, from, to)
+if not map or not map.corridors[from] then return nil end
+return map.corridors[from][to]
+end
+
+
+
+
+function schematic.route(map, from, to)
+local forward = schematic.corridor(map, from, to)
+if forward then return forward.cells, forward.floor end
+
+local back = schematic.corridor(map, to, from)
+if back then
+local reversed = {}
+for i = #back.cells, 1, -1 do reversed[#reversed + 1] = back.cells[i] end
+return reversed, back.floor
+end
+return nil
+end
+
+
+
+
+function schematic.absolute(map, position)
+if not map or not map.origin or not position then return nil end
+return {
+x = map.origin.x + position.x,
+y = map.origin.y + position.y,
+z = map.origin.z + position.z,
+}
+end
+
+
+
+
+
+
+
+
+
+
+
+function schematic.expand(cells)
+if type(cells) ~= "table" or #cells == 0 then return nil, "no cells" end
+
+local out = {{x = cells[1].x, y = cells[1].y, z = cells[1].z}}
+
+for i = 2, #cells do
+local from, to = cells[i - 1], cells[i]
+local dx, dy, dz = to.x - from.x, to.y - from.y, to.z - from.z
+
+local moving = 0
+if dx ~= 0 then moving = moving + 1 end
+if dy ~= 0 then moving = moving + 1 end
+if dz ~= 0 then moving = moving + 1 end
+
+if moving > 1 then
+return nil, ("segment %d,%d,%d -> %d,%d,%d changes more than one axis; "
+.. "there is no unambiguous line between them"):format(
+from.x, from.y, from.z, to.x, to.y, to.z)
+end
+
+if moving == 1 then
+local step = {
+x = (dx > 0 and 1) or (dx < 0 and -1) or 0,
+y = (dy > 0 and 1) or (dy < 0 and -1) or 0,
+z = (dz > 0 and 1) or (dz < 0 and -1) or 0,
+}
+local cursor = {x = from.x, y = from.y, z = from.z}
+while not (cursor.x == to.x and cursor.y == to.y and cursor.z == to.z) do
+cursor = {x = cursor.x + step.x, y = cursor.y + step.y,
+z = cursor.z + step.z}
+out[#out + 1] = {x = cursor.x, y = cursor.y, z = cursor.z}
+end
+end
+end
+
+return out
+end
+
+function schematic.places(map)
+local out = {}
+for name in pairs(map and map.places or {}) do out[#out + 1] = name end
+table.sort(out)
+return out
+end
+
+return schematic

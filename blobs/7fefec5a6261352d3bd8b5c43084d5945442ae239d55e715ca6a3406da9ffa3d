@@ -1,0 +1,99 @@
+
+
+
+
+
+local dispatch = require("mfg.controller.dispatch")
+local store = require("mfg.storage")
+local config = require("mfg.common.config")
+local holds = require("mfg.controller.holds")
+
+local supervisor = {}
+
+
+
+
+
+
+
+
+
+
+
+
+function supervisor.available(source, holder)
+local stock, why = store.stock(source or config.setting("source"))
+if not stock then return nil, why end
+local claims, byJob = dispatch.claims()
+local held, byHolder = holds.effective(stock, claims)
+local own = (holder and byHolder[holder]) or {}
+local available = {}
+for item, count in pairs(stock) do
+available[item] = math.max(0, count - math.floor(claims[item] or 0)
+- (held[item] or 0) + (own[item] or 0))
+end
+return available, {stock = stock, claims = claims, byJob = byJob, held = held,
+byHolder = byHolder}
+end
+
+
+
+
+function supervisor.spoken(item, breakdown, holder)
+local text, promised = "", {}
+for _, claim in ipairs(breakdown.byJob[item] or {}) do
+promised[#promised + 1] = ("%d to job %d"):format(math.floor(claim.count),
+claim.job)
+end
+if #promised > 0 then
+text = ", " .. table.concat(promised, ", ") .. " promised"
+end
+local others = ((breakdown.held or {})[item] or 0)
+- (((holder and (breakdown.byHolder or {})[holder]) or {})[item] or 0)
+if others > 0 then text = text .. (", %d held for carts"):format(others) end
+return text
+end
+
+
+
+function supervisor.describeShort(plan, breakdown)
+local items = {}
+for item in pairs(plan.short) do items[#items + 1] = item end
+table.sort(items)
+
+local parts, short = {}, {}
+for _, item in ipairs(items) do
+local wanted = (plan.draws[item] or 0) + plan.short[item]
+local have = plan.draws[item] or 0
+short[item] = {wanted = wanted, have = have}
+
+parts[#parts + 1] = ("%s: needs %d, pool holds %d%s"):format(item, wanted,
+breakdown.stock[item] or 0, supervisor.spoken(item, breakdown))
+end
+return table.concat(parts, "; "), short
+end
+
+
+
+
+
+function supervisor.order(recipeId, quantity, opts)
+opts = opts or {}
+local available, breakdown = supervisor.available(opts.source)
+if not available then return nil, "the pool cannot be read: " .. tostring(breakdown) end
+
+local plan, why = dispatch.plan(recipeId, quantity, available)
+if not plan then return nil, why end
+
+if next(plan.short) then
+local text, short = supervisor.describeShort(plan, breakdown)
+plan.shortfall = short
+return nil, text, plan
+end
+
+local id = dispatch.commit(plan, {by = opts.by, requested = quantity,
+order = opts.order})
+return id, plan
+end
+
+return supervisor

@@ -1,0 +1,363 @@
+
+
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+function backend.slots()
+local out = {}
+for slot = 1, 16 do
+local detail = turtle.getItemDetail(slot)
+if detail then
+out[slot] = {name = detail.name, count = detail.count}
+end
+end
+return out
+end
+
+function backend.select(slot)
+return turtle.select(slot)
+end
+
+function backend.itemCount(slot)
+return turtle.getItemCount(slot)
+end
+
+function backend.transferTo(slot, count)
+return turtle.transferTo(slot, count)
+end
+
+
+
+
+
+function backend.suckInput(count)
+return turtle.suck(count)
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local feedMode, feedSide = nil, nil
+
+local function feedConfig()
+if feedMode then return feedMode, feedSide end
+local config = require("mfg.common.config")
+
+feedMode, feedSide = config.setting("feed.mode"), config.setting("feed.side")
+return feedMode, feedSide
+end
+
+function backend.feedMode()
+local mode = feedConfig()
+return mode
+end
+
+
+
+
+
+
+
+
+function backend.lockFeed(locked)
+local _, side = feedConfig()
+if not side then return true end
+redstone.setOutput(side, locked and true or false)
+return true
+end
+
+function backend.feedLocked()
+local _, side = feedConfig()
+if not side then return false end
+return redstone.getOutput(side) == true
+end
+
+function backend.hasInput()
+return peripheral.hasType("front", "inventory") == true
+end
+
+function backend.hasOutput()
+return peripheral.hasType("bottom", "inventory") == true
+end
+
+
+
+
+
+
+function backend.held()
+local totals = {}
+for _, stack in pairs(backend.slots()) do
+totals[stack.name] = (totals[stack.name] or 0) + stack.count
+end
+return totals
+end
+
+
+
+
+
+
+
+
+
+
+function backend.adjacent()
+local out = {}
+for _, side in ipairs({"front", "top", "bottom"}) do
+if peripheral.hasType(side, "inventory") == true then
+local wrapped = peripheral.wrap(side)
+local ok, listing = pcall(wrapped.list)
+if ok and listing then
+local totals = {}
+for _, stack in pairs(listing) do
+totals[stack.name] = (totals[stack.name] or 0) + stack.count
+end
+out[side] = totals
+end
+end
+end
+return out
+end
+
+
+function backend.surroundings()
+local out = {}
+for _, side in ipairs({"front", "top", "bottom", "left", "right"}) do
+local kind = peripheral.getType(side)
+out[side] = {
+peripheral = kind,
+inventory = kind and peripheral.hasType(side, "inventory") == true,
+}
+end
+local ok, block = turtle.inspect()
+out.blockInFront = ok and block.name or "nothing (air)"
+local okDown, below = turtle.inspectDown()
+out.blockBelow = okDown and below.name or "nothing (air)"
+return out
+end
+
+function backend.dropOutput(count)
+return turtle.dropDown(count)
+end
+
+
+
+
+
+
+
+
+function backend.dropInput(count)
+return turtle.drop(count)
+end
+
+
+
+
+
+
+
+function backend.craft(limit)
+if not turtle.craft then return false, "no crafting table fitted" end
+return turtle.craft(limit)
+end
+
+function backend.fuelLevel()
+return turtle.getFuelLevel()
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local UPGRADE_TYPES = {
+workbench = "minecraft:crafting_table",
+}
+
+local function inferred(side)
+local kind = peripheral.getType(side)
+if kind == nil then return nil end
+if kind == "modem" then
+
+
+local ok, wireless = pcall(peripheral.call, side, "isWireless")
+if ok and wireless then return "computercraft:wireless_modem_normal" end
+return "peripheral:modem"
+end
+return UPGRADE_TYPES[kind] or ("peripheral:" .. kind)
+end
+
+function backend.equipment()
+if turtle.getEquippedLeft and turtle.getEquippedRight then
+local left, right = turtle.getEquippedLeft(), turtle.getEquippedRight()
+return {left = left and left.name, right = right and right.name, how = "equipped"}
+end
+return {left = inferred("left"), right = inferred("right"), how = "peripheral"}
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function backend.forward()
+return turtle.forward()
+end
+
+function backend.back()
+return turtle.back()
+end
+
+function backend.up()
+return turtle.up()
+end
+
+function backend.down()
+return turtle.down()
+end
+
+function backend.turnLeft()
+return turtle.turnLeft()
+end
+
+function backend.turnRight()
+return turtle.turnRight()
+end
+
+
+
+local function looked(ok, data)
+if not ok then return nil end
+return {name = data.name, state = data.state, tags = data.tags}
+end
+
+function backend.inspect()
+return looked(turtle.inspect())
+end
+
+
+
+
+
+function backend.inspectDown()
+return looked(turtle.inspectDown())
+end
+
+function backend.inspectUp()
+return looked(turtle.inspectUp())
+end
+
+
+
+
+
+
+
+
+
+
+
+function backend.peer(side)
+local kind = peripheral.getType(side)
+if kind ~= "computer" and kind ~= "turtle" then return nil end
+
+local wrapped = peripheral.wrap(side)
+if not wrapped then return nil end
+
+local ok, label = pcall(wrapped.getLabel)
+local gotId, id = pcall(wrapped.getID)
+return {
+kind = kind,
+label = ok and label or nil,
+id = gotId and id or nil,
+side = side,
+}
+end
+
+
+
+function backend.rebootPeer(side)
+local kind = peripheral.getType(side)
+if kind ~= "computer" and kind ~= "turtle" then
+return false, ("nothing rebootable on %s"):format(tostring(side))
+end
+local wrapped = peripheral.wrap(side)
+if not wrapped then return false, "could not wrap " .. tostring(side) end
+
+local ok, err = pcall(wrapped.reboot)
+if not ok then return false, tostring(err) end
+return true
+end
+
+return backend

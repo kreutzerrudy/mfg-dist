@@ -1,0 +1,76 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local schedules = require("mfg.controller.schedules")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "schedule",
+label       = "Schedule an action",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "id", label = "Name", type = "text", required = true,
+maxLength = 24, pattern = "^[%w_%-]+$",
+help = "Names the schedule. An existing name is replaced."},
+
+{name = "action", label = "Action", type = "text", required = true,
+help = "What to run -- usually make."},
+
+{name = "params", label = "Parameters", type = "table", required = false,
+help = "The action's parameters, checked against its declaration now."},
+
+{name = "every", label = "Every (minutes)", type = "number", integer = true,
+min = 1, max = 10080, required = true},
+
+{name = "enabled", label = "Enabled", type = "flag", required = false},
+},
+
+returns = {entry = "table"},
+
+run = function(params, ctx)
+local decl = actions.get(params.action)
+local offered = false
+for _, entry in ipairs(actions.list()) do
+if entry.name == params.action then offered = true end
+end
+if not decl or not offered then
+return rpc.REJECTED, {reason = ("%s is not an action this controller "
+.. "offers"):format(params.action)}
+end
+if decl.tier == "orchestrated" then
+return rpc.REJECTED, {reason = ("%s does the work itself -- schedule "
+.. "what queues it (make), not what runs it"):format(params.action)}
+end
+if decl.manual then
+return rpc.REJECTED, {reason = ("%s is a manual action, and a schedule "
+.. "is not an operator"):format(params.action)}
+end
+
+local checked, why = actions.validate.check(decl, params.params or {})
+if not checked then
+return rpc.REJECTED, {reason = ("%s would be refused every time: %s")
+:format(params.action, tostring(why))}
+end
+
+local entry = schedules.put({
+id = params.id, action = params.action, params = checked,
+every = params.every, enabled = params.enabled, by = ctx.by,
+})
+return rpc.COMPLETED, {entry = entry}
+end,
+}

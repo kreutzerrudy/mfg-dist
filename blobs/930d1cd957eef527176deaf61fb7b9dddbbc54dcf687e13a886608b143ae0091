@@ -1,0 +1,74 @@
+local rpc = require("mfg.common.rpc")
+local node = require("mfg.turtle.node")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "pattern_fill",
+label       = "Arrange a pattern",
+role        = "turtle",
+tier        = "node",
+
+
+
+
+
+manual      = true,
+destructive = false,
+requires    = {state = "idle"},
+
+parameters = {
+
+
+
+
+
+
+
+
+
+{name = "pattern_id", label = "Pattern", type = "text", required = true,
+help = "Names the arrangement -- usually the recipe id. The node refuses "
+.. "if this does not match what it has cached."},
+
+{name = "pattern", label = "Slots", type = "pattern", required = false,
+help = "Slot to item. Omit to reuse the last pattern this node was sent; "
+.. "the first arrangement must carry one. Depth is how many sets the "
+.. "held material supports, and is a result rather than an input."},
+},
+
+
+
+returns = {depth = "number", moves = "number", returned = "number"},
+
+run = function(params)
+local ok, result, detail = node.patternFill(params.pattern,
+{id = params.pattern_id})
+if not ok then
+
+
+
+return rpc.REJECTED, {reason = tostring(result), detail = detail}
+end
+return rpc.COMPLETED, result
+end,
+}

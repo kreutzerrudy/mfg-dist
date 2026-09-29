@@ -1,0 +1,282 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local types = {}
+
+
+
+
+
+
+local function choiceList(param)
+local choices = param.choices
+if type(choices) ~= "table" then return nil end
+if choices.source then return nil end
+return choices
+end
+
+
+
+local function choiceValues(choices)
+local values = {}
+for _, entry in ipairs(choices) do
+if type(entry) == "table" then
+values[#values + 1] = entry.value
+else
+values[#values + 1] = entry
+end
+end
+return values
+end
+
+local function inChoices(value, choices)
+for _, allowed in ipairs(choiceValues(choices)) do
+if allowed == value then return true end
+end
+return false
+end
+
+
+
+
+local function isToken(value)
+return type(value) == "string" and value ~= "" and not value:find("%s")
+end
+
+types.number = {
+coerce = function(value)
+if type(value) == "number" then return value end
+if type(value) ~= "string" then return nil end
+return tonumber(value)
+end,
+check = function(value, param)
+if type(value) ~= "number" then return false, "not a number" end
+if value ~= value then return false, "not a number" end
+if param.integer and math.floor(value) ~= value then
+return false, "must be a whole number"
+end
+if param.min and value < param.min then
+return false, ("must be at least %s"):format(tostring(param.min))
+end
+if param.max and value > param.max then
+return false, ("must be at most %s"):format(tostring(param.max))
+end
+return true
+end,
+}
+
+types.text = {
+coerce = function(value)
+if type(value) == "string" then return value end
+return nil
+end,
+check = function(value, param)
+if type(value) ~= "string" then return false, "not text" end
+if param.maxLength and #value > param.maxLength then
+return false, ("must be at most %d characters"):format(param.maxLength)
+end
+if param.pattern and not value:find(param.pattern) then
+return false, "does not match the expected form"
+end
+return true
+end,
+}
+
+types.choice = {
+coerce = function(value)
+if type(value) == "string" or type(value) == "number" then return value end
+return nil
+end,
+check = function(value, param)
+local choices = choiceList(param)
+if not choices then
+
+
+
+return true
+end
+if not inChoices(value, choices) then
+return false, ("not one of: %s"):format(
+table.concat(choiceValues(choices), ", "))
+end
+return true
+end,
+}
+
+
+
+
+types.flag = {
+coerce = function(value)
+if type(value) == "boolean" then return value end
+if value == "true" then return true end
+if value == "false" then return false end
+return nil
+end,
+check = function(value)
+if type(value) ~= "boolean" then return false, "not true or false" end
+return true
+end,
+}
+
+types.item = {
+coerce = types.text.coerce,
+check = function(value, param)
+if not isToken(value) then return false, "not an item id" end
+local choices = choiceList(param)
+if choices and not inChoices(value, choices) then
+return false, "not an item this cluster holds"
+end
+return true
+end,
+}
+
+types.node = {
+coerce = types.text.coerce,
+check = function(value, param)
+if not isToken(value) then return false, "not a node name" end
+local choices = choiceList(param)
+if choices and not inChoices(value, choices) then
+return false, "not a node this controller knows"
+end
+return true
+end,
+}
+
+
+
+
+types.path = {
+coerce = types.text.coerce,
+check = function(value, param)
+if not isToken(value) then return false, "not a path" end
+if value:sub(1, 1) ~= "/" then return false, "a path starts with /" end
+local choices = choiceList(param)
+if choices and not inChoices(value, choices) then
+return false, "not a declared mount point"
+end
+return true
+end,
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+types.pattern = {
+coerce = function(value)
+if type(value) == "table" then return value end
+return nil
+end,
+check = function(value)
+if next(value) == nil then return false, "the pattern is empty" end
+for slot, item in pairs(value) do
+if type(slot) ~= "number" or slot < 1 or math.floor(slot) ~= slot then
+return false, ("%s is not a slot number"):format(tostring(slot))
+end
+if not isToken(item) then
+return false, ("slot %d does not name an item"):format(slot)
+end
+end
+return true
+end,
+}
+
+
+types.items = {
+coerce = function(value)
+if type(value) == "table" then return value end
+return nil
+end,
+check = function(value)
+for item, count in pairs(value) do
+if not isToken(item) then
+return false, ("%s is not an item id"):format(tostring(item))
+end
+if type(count) ~= "number" or count < 0
+or math.floor(count) ~= count then
+return false, ("%s: %s is not a count"):format(
+item, tostring(count))
+end
+end
+return true
+end,
+}
+
+
+
+
+types.ports = {
+coerce = function(value)
+if type(value) == "table" then return value end
+return nil
+end,
+check = function(value)
+for port, device in pairs(value) do
+if not isToken(port) or port:find("[/:]") then
+return false, ("%s is not a port name"):format(tostring(port))
+end
+if not isToken(device) then
+return false, ("%s: %s is not a device"):format(port, tostring(device))
+end
+end
+return true
+end,
+}
+
+
+
+
+
+
+types.table = {
+coerce = function(value)
+if type(value) == "table" then return value end
+return nil
+end,
+check = function(value)
+if type(value) ~= "table" then return false, "not a table" end
+return true
+end,
+}
+
+function types.get(name)
+return types[name]
+end
+
+function types.names()
+return {"number", "text", "choice", "flag", "item", "node", "path",
+"pattern", "items", "ports", "table"}
+end
+
+return types

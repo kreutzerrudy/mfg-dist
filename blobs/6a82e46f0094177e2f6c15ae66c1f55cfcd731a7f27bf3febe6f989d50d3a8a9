@@ -1,0 +1,321 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local mount = require("mfg.storage.mount")
+local store = require("mfg.storage")
+local hal = require("mfg.common.hal")
+
+local probe = {}
+
+
+
+
+local ROLE_BY_SIDE = {front = "input", top = "input", bottom = "output"}
+
+local DEFAULT_SETTLE = 8
+local POLL = 0.5
+
+local function countIn(counts, marker)
+if type(counts) ~= "table" then return 0 end
+return counts[marker] or 0
+end
+
+
+
+
+
+
+
+
+
+
+function probe.markerIsClear(marker, candidates, source)
+for _, path in ipairs(mount.volumes()) do
+if mount.isBound(path) and path ~= source then
+local n = store.count(path, marker)
+if n and n > 0 then
+return false, ("%s already holds %d %s"):format(path, n, marker)
+end
+end
+end
+
+local inv = hal.inventory()
+for _, device in ipairs(candidates or {}) do
+local listing = inv.list(device)
+for _, stack in pairs(listing or {}) do
+if stack.name == marker then
+return false, ("%s already holds %s"):format(device, marker)
+end
+end
+end
+return true
+end
+
+
+
+
+
+
+
+local function pushMarker(source, device, marker)
+local view = store.locate(marker)
+local from = nil
+for _, entry in ipairs(view) do
+if entry.path == source then from = entry end
+end
+if not from then
+return false, ("%s holds no %s to probe with"):format(source, marker)
+end
+
+local present = mount.devices(source)
+local inv = hal.inventory()
+
+for _, sourceDevice in ipairs(present or {}) do
+local listing = inv.list(sourceDevice)
+for slot, stack in pairs(listing or {}) do
+if stack.name == marker then
+local n, err = inv.push(sourceDevice, device, slot, 1)
+if n and n > 0 then return true end
+if err then return false, tostring(err) end
+end
+end
+end
+return false, "could not move a marker"
+end
+
+
+local function recoverFrom(device, marker, into)
+local inv = hal.inventory()
+local present = mount.devices(into)
+if not present or #present == 0 then return 0 end
+
+local listing = inv.list(device)
+local recovered = 0
+for slot, stack in pairs(listing or {}) do
+if stack.name == marker then
+for _, target in ipairs(present) do
+if recovered == 0 then
+local n = inv.push(device, target, slot, stack.count)
+if n and n > 0 then recovered = recovered + n end
+end
+end
+end
+end
+return recovered
+end
+
+
+
+
+
+
+local function await(observe, marker, settle)
+local started = os.epoch("utc")
+local deadline = started + settle * 1000
+
+repeat
+local seen, err = observe()
+if seen then
+local elapsed = (os.epoch("utc") - started) / 1000
+
+for side, counts in pairs(seen.sides or {}) do
+if countIn(counts, marker) > 0 and ROLE_BY_SIDE[side] then
+return {where = "side", side = side,
+role = ROLE_BY_SIDE[side], elapsed = elapsed}
+end
+end
+
+if countIn(seen.held, marker) > 0 then
+return {where = "held", role = "input", elapsed = elapsed,
+transit = elapsed}
+end
+elseif err then
+return nil, tostring(err)
+end
+sleep(POLL)
+until os.epoch("utc") >= deadline
+
+return nil
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function probe.identify(opts)
+opts = opts or {}
+local marker = opts.marker
+local source = opts.source
+local observe = opts.observe
+local settle = opts.settle or DEFAULT_SETTLE
+
+if not marker then return nil, "a marker item is required" end
+if not source then return nil, "a marker source volume is required" end
+if type(observe) ~= "function" then return nil, "an observe function is required" end
+
+local candidates = opts.candidates or mount.unclaimed()
+if #candidates == 0 then return nil, "no unclaimed inventories to probe" end
+
+local clear, why = probe.markerIsClear(marker, candidates, source)
+if not clear then return nil, why end
+
+local found = {input = nil, output = nil, transit = nil}
+local tried = {}
+
+for _, device in ipairs(candidates) do
+if found.input and found.output then break end
+
+local pushed, pushErr = pushMarker(source, device, marker)
+if not pushed then return nil, pushErr end
+
+local seen, obsErr = await(observe, marker, settle)
+if obsErr then
+recoverFrom(device, marker, source)
+return nil, obsErr
+end
+
+tried[#tried + 1] = device
+
+if seen and seen.where == "side" then
+
+found[seen.role] = found[seen.role] or device
+local back = recoverFrom(device, marker, source)
+if back < 1 then
+return nil, ("marker unaccounted for in %s -- refusing to bind on "
+.. "a guess (S7.14)"):format(device)
+end
+
+elseif seen and seen.where == "held" then
+
+
+
+found.input = found.input or device
+found.transit = seen.transit
+
+if type(opts.emit) ~= "function" then
+return nil, ("marker reached the node but no emit function was "
+.. "given, so it cannot be recovered -- refusing (S7.14)")
+end
+local emitted, emitErr = opts.emit(marker)
+if not emitted then
+return nil, ("node could not return the marker: %s")
+:format(tostring(emitErr))
+end
+
+
+
+
+
+local landed = probe.findMarker(marker, candidates, device)
+if not landed then
+return nil, ("the node reported emitting the marker and it was not "
+.. "found anywhere else -- refusing to bind on a guess (S7.14)")
+end
+found.output = found.output or landed
+local back = recoverFrom(landed, marker, source)
+if back < 1 then
+return nil, ("marker unaccounted for in %s (S7.14)"):format(landed)
+end
+
+else
+
+local back = recoverFrom(device, marker, source)
+if back < 1 then
+return nil, ("marker left %s unaccounted for (S7.14)"):format(device)
+end
+end
+end
+
+found.tried = tried
+if not found.input and not found.output then
+return nil, "probed every candidate and the node saw nothing"
+end
+return found
+end
+
+
+
+
+
+
+function probe.findMarker(marker, candidates, except)
+local inv = hal.inventory()
+for _, device in ipairs(candidates or {}) do
+if device ~= except then
+local listing = inv.list(device)
+for _, stack in pairs(listing or {}) do
+if stack.name == marker then return device end
+end
+end
+end
+return nil
+end
+
+
+
+
+
+
+function probe.bind(nodeId, opts)
+opts = opts or {}
+local inPath = ("/%s/in"):format(nodeId)
+local outPath = ("/%s/out"):format(nodeId)
+
+for _, path in ipairs({inPath, outPath}) do
+if not mount.get(path) then
+return nil, ("%s is not declared -- register the node first"):format(path)
+end
+end
+
+local found, err = probe.identify(opts)
+if not found then return nil, err end
+
+local bound = {}
+if found.input then
+local ok, bindErr = mount.bind(inPath, {found.input},
+{node = nodeId, role = "input", by = "probe"})
+if not ok then return nil, bindErr end
+bound[inPath] = found.input
+end
+if found.output then
+local ok, bindErr = mount.bind(outPath, {found.output},
+{node = nodeId, role = "output", by = "probe"})
+if not ok then return nil, bindErr end
+bound[outPath] = found.output
+end
+
+return {bound = bound, transit = found.transit, tried = found.tried,
+unbound = (not found.input and inPath) or (not found.output and outPath)}
+end
+
+return probe

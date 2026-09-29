@@ -1,0 +1,238 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local store = require("mfg.storage")
+local cli = require("mfg.storage.cli")
+local ledger = require("mfg.station.ledger")
+local broker = require("mfg.station.broker")
+local rpc = require("mfg.common.rpc")
+
+local args = {...}
+local cmd = args[1]
+
+
+
+local link = {
+request = function(node, body)
+return rpc.request(node, "mfg-order", body, {timeout = 4, attempts = 2})
+end,
+}
+
+local function usage()
+print("stationctl nodes | orders | show <id> | check <id>")
+print("stationctl order <node> <product> <qty> [item=count ...]")
+print("stationctl supply <id> | collect <id> | withdraw <id>")
+print("stationctl bind <path> <device...> | bindings | store <path>")
+print("stationctl step                one turn of the loop")
+end
+
+local lines = cli.lines
+
+if cmd == nil or cmd == "help" then
+usage()
+
+elseif cmd == "nodes" then
+
+
+local names = {}
+for i = 2, #args do names[#names + 1] = args[i] end
+if #names == 0 then
+
+local seen = {}
+for _, record in pairs(ledger.all()) do seen[record.node] = true end
+for node in pairs(seen) do names[#names + 1] = node end
+if #names == 0 then
+print("no nodes known -- try: stationctl nodes mfg")
+return
+end
+end
+
+for _, node in ipairs(names) do
+local answer = link.request(node, {command = "hello"})
+if answer and answer.status == "completed" then
+print(("%-10s %s  %d order(s) open"):format(node,
+tostring(answer.kind), answer.ordersOpen or 0))
+print(("           inbound %s  outbound %s"):format(
+tostring(answer.inbound), tostring(answer.outbound)))
+if answer.products then
+print("           makes: " .. table.concat(answer.products, ", "))
+end
+print(("           we address these as %s and %s"):format(
+broker.inboundOf(node), broker.outboundOf(node)))
+else
+printError(("%-10s UNREACHABLE (%s)"):format(node,
+tostring(answer and answer.reason or "no reply")))
+end
+end
+
+elseif cmd == "bind" then
+cli.bind("stationctl", args)
+
+elseif cmd == "bindings" then
+cli.bindings()
+
+elseif cmd == "store" then
+cli.store("stationctl", args[2])
+
+elseif cmd == "order" then
+local node, product, qty = args[2], args[3], tonumber(args[4] or "1")
+if not (node and product) then
+printError("usage: stationctl order <node> <product> <qty> [item=count ...]")
+print("items listed are what THIS station supplies for the job")
+return
+end
+
+local supplied = {}
+for i = 5, #args do
+local item, count = args[i]:match("^(.+)=(%d+)$")
+if item then supplied[item] = tonumber(count) end
+end
+
+
+
+local short = {}
+for item, count in pairs(supplied) do
+local held = store.count(broker.POOL, item) or 0
+if held < count then short[item] = {promised = count, held = held} end
+end
+if next(short) then
+printError("this station does not hold what the order promises:")
+for item, detail in pairs(short) do
+printError(("  %s: promising %d, holding %d"):format(item,
+detail.promised, detail.held))
+end
+return
+end
+
+local record, err = broker.place(link, {
+node = node, product = product, quantity = qty, supplied = supplied,
+})
+if not record then printError(tostring(err)) return end
+
+print(("%s placed with %s: %d %s"):format(record.id, node, qty, product))
+lines("we supply", record.promised)
+if next(record.promised) then
+print("  the loop will push it across and tell them it arrived")
+else
+print("  supplying nothing -- they build it from their own stock")
+end
+
+elseif cmd == "orders" then
+local all = ledger.all()
+local any = false
+for id, record in pairs(all) do
+any = true
+local supply = ledger.outstandingSupply(record)
+local product = ledger.outstandingProduct(record)
+print(("%-8s %-11s %-10s %d %s"):format(id, record.state,
+record.node, record.quantity or 0, tostring(record.product)))
+if next(supply) then
+local parts = {}
+for item, count in pairs(supply) do
+parts[#parts + 1] = ("%d %s"):format(count, item)
+end
+print("         still to supply: " .. table.concat(parts, ", "))
+end
+if next(product) then
+local parts = {}
+for item, count in pairs(product) do
+parts[#parts + 1] = ("%d %s"):format(count, item)
+end
+print("         still owed us:   " .. table.concat(parts, ", "))
+end
+end
+if not any then print("no orders") end
+
+elseif cmd == "show" then
+local record = ledger.get(args[2] or "")
+if not record then printError("no such order: " .. tostring(args[2])) return end
+print(("%s  %s  with %s"):format(record.id, record.state, record.node))
+lines("we promised", record.promised)
+lines("we pushed", record.pushed)
+lines("they owe us", record.owed)
+lines("we collected", record.collected)
+if record.history then
+print("  history")
+for _, entry in ipairs(record.history) do
+print(("    %-11s %s"):format(entry.state, tostring(entry.why)))
+end
+end
+
+elseif cmd == "check" then
+local id = args[2]
+if not id then printError("usage: stationctl check <id>") return end
+local statement, reconciliation = broker.check(link, id)
+if not statement then printError(tostring(reconciliation)) return end
+
+print(("their state: %s    ours: %s"):format(tostring(reconciliation.theirState),
+tostring(reconciliation.ourState)))
+lines("they received", statement.received)
+lines("they delivered", statement.delivered)
+lines("off manifest (held, unspendable)", statement.offManifest)
+
+if reconciliation.agrees then
+print("  the two ledgers AGREE")
+else
+
+
+printError("  the two ledgers DISAGREE:")
+for _, finding in ipairs(reconciliation.findings) do
+printError(("    %s %s: we say %d, they say %d"):format(
+finding.what, finding.item, finding.ours, finding.theirs))
+end
+end
+
+elseif cmd == "supply" then
+local result, err = broker.supply(link, args[2] or "")
+if not result then printError(tostring(err)) return end
+lines("pushed", result.sent)
+if result.short then lines("still short", result.short) end
+print(result.complete and "  supplied in full" or "  part supplied")
+
+elseif cmd == "collect" then
+local result, err = broker.collect(link, args[2] or "")
+if not result then printError(tostring(err)) return end
+lines("collected", result.got)
+if result.closed then
+print("  settled -- the order is closed")
+elseif result.reason then
+printError("  not settled: " .. tostring(result.reason))
+elseif result.outstanding then
+lines("still owed us", result.outstanding)
+end
+
+elseif cmd == "withdraw" then
+local result, err = broker.withdraw(link, args[2] or "", args[3])
+if not result then printError(tostring(err)) return end
+print("withdrawn")
+lines("they are returning", result.returned)
+print("  the loop will collect it from their outbound point")
+
+elseif cmd == "step" then
+local acted = broker.step(link)
+if #acted == 0 then print("nothing to do") return end
+for _, entry in ipairs(acted) do
+print(("%-8s %s"):format(entry.order, entry.did))
+end
+
+else
+printError("unknown command: " .. tostring(cmd))
+usage()
+end

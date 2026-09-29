@@ -1,0 +1,679 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local actions = require("mfg.common.actions")
+local journal = require("mfg.common.actions.journal")
+local rpc = require("mfg.common.rpc")
+local check = require("mfg.common.script.check")
+local format = require("mfg.common.script.format")
+local interp = require("mfg.common.script.interp")
+local store = require("mfg.storage")
+local mount = require("mfg.storage.mount")
+local signals = require("mfg.controller.signals")
+local machines = require("mfg.controller.machines")
+local alarms = require("mfg.controller.alarms")
+
+local scripts = {}
+
+local STORE = "scripts"
+
+scripts.POLL = 1
+scripts.RING = 16
+scripts.FAULTS = 3
+
+scripts.STOPPED = "stopped"
+scripts.RUNNING = "running"
+scripts.FAULTED = "faulted"
+scripts.PAUSED = "paused"
+
+
+
+
+
+local function migrate(value, from)
+if from ~= 1 then error("no migration from schema " .. tostring(from), 0) end
+local out = {scripts = {}, machines = {}}
+for id, old in pairs(value.scripts or {}) do
+out.scripts[id] = {name = id, ast = old.ast, source = old.source, rev = old.rev,
+ports = old.ports, footprint = old.footprint, registered = old.registered}
+out.machines[id] = {name = id, script = id, enabled = old.enabled,
+state = old.state, faults = old.faults, lastError = old.lastError,
+handlers = old.handlers or {}, runs = old.runs or {}, created = old.registered}
+end
+return out
+end
+
+local OPTS = {schema = 2, migrate = migrate}
+
+local function load()
+local data, why = state.read(STORE, {scripts = {}, machines = {}}, OPTS)
+if why then error("the script store is unreadable: " .. why, 0) end
+if type(data) ~= "table" then data = {} end
+data.scripts = type(data.scripts) == "table" and data.scripts or {}
+data.machines = type(data.machines) == "table" and data.machines or {}
+return data
+end
+
+local function save(data)
+return state.write(STORE, data, OPTS)
+end
+
+
+
+local function update(name, fn)
+local data = load()
+local record = data.machines[name]
+if not record then return nil end
+if fn(record) ~= false then save(data) end
+return record
+end
+
+local function sortedValues(map, key)
+local out = {}
+for _, record in pairs(map) do out[#out + 1] = record end
+table.sort(out, function(a, b) return a[key] < b[key] end)
+return out
+end
+
+
+function scripts.get(name)
+return load().scripts[name]
+end
+
+
+function scripts.all()
+return sortedValues(load().scripts, "name")
+end
+
+
+function scripts.machine(name)
+return load().machines[name]
+end
+
+
+function scripts.machines(script)
+local out = {}
+for _, record in ipairs(sortedValues(load().machines, "name")) do
+if not script or record.script == script then out[#out + 1] = record end
+end
+return out
+end
+
+function scripts.clear()
+state.clear(STORE)
+end
+
+
+
+
+
+function scripts.env()
+local decls = {}
+for _, action in pairs(check.VERBS) do decls[action] = actions.get(action) end
+local items = nil
+local ok, stock = pcall(store.stock, require("mfg.common.config").setting("source"))
+if ok and type(stock) == "table" then
+items = {}
+for item in pairs(stock) do items[item] = true end
+end
+return {decls = decls, items = items}
+end
+
+
+
+function scripts.check(source)
+local report = check.source(source, scripts.env())
+if report.tree and report.ok then report.text = format.format(report.tree) end
+return report
+end
+
+
+
+
+
+local function refit(machine, script)
+local ok, why = machines.declare(machine.name, script.ports, script.name)
+if not ok then return nil, why end
+if machine.device then
+local bound, attachWhy = machines.attach(machine.name, machine.device, script.ports,
+machine.chests)
+if not bound then return nil, attachWhy end
+end
+return true
+end
+
+
+
+
+
+function scripts.register(source, by)
+local report = scripts.check(source)
+if not report.ok then return nil, report end
+local tree = report.tree
+local name = tree.machine
+
+local data = load()
+local previous = data.scripts[name]
+data.scripts[name] = {
+name = name,
+ast = tree,
+source = source,
+rev = (previous and previous.rev or 0) + 1,
+ports = report.ports,
+footprint = report.footprint,
+registered = {at = os.epoch("utc"), by = by},
+}
+save(data)
+
+local problems = {}
+for _, machine in ipairs(scripts.machines(name)) do
+local ok, why = refit(machine, data.scripts[name])
+if not ok then problems[machine.name] = why end
+end
+return data.scripts[name], report, problems
+end
+
+
+function scripts.forgetScript(name)
+local data = load()
+if not data.scripts[name] then return nil, "no script called " .. tostring(name) end
+local users = scripts.machines(name)
+if #users > 0 then
+local names = {}
+for _, m in ipairs(users) do names[#names + 1] = m.name end
+return nil, ("%s is still used by %s -- forget those machines first")
+:format(name, table.concat(names, ", "))
+end
+data.scripts[name] = nil
+save(data)
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function scripts.addMachine(name, scriptName, device, by, chests)
+if type(name) ~= "string" or not name:match("^[a-z0-9_%-]+$") then
+return nil, ("a machine's name is one lowercase path segment, like f1, not %s")
+:format(tostring(name))
+end
+local script = scripts.get(scriptName)
+if not script then return nil, "no script called " .. tostring(scriptName) end
+local existing = scripts.machine(name)
+if existing and existing.script ~= scriptName then
+return nil, ("%s is already made from %s -- forget it first"):format(name,
+existing.script)
+end
+if not existing then
+for _, path in ipairs(mount.list("/" .. name)) do
+local record = mount.get(path)
+if not record or record.machine ~= name then
+return nil, ("/%s is already in use by %s"):format(name, path)
+end
+end
+end
+
+chests = chests or {}
+local inventory = device or (existing and existing.device)
+local ok, why = machines.checkChests(name, chests, script.ports, inventory)
+if not ok then return nil, why end
+
+
+local allChests = {}
+for port, chest in pairs(existing and existing.chests or {}) do allChests[port] = chest end
+for port, chest in pairs(chests) do allChests[port] = chest end
+
+ok, why = machines.declare(name, script.ports, scriptName)
+if not ok then return nil, why end
+local bound = {}
+local function undo(reason)
+if not existing then machines.forget(name) end
+return nil, reason
+end
+if device then
+local attached, attachWhy = machines.attach(name, device, script.ports, allChests)
+if not attached then return undo(attachWhy) end
+bound = attached
+end
+local chestPaths, chestWhy = machines.bindChests(name, chests)
+if not chestPaths then return undo(chestWhy) end
+for _, path in ipairs(chestPaths) do bound[#bound + 1] = path end
+
+local data = load()
+local record = data.machines[name] or {
+name = name, script = scriptName, enabled = false, state = scripts.STOPPED,
+faults = 0, handlers = {}, runs = {}, created = {at = os.epoch("utc"), by = by},
+}
+record.device = device or record.device
+record.chests = next(allChests) and allChests or nil
+data.machines[name] = record
+save(data)
+
+local unbound = {}
+for _, port in ipairs(machines.unbound(name)) do unbound[#unbound + 1] = port.path end
+return record, {bound = bound, unbound = unbound}
+end
+
+
+
+function scripts.setLimit(name, item, at, resume)
+if item and (not at or at < 1) then return nil, "a limit needs a level of at least 1" end
+if item and resume and resume > at then
+return nil, ("resume (%d) must be at most the limit (%d)"):format(resume, at)
+end
+local record = update(name, function(record)
+record.limit = item and {item = item, at = at, resume = resume or at} or nil
+end)
+if not record then return nil, "no machine called " .. tostring(name) end
+return record
+end
+
+
+
+
+function scripts.overLimit(machine, paused)
+local limit = machine.limit
+if not limit then return false end
+local pool = require("mfg.common.config").setting("source")
+local stock = store.stock(pool)
+if not stock then return false end
+local held = stock[limit.item] or 0
+if paused then
+if held >= limit.resume then
+return true, ("%s %d, resumes below %d"):format(limit.item, held, limit.resume)
+end
+return false
+end
+if held >= limit.at then
+return true, ("%s %d >= %d"):format(limit.item, held, limit.at)
+end
+return false
+end
+
+function scripts.enable(name)
+return update(name, function(record)
+record.enabled = true
+record.faults = 0
+if record.state == scripts.FAULTED then record.state = scripts.STOPPED end
+end)
+end
+
+function scripts.disable(name)
+return update(name, function(record) record.enabled = false end)
+end
+
+
+
+function scripts.forgetMachine(name)
+local data = load()
+if not data.machines[name] then return nil, "no machine called " .. tostring(name) end
+data.machines[name] = nil
+save(data)
+signals.releaseAll("machine:" .. name)
+alarms.clear("machine." .. name)
+alarms.clear("machine." .. name .. ".fault")
+return machines.forget(name)
+end
+
+
+
+local function handlerName(node)
+if node.kind == "every" then return "every " .. node.every.n .. node.every.unit end
+if node.kind == "when" then return "when " .. format.expr(node.cond) end
+return "on " .. tostring(node.event)
+end
+
+
+function scripts.record(name, h, result, steps)
+local now = os.epoch("utc")
+local faulted = result.status == interp.FAULTED
+local reason = result.reason
+if faulted and result.line then reason = ("line %d: %s"):format(result.line, reason) end
+local did = steps and #steps > 0
+
+local record = update(name, function(record)
+if not faulted and not did and (record.faults or 0) == 0 then return false end
+local last = {at = now, handler = handlerName(h.node), status = result.status,
+reason = reason, steps = did and steps or nil}
+record.handlers = record.handlers or {}
+record.handlers[h.index] = {at = now, status = result.status, reason = reason}
+if did or faulted then
+record.runs = record.runs or {}
+table.insert(record.runs, 1, last)
+while #record.runs > scripts.RING do table.remove(record.runs) end
+end
+if faulted then
+record.faults = (record.faults or 0) + 1
+record.lastError = reason
+if record.faults >= scripts.FAULTS then
+record.enabled = false
+record.state = scripts.FAULTED
+end
+else
+record.faults = 0
+end
+end)
+
+if faulted then
+
+journal.record({action = "machine:" .. name,
+params = {handler = handlerName(h.node)}, status = rpc.REJECTED,
+reason = reason, by = "scripts", at = now, steps = did and steps or nil})
+alarms.raise("machine." .. name .. ".fault", ("%s faulted: %s"):format(name,
+tostring(reason)), {source = "/" .. name})
+elseif record and (record.faults or 0) == 0 then
+alarms.clear("machine." .. name .. ".fault")
+end
+return record
+end
+
+
+
+
+function scripts.host(name, opts)
+opts = opts or {}
+local holder = "machine:" .. name
+local host = {steps = {}, finishing = false}
+
+function host.now() return (opts.now or os.epoch)("utc") end
+
+function host.sleep(seconds)
+if opts.sleep then return opts.sleep(seconds) end
+
+
+local timer = os.startTimer(math.max(0.05, seconds))
+while true do
+local event, arg = os.pullEvent()
+if event == "timer" and arg == timer then return end
+if event == "redstone" then
+os.cancelTimer(timer)
+return
+end
+end
+end
+
+function host.stopping()
+if host.finishing then return false end
+local record = scripts.machine(name)
+return not record or not record.enabled
+end
+
+function host.read(path, kind)
+local level, on = signals.read(path)
+if level == nil then return nil, on end
+if kind == "flag" then return on end
+return level
+end
+
+function host.count(path, item)
+return store.count(path, item)
+end
+
+function host.free(item)
+local pool = require("mfg.common.config").setting("source")
+local available, why = require("mfg.controller.supervisor").available(pool)
+if not available then return nil, why end
+return available[item] or 0
+end
+
+function host.invoke(action, params)
+return actions.invoke(action, params,
+{by = holder, policy = holder, steps = host.steps})
+end
+
+function host.alarm(text)
+alarms.raise("machine." .. name, text, {source = "/" .. name, severity = "hold"})
+end
+
+function host.clearAlarm()
+alarms.clear("machine." .. name)
+end
+
+return host
+end
+
+
+
+
+local function claimOutputs(name, script)
+local holder = "machine:" .. name
+for _, port in ipairs(script.ports or {}) do
+if port.kind ~= "volume" and port.direction == "output" then
+local path = "/" .. name .. "/" .. port.name
+local ok, held = signals.claim(path, holder)
+if not ok then
+return nil, ("%s is held by %s -- release it first"):format(path, held)
+end
+end
+end
+return true
+end
+
+local function stopWith(name, fields)
+signals.releaseAll("machine:" .. name)
+update(name, function(record)
+for key, value in pairs(fields) do record[key] = value end
+end)
+end
+
+
+local function runOne(name, script, run, host, h)
+host.steps = {}
+local result = run:runHandler(h)
+if result.status == interp.ABORTED then return true end
+local record = scripts.record(name, h, result, host.steps)
+if result.status == interp.FAULTED then
+
+signals.releaseAll("machine:" .. name)
+if not record or not record.enabled then return false end
+local ok, why = claimOutputs(name, script)
+if not ok then
+stopWith(name, {enabled = false, state = scripts.FAULTED, lastError = why})
+return false
+end
+end
+return true
+end
+
+
+
+function scripts.main(name, opts)
+local machine = scripts.machine(name)
+if not machine or not machine.enabled then return end
+local script = scripts.get(machine.script)
+if not script then
+stopWith(name, {enabled = false, state = scripts.FAULTED,
+lastError = "its script " .. tostring(machine.script) .. " is gone"})
+return
+end
+
+
+local report = check.check(script.ast, scripts.env())
+if not report.ok then
+local first = report.errors[1]
+stopWith(name, {enabled = false, state = scripts.FAULTED,
+lastError = ("no longer checks: line %s: %s"):format(tostring(first.line),
+first.message)})
+return
+end
+local owned, why = claimOutputs(name, script)
+if not owned then
+stopWith(name, {enabled = false, state = scripts.FAULTED, lastError = why})
+return
+end
+
+local host = scripts.host(name, opts)
+local run = interp.new(script.ast, host, name)
+local rev = script.rev
+run:start(host.now())
+
+
+local paused, why = scripts.overLimit(machine, false)
+if paused then
+update(name, function(r) r.state = scripts.PAUSED; r.pausedBy = why end)
+else
+update(name, function(r) r.state = scripts.RUNNING; r.pausedBy = nil end)
+local begin = run:on("start")
+if begin and not runOne(name, script, run, host, begin) then return end
+end
+
+while true do
+machine = scripts.machine(name)
+if not machine or not machine.enabled then
+
+
+
+local finish = run:on("stop")
+if finish and machine and machine.state ~= scripts.FAULTED and not paused then
+host.finishing = true
+runOne(name, script, run, host, finish)
+end
+if machine then
+stopWith(name, {state = machine.state == scripts.FAULTED
+and scripts.FAULTED or scripts.STOPPED, pausedBy = false})
+else
+signals.releaseAll("machine:" .. name)
+end
+return
+end
+
+
+
+local over, overWhy = scripts.overLimit(machine, paused)
+if over and not paused then
+paused = true
+local finish = run:on("stop")
+if finish then runOne(name, script, run, host, finish) end
+signals.releaseAll("machine:" .. name)
+claimOutputs(name, script)
+update(name, function(r) r.state = scripts.PAUSED; r.pausedBy = overWhy end)
+elseif not over and paused then
+paused = false
+update(name, function(r) r.state = scripts.RUNNING; r.pausedBy = nil end)
+run:start(host.now())
+local begin = run:on("start")
+if begin and not runOne(name, script, run, host, begin) then return end
+end
+
+
+local latest = scripts.get(machine.script)
+if latest and latest.rev ~= rev then
+local ok, claimWhy = claimOutputs(name, latest)
+if not ok then
+stopWith(name, {enabled = false, state = scripts.FAULTED,
+lastError = claimWhy})
+return
+end
+script = latest
+run = interp.new(script.ast, host, name)
+rev = script.rev
+run:start(host.now())
+end
+
+for _, met in ipairs(paused and {} or run:watch()) do
+local keep = scripts.record(name, met.handler,
+{status = interp.FAULTED, reason = met.reason}, {})
+signals.releaseAll("machine:" .. name)
+if not keep or not keep.enabled then return end
+claimOutputs(name, script)
+end
+
+local h = not paused and run:due(host.now())
+if paused then
+run:skip(host.now())
+host.sleep(interp.POLL)
+elseif h then
+if not runOne(name, script, run, host, h) then return end
+else
+local wake = run:nextAt()
+local wait = interp.POLL
+if wake then wait = math.min(wait, (wake - host.now()) / 1000) end
+host.sleep(math.max(0.05, wait))
+end
+end
+end
+
+
+
+
+local function reconcile(live, opts)
+for _, record in ipairs(scripts.machines()) do
+if record.enabled and not live[record.name] then
+local name = record.name
+local co = coroutine.create(function()
+local ok, err = pcall(scripts.main, name, opts)
+if not ok then
+printError(("machine %s: %s"):format(name, tostring(err)))
+stopWith(name, {enabled = false, state = scripts.FAULTED,
+lastError = tostring(err)})
+end
+end)
+local entry = {co = co}
+live[name] = entry
+local ok, filter = coroutine.resume(co)
+if not ok or coroutine.status(co) == "dead" then
+live[name] = nil
+else
+entry.filter = filter
+end
+end
+end
+end
+
+
+
+function scripts.run(opts)
+signals.boot()
+local live = {}
+local tick = os.startTimer(0)
+while true do
+local event = table.pack(os.pullEventRaw())
+if event[1] == "timer" and event[2] == tick then
+local ok, err = pcall(reconcile, live, opts)
+if not ok then printError("scripts: " .. tostring(err)) end
+tick = os.startTimer(scripts.POLL)
+end
+for name, entry in pairs(live) do
+if entry.filter == nil or entry.filter == event[1]
+or event[1] == "terminate" then
+local ok, filter = coroutine.resume(entry.co, table.unpack(event, 1, event.n))
+if not ok then printError(("machine %s: %s"):format(name, tostring(filter))) end
+if not ok or coroutine.status(entry.co) == "dead" then
+live[name] = nil
+else
+entry.filter = filter
+end
+end
+end
+end
+end
+
+return scripts

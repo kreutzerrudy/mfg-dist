@@ -1,0 +1,470 @@
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+
+local app = {}
+
+app.COMPLETED = "completed"
+app.REJECTED = "rejected"
+app.TIMED_OUT = "timed_out"
+
+
+app.STEPS = {1, 8, 64}
+local KEYS = {[1] = {"-", "+"}, [8] = {"[", "]"}}
+
+function app.clock(view)
+if view.now then return view.now() end
+return os.epoch("utc")
+end
+
+function app.shortName(item)
+if type(item) ~= "string" then return "" end
+return item:match("[^:]+$") or item
+end
+
+function app.parameter(view, name)
+if not view.offer then return nil end
+for _, param in ipairs(view.offer.parameters or {}) do
+if param.name == name then return param end
+end
+return nil
+end
+
+
+function app.ask(view, job)
+for _, queued in ipairs(view.queue) do
+if queued.kind == job.kind then return false end
+end
+view.queue[#view.queue + 1] = job
+return true
+end
+
+
+function app.noteLink(view, answer)
+local now = app.clock(view)
+if answer.src then
+view.link = {state = "ok", at = now}
+elseif answer.status == app.TIMED_OUT or answer.status == app.REJECTED then
+view.link = {state = "down", reason = answer.reason, at = now}
+end
+end
+
+
+
+function app.header(view, title, control)
+local link = view.link or {}
+local text, colour = view.host .. " ...", "dim"
+if link.state == "ok" then
+text, colour = view.host .. " ok", "good"
+elseif link.state == "down" then
+text, colour = ("%s down: %s"):format(view.host, tostring(link.reason)), "bad"
+end
+
+
+local children = {
+doc.text(" " .. title, {colour = "title", keep = doc.REQUIRED, name = "title"}),
+doc.spacer({min = 1}),
+}
+if control then
+children[#children + 1] = control
+children[#children + 1] = doc.gap(1)
+end
+children[#children + 1] = doc.text(text .. " ", {colour = colour,
+keep = doc.REQUIRED, truncate = doc.TRUNCATED, name = "link"})
+return doc.row(children, {keep = doc.REQUIRED, name = "header", bg = "bar"})
+end
+
+
+
+
+function app.sound(view, name)
+local display = view and view.display
+if display and display.sound then pcall(display.sound, name) end
+end
+
+
+
+
+
+local CHIPS = {
+{"netherite", "black"}, {"redstone", "red"}, {"lapis", "blue"},
+{"diamond", "lightBlue"}, {"emerald", "magenta"}, {"amethyst", "cyan"},
+{"gold", "yellow"}, {"copper", "orange"}, {"iron", "white"},
+{"coal", "black"}, {"obsidian", "black"}, {"quartz", "white"},
+{"log", "brown"}, {"planks", "brown"}, {"wood", "brown"}, {"stick", "brown"},
+{"stone", "gray"}, {"cobble", "gray"}, {"gravel", "gray"}, {"deepslate", "black"},
+{"sand", "yellow"}, {"dirt", "brown"}, {"leaves", "lime"}, {"sapling", "lime"},
+{"slime", "magenta"}, {"wool", "white"}, {"glass", "purple"},
+}
+
+local MOD_CHIPS = {"cyan", "orange", "magenta", "yellow", "lime", "pink", "brown", "blue"}
+
+function app.chipFor(item)
+local id = tostring(item or ""):lower()
+local name = id:match(":(.+)$") or id
+for _, rule in ipairs(CHIPS) do
+if name:find(rule[1], 1, true) then return rule[2] end
+end
+local mod = id:match("^([^:]+):") or ""
+if mod == "minecraft" or mod == "" then return "gray" end
+local sum = 0
+for i = 1, #mod do sum = sum + mod:byte(i) end
+return MOD_CHIPS[sum % #MOD_CHIPS + 1]
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function app.newList()
+return {from = 1, shown = 0, listed = 0, query = ""}
+end
+
+
+
+local function fold(text)
+return (tostring(text or ""):lower():gsub("[_ ]", " "))
+end
+
+
+
+
+
+
+
+
+
+
+
+function app.matches(query, entry)
+if not query or query == "" then return true end
+local q = fold(query)
+if not entry.folded then
+local id = tostring(entry.value or "")
+entry.folded = {whole = fold(id), own = fold(id:match(":(.+)$") or id),
+label = fold(entry.label)}
+end
+local f = entry.folded
+local id = q:find(":", 1, true) and f.whole or f.own
+return id:find(q, 1, true) ~= nil or f.label:find(q, 1, true) ~= nil
+end
+
+
+local function requery(list, query)
+list.query = query
+list.from, list.shown = 1, 0
+end
+
+
+local function lastFrom(list)
+return math.max(1, (list.total or 0) - math.max(list.shown or 0, 1) + 1)
+end
+
+
+function app.scroll(list, n)
+local was = list.from
+list.from = math.max(1, math.min(list.from + n, lastFrom(list)))
+return list.from ~= was
+end
+
+local function searchRow(list, matched, total, prefix, keep)
+
+
+local focus = {kind = "focus", field = "search"}
+local children
+if list.query == "" then
+children = {doc.text(" type to search", {colour = "dim", width = "fill",
+truncate = doc.TRUNCATED, name = prefix .. "-query", bg = "field",
+action = focus})}
+else
+children = {
+doc.text((" find: %s_"):format(list.query), {colour = "title",
+width = "fill", truncate = doc.TRUNCATED, name = prefix .. "-query",
+bg = "field", action = focus}),
+doc.gap(1),
+doc.text(("%d of %d"):format(matched, total), {colour = "dim", keep = 2,
+name = prefix .. "-count"}),
+doc.gap(1),
+doc.button("clear", {key = "delete", keyLabel = "del", colour = "bad",
+action = {kind = "clear-search"}, keep = 3,
+name = prefix .. "-clear"}),
+}
+end
+return doc.row(children, {keep = keep, name = prefix .. "-search"})
+end
+
+
+
+
+local function thumb(from, shown, total)
+local length = math.max(1, math.floor(shown * shown / total + 0.5))
+local room = shown - length
+local span = math.max(1, total - shown)
+return 1 + math.floor((from - 1) / span * room + 0.5), length
+end
+
+
+
+
+
+
+
+
+
+
+
+function app.listRows(list, entries, prefix, action, opts)
+opts = opts or {}
+local matched = {}
+for _, entry in ipairs(entries) do
+if app.matches(list.query, entry) then matched[#matched + 1] = entry end
+end
+local last = #matched
+list.total = last
+list.matched, list.action, list.arrows = matched, action, opts.arrows
+list.from = math.max(1, math.min(list.from, lastFrom(list)))
+
+
+if list.follow then
+if list.follow < list.from then
+list.from = list.follow
+elseif list.shown > 0 and list.follow > list.from + list.shown - 1 then
+list.from = list.follow - list.shown + 1
+end
+list.follow = nil
+end
+
+list.top = matched[list.from] and action(matched[list.from]) or nil
+if #entries == 0 then
+list.listed = 0
+return {}
+end
+
+
+
+local rows = {searchRow(list, last, #entries, prefix, 22 + #entries)}
+if last == 0 then
+rows[#rows + 1] = doc.text(("nothing matches \"%s\""):format(list.query),
+{colour = "warn", wrap = true, keep = 20, name = prefix .. "-none"})
+end
+
+
+
+local shown = list.shown or 0
+local bar = shown > 0 and last > shown
+local thumbAt, thumbLength = 0, 0
+if bar then thumbAt, thumbLength = thumb(list.from, shown, last) end
+
+
+
+
+
+
+local upto = last
+if opts.limit then upto = math.min(last, list.from + opts.limit - 1) end
+list.listed = math.max(0, upto - list.from + 1)
+local position = 0
+for index = list.from, upto do
+position = position + 1
+local entry = matched[index]
+
+
+local children = {}
+if entry.chip then
+children[#children + 1] = doc.text("  ", {bg = entry.chip,
+name = prefix .. "-chip:" .. index})
+end
+children[#children + 1] = doc.button(entry.label, {
+width = "fill", align = "left",
+colour = entry.selected and "selected" or "action",
+action = action(entry),
+key = (opts.pickKeys ~= false and position <= 9) and tostring(position) or nil,
+name = prefix .. ":" .. index,
+style = "row", alt = position % 2 == 0,
+})
+if entry.note then
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = doc.text(tostring(entry.note), {colour = "dim",
+name = prefix .. "-note:" .. index})
+end
+if bar then
+
+
+local isThumb = position >= thumbAt and position < thumbAt + thumbLength
+children[#children + 1] = doc.text(" ", {
+bg = (position <= shown and isThumb) and "thumb" or "track",
+action = {kind = "scrollbar", cell = position, cells = shown},
+name = prefix .. "-bar:" .. index,
+})
+end
+
+
+rows[#rows + 1] = doc.row(children,
+{keep = 20 + (last - index), name = prefix .. ":" .. index,
+bg = entry.selected and "selected" or (position % 2 == 0 and "zebra" or nil)})
+end
+return rows
+end
+
+
+function app.settle(list, report, prefix)
+if not report then return false end
+local dropped = 0
+for _, entry in ipairs(report.dropped or {}) do
+if type(entry.name) == "string" and entry.name:find("^" .. prefix .. ":") then
+dropped = dropped + 1
+end
+end
+local shown = (list.listed or 0) - dropped
+if shown == list.shown then return false end
+list.shown = shown
+return true
+end
+
+
+
+function app.page(list, kind, action)
+local page = math.max((list.shown or 0) - 1, 1)
+if kind == "next" then
+return app.scroll(list, page)
+elseif kind == "prev" then
+return app.scroll(list, -page)
+elseif kind == "scrollbar" and action then
+local cells = math.max(action.cells or 1, 1)
+local share = cells > 1 and (action.cell - 1) / (cells - 1) or 0
+local want = 1 + math.floor(share * (lastFrom(list) - 1) + 0.5)
+list.from = want
+return true
+elseif kind == "clear-search" then
+requery(list, "")
+return true
+end
+return false
+end
+
+
+
+local function neighbour(list, step)
+local matched = list.matched or {}
+if #matched == 0 or not list.action then return nil end
+local at
+for index, entry in ipairs(matched) do
+if entry.selected then at = index end
+end
+local want = at and (at + step) or list.from
+want = math.max(1, math.min(want, #matched))
+list.follow = want
+return list.action(matched[want])
+end
+
+
+
+
+
+
+
+
+function app.type(list, event)
+if not list or not event then return false end
+if event.kind == "scroll" then
+
+app.scroll(list, (event.dir or 0) * 3)
+return true
+end
+if event.kind == "char" then
+local ch = event.char
+if type(ch) ~= "string" or not ch:match("^[%a_: ]$") then return false end
+requery(list, list.query .. ch:lower())
+return true
+end
+if event.kind ~= "key" or not keys then return false end
+local key = event.key
+if key == keys.backspace and list.query ~= "" then
+requery(list, list.query:sub(1, -2))
+return true
+elseif key == keys.delete and list.query ~= "" then
+requery(list, "")
+return true
+elseif key == keys.pageDown or key == keys.right then
+app.page(list, "next")
+return true
+elseif key == keys.pageUp or key == keys.left then
+app.page(list, "prev")
+return true
+elseif list.arrows and (key == keys.up or key == keys.down) then
+return true, neighbour(list, key == keys.up and -1 or 1)
+end
+return false
+end
+
+
+
+
+
+
+
+app.KEEP_STATUS = 1000
+
+
+function app.quantityRow(value, usable, label, indent)
+local children = {}
+if indent and indent > 0 then children[1] = doc.gap(indent) end
+children[#children + 1] = doc.text(label or "Qty", {colour = "label",
+keep = doc.REQUIRED, name = "qty-label"})
+children[#children + 1] = doc.gap(1)
+for i = #app.STEPS, 1, -1 do
+local step = app.STEPS[i]
+children[#children + 1] = doc.button("-" .. step, {
+key = usable and KEYS[step] and KEYS[step][1] or nil,
+colour = usable and "action" or "dim",
+action = usable and {kind = "delta", n = -step} or nil,
+keep = (step == 1) and doc.REQUIRED or (6 - i), name = "less" .. step})
+children[#children + 1] = doc.gap(1)
+end
+children[#children + 1] = doc.text(tostring(value), {width = 4, align = "right",
+colour = usable and "text" or "dim", keep = doc.REQUIRED, name = "quantity"})
+for i, step in ipairs(app.STEPS) do
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = doc.button("+" .. step, {
+key = usable and KEYS[step] and KEYS[step][2] or nil,
+colour = usable and "action" or "dim",
+action = usable and {kind = "delta", n = step} or nil,
+keep = (step == 1) and doc.REQUIRED or (6 - i), name = "more" .. step})
+end
+return doc.row(children, {keep = doc.REQUIRED, name = "qty"})
+end
+
+
+function app.clamp(value, min, max)
+value = math.floor(tonumber(value) or min)
+if value < min then value = min end
+if max and value > max then value = max end
+return value
+end
+
+return app

@@ -1,0 +1,203 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+
+local ledger = {}
+
+local FILE = "orders"
+
+
+
+
+ledger.PLACED = "placed"
+ledger.SUPPLYING = "supplying"
+ledger.AWAITING = "awaiting"
+ledger.COLLECTING = "collecting"
+ledger.CLOSED = "closed"
+ledger.WITHDRAWN = "withdrawn"
+
+function ledger.all()
+local stored = state.read(FILE, {})
+if type(stored) ~= "table" then return {} end
+return stored
+end
+
+function ledger.get(id)
+return ledger.all()[id]
+end
+
+local function put(record)
+local all = ledger.all()
+all[record.id] = record
+state.write(FILE, all)
+return record
+end
+
+ledger.put = put
+
+
+
+
+function ledger.nextId(prefix)
+prefix = prefix or "ord"
+local all = ledger.all()
+local n = 1
+while all[("%s-%d"):format(prefix, n)] do n = n + 1 end
+return ("%s-%d"):format(prefix, n)
+end
+
+
+function ledger.open(spec)
+if not spec.id then return nil, "an order needs an id" end
+if ledger.get(spec.id) then
+return nil, ("we already have an order called %s"):format(spec.id)
+end
+if not spec.node then return nil, "an order needs a node to place it with" end
+
+return put({
+id = spec.id,
+node = spec.node,
+product = spec.product,
+quantity = spec.quantity,
+
+
+
+promised = spec.supplied or {},
+pushed = {},
+owed = spec.owed or {},
+collected = {},
+state = ledger.PLACED,
+opened = os.epoch("utc"),
+history = {{state = ledger.PLACED, at = os.epoch("utc"),
+why = "placed with " .. tostring(spec.node)}},
+})
+end
+
+function ledger.advance(id, to, why)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+record.state = to
+record.history = record.history or {}
+record.history[#record.history + 1] = {state = to, at = os.epoch("utc"), why = why}
+return put(record)
+end
+
+function ledger.pushed(id, items)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+for item, count in pairs(items or {}) do
+record.pushed[item] = (record.pushed[item] or 0) + count
+end
+return put(record)
+end
+
+function ledger.collected(id, items)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+for item, count in pairs(items or {}) do
+record.collected[item] = (record.collected[item] or 0) + count
+end
+return put(record)
+end
+
+
+function ledger.outstandingSupply(record)
+local out = {}
+for item, promised in pairs(record.promised or {}) do
+local sent = (record.pushed or {})[item] or 0
+if promised > sent then out[item] = promised - sent end
+end
+return out
+end
+
+
+function ledger.outstandingProduct(record)
+local out = {}
+for item, owed in pairs(record.owed or {}) do
+local got = (record.collected or {})[item] or 0
+if owed > got then out[item] = owed - got end
+end
+return out
+end
+
+function ledger.open_orders()
+local out = {}
+for _, record in pairs(ledger.all()) do
+if record.state ~= ledger.CLOSED and record.state ~= ledger.WITHDRAWN then
+out[#out + 1] = record
+end
+end
+table.sort(out, function(a, b) return a.id < b.id end)
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+function ledger.reconcile(id, statement)
+local record = ledger.get(id)
+if not record then return nil, "no such order: " .. tostring(id) end
+if type(statement) ~= "table" then
+return nil, "no statement from the node to compare against"
+end
+
+local findings = {}
+
+local function compare(what, ours, theirs)
+local items = {}
+for item in pairs(ours or {}) do items[item] = true end
+for item in pairs(theirs or {}) do items[item] = true end
+for item in pairs(items) do
+local mine = (ours or {})[item] or 0
+local yours = (theirs or {})[item] or 0
+if mine ~= yours then
+findings[#findings + 1] = {
+what = what, item = item, ours = mine, theirs = yours,
+}
+end
+end
+end
+
+
+
+compare("supplied", record.pushed, statement.received)
+
+compare("collected", record.collected, statement.delivered)
+
+compare("owed", record.owed, statement.owed)
+
+
+
+local offManifest = nil
+if statement.offManifest and next(statement.offManifest) then
+offManifest = statement.offManifest
+end
+
+return {
+order = id,
+agrees = #findings == 0,
+findings = findings,
+offManifest = offManifest,
+theirState = statement.state,
+ourState = record.state,
+}
+end
+
+return ledger

@@ -1,0 +1,163 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local turtles = require("mfg.controller.turtles")
+local mount = require("mfg.storage.mount")
+local store = require("mfg.storage")
+local handoff = require("mfg.storage.handoff")
+local recipes = require("mfg.controller.recipes")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function sorted(set)
+local out = {}
+for key in pairs(set) do out[#out + 1] = key end
+table.sort(out)
+return out
+end
+
+
+
+
+
+
+
+local function resolve(source)
+if source == "nodes" then
+local out = {}
+for _, id in ipairs(sorted(turtles.all())) do
+local record = turtles.get(id)
+out[#out + 1] = {value = id, label = record.label or id}
+end
+return out
+end
+
+if source == "volumes" then
+return mount.volumes()
+end
+
+
+
+if source == "signals" then
+return mount.list(nil, "signal")
+end
+if source == "ports" then
+local out = {}
+for _, path in ipairs(mount.volumes()) do
+if (mount.get(path) or {}).machine then out[#out + 1] = path end
+end
+return out
+end
+
+
+
+if source == "recipes" then
+local out = {}
+for _, def in ipairs(recipes.all()) do
+out[#out + 1] = {value = def.id, label = ("%s -> %d %s"):format(
+def.label, def.output.count, def.output.item)}
+end
+return out
+end
+
+if source == "items" then
+local pool = handoff.sourceOf({})
+local totals, why = store.stock(pool)
+if not totals then
+return nil, ("%s: %s"):format(pool, tostring(why))
+end
+return sorted(totals)
+end
+
+return nil, ("no such source: %s"):format(tostring(source))
+end
+
+
+local function describe(decl)
+local out = {
+name = decl.name, label = decl.label, role = decl.role, tier = decl.tier,
+manual = decl.manual or nil, destructive = decl.destructive or nil,
+requires = decl.requires, uses = decl.uses, returns = decl.returns,
+parameters = {},
+unresolved = nil,
+}
+
+for _, param in ipairs(decl.parameters or {}) do
+local copy = {}
+for key, value in pairs(param) do copy[key] = value end
+
+local source = type(param.choices) == "table" and param.choices.source
+if source then
+local list, why = resolve(source)
+if list then
+copy.choices = list
+else
+out.unresolved = out.unresolved or {}
+out.unresolved[param.name] = why
+end
+end
+out.parameters[#out.parameters + 1] = copy
+end
+
+return out
+end
+
+return {
+name        = "offer",
+label       = "What this controller offers",
+role        = "controller",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "name", label = "Action", type = "text", required = false,
+help = "One action by name. Omit for every action this controller "
+.. "offers an operator."},
+},
+
+returns = {actions = "text"},
+
+run = function(params)
+local list = actions.list()
+
+if params.name then
+local found = nil
+for _, decl in ipairs(list) do
+if decl.name == params.name then found = decl end
+end
+if not found then
+
+
+return rpc.REJECTED, {reason = ("%s is not an action this "
+.. "controller offers"):format(params.name)}
+end
+list = {found}
+end
+
+local out = {}
+for _, decl in ipairs(list) do
+out[#out + 1] = describe(decl)
+end
+return rpc.COMPLETED, {actions = out}
+end,
+}

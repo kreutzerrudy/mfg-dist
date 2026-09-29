@@ -1,0 +1,27 @@
+local rpc = require("mfg.common.rpc")
+local signals = require("mfg.controller.signals")
+
+
+
+
+
+return {
+name        = "release_signal",
+label       = "Release a signal",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "signal", label = "Signal", type = "path", required = true,
+choices = {source = "signals"}},
+},
+
+returns = {},
+
+run = function(params, ctx)
+local ok, why = signals.release(params.signal, ctx.policy or "operator")
+if not ok then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {}
+end,
+}

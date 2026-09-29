@@ -1,0 +1,240 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local turtles = require("mfg.controller.turtles")
+local rpc = require("mfg.common.rpc")
+
+local recovery = {}
+
+recovery.COMMANDED = "commanded"
+recovery.REBOOTED = "rebooted"
+recovery.DISPATCHED = "dispatched"
+recovery.EXHAUSTED = "exhausted"
+
+
+
+
+
+
+
+
+
+
+
+function recovery.findPeripheral(label, opts)
+opts = opts or {}
+local names = opts.names
+local wrap = opts.wrap
+
+if not names then
+names = {}
+for _, name in ipairs(peripheral.getNames()) do
+local kind = peripheral.getType(name)
+if kind == "turtle" or kind == "computer" then
+names[#names + 1] = name
+end
+end
+end
+wrap = wrap or peripheral.wrap
+
+for _, name in ipairs(names) do
+local device = wrap(name)
+if device and device.getLabel then
+local ok, found = pcall(device.getLabel)
+if ok and found == label then return name, device end
+end
+end
+return nil
+end
+
+
+
+
+local function commandIt(node, opts)
+local answer = turtles.clearFault(node, opts.rpc or {timeout = 3, attempts = 2})
+if answer and answer.status == rpc.COMPLETED then
+return true, "cleared its fault over the control service"
+end
+return false, ("did not clear: %s"):format(
+tostring(answer and (answer.reason or answer.status) or "no reply"))
+end
+
+
+
+
+
+
+local function rebootIt(node, opts)
+local label = node.label or node.id
+if not label then
+return false, "no label, so it cannot be found on the network (W8.4)"
+end
+
+local name, device = recovery.findPeripheral(label, opts)
+if not name then
+return false, ("no network peripheral labelled %s -- is it in its bay, and "
+.. "is the bay's modem activated?"):format(tostring(label))
+end
+
+local ok, err = pcall(device.reboot)
+if not ok then return false, ("reboot failed: %s"):format(tostring(err)) end
+return true, ("rebooted via %s"):format(name)
+end
+
+
+
+local function dispatchBuilder(node, opts)
+local builder = opts.builder
+if not builder then
+return false, "no builder registered -- nothing left to try"
+end
+
+local answer = rpc.request(builder.host, "mfg-control", {
+command = "recover",
+target = node.id,
+label = node.label or node.id,
+}, opts.rpc or {timeout = 5, attempts = 2})
+
+if not answer or answer.status == rpc.TIMED_OUT then
+return false, "the builder did not answer"
+end
+if answer.status == rpc.REJECTED then
+return false, ("the builder refused: %s"):format(tostring(answer.reason))
+end
+
+
+return true, "builder dispatched"
+end
+
+
+
+
+
+
+
+function recovery.recover(nodeId, opts)
+opts = opts or {}
+
+local node = turtles.get(nodeId)
+if not node then return nil, ("no such node: %s"):format(tostring(nodeId)) end
+
+local rungs = {
+{name = recovery.COMMANDED, run = commandIt},
+{name = recovery.REBOOTED, run = rebootIt},
+{name = recovery.DISPATCHED, run = dispatchBuilder},
+}
+
+local attempts = {}
+
+for _, rung in ipairs(rungs) do
+
+
+
+if not (opts.skip and opts.skip[rung.name]) then
+
+
+
+local lived, ok, why = pcall(rung.run, node, opts)
+if not lived then
+ok, why = false, "the rung itself failed: " .. tostring(ok)
+end
+
+attempts[#attempts + 1] = {rung = rung.name, ok = ok, why = why}
+if ok then
+return rung.name, attempts
+end
+else
+attempts[#attempts + 1] = {rung = rung.name, ok = false,
+why = "skipped", skipped = true}
+end
+end
+
+return recovery.EXHAUSTED, attempts
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function recovery.verifyDevices(before, opts)
+opts = opts or {}
+local store = opts.store or require("mfg.storage")
+local after = store.audit()
+
+local wasMissing = {}
+for _, entry in ipairs((before and before.degraded) or {}) do
+for _, device in ipairs(entry.missing) do wasMissing[device] = true end
+end
+
+local vanished, alreadyGone = {}, {}
+for _, entry in ipairs(after.degraded) do
+for _, device in ipairs(entry.missing) do
+local record = {path = entry.path, device = device}
+if wasMissing[device] then
+alreadyGone[#alreadyGone + 1] = record
+else
+vanished[#vanished + 1] = record
+end
+end
+end
+
+return {
+audit = after,
+vanished = vanished,
+alreadyGone = alreadyGone,
+ok = #vanished == 0,
+
+
+
+diagnosis = (#vanished > 0)
+and "a device vanished during builder movement -- check the wired modem "
+.. "is still activated before assuming a broken block (F9.8c)"
+or nil,
+}
+end
+
+
+
+
+
+function recovery.explain(nodeId, outcome, attempts)
+local parts = {}
+for _, attempt in ipairs(attempts or {}) do
+parts[#parts + 1] = ("%s: %s"):format(attempt.rung, tostring(attempt.why))
+end
+return ("%s -> %s (%s)"):format(tostring(nodeId), tostring(outcome),
+table.concat(parts, "; "))
+end
+
+return recovery

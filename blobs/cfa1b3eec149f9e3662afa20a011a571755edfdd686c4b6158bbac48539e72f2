@@ -1,0 +1,32 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+
+
+
+
+
+
+
+
+
+return {
+name        = "locate",
+label       = "Find an item",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "item", label = "Item", type = "item", required = true,
+choices = {source = "items"},
+help = "An item id, an id#nbt, or a #tag."},
+},
+
+
+
+
+returns = {found = "text"},
+
+run = function(params)
+return rpc.COMPLETED, {found = store.locate(params.item)}
+end,
+}
