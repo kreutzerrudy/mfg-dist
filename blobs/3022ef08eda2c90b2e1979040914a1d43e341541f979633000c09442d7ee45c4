@@ -1,0 +1,177 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = {}
+
+local ROOT = "/mfg/state"
+
+
+local SCHEMA_KEY = "~schema"
+
+local function pathFor(name)
+return fs.combine(ROOT, name)
+end
+
+local function slurp(path, binary)
+local handle = fs.open(path, binary and "rb" or "r")
+if not handle then return nil, "could not open " .. path end
+local text = handle.readAll() or ""
+handle.close()
+return text
+end
+
+
+
+
+
+
+function state.readText(path, binary)
+local temp = path .. ".new"
+if fs.exists(path) then
+
+
+
+
+if fs.exists(temp) then fs.delete(temp) end
+return slurp(path, binary)
+end
+if not fs.exists(temp) then return nil end
+local text, why = slurp(temp, binary)
+if text == nil then return nil, why end
+fs.move(temp, path)
+return text
+end
+
+
+
+function state.writeText(path, text, binary)
+local dir = fs.getDir(path)
+if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+
+local temp = path .. ".new"
+if fs.exists(temp) then fs.delete(temp) end
+
+local handle = fs.open(temp, binary and "wb" or "w")
+if not handle then return false, "could not write " .. temp end
+handle.write(text)
+handle.close()
+
+if fs.exists(path) then fs.delete(path) end
+fs.move(temp, path)
+return true
+end
+
+
+
+function state.readFile(path)
+local text, why = state.readText(path)
+if text == nil then return nil, why end
+local ok, parsed = pcall(textutils.unserialize, text)
+if not ok or parsed == nil then return nil, "unreadable state at " .. path end
+return parsed
+end
+
+
+
+function state.writeFile(path, value)
+return state.writeText(path, textutils.serialize(value, {compact = true}))
+end
+
+local function stamped(value)
+return type(value) == "table" and value[SCHEMA_KEY] ~= nil
+end
+
+
+
+
+
+
+
+
+
+
+function state.read(name, fallback, opts)
+local path = pathFor(name)
+local parsed, why = state.readFile(path)
+if parsed == nil then return fallback, why end
+
+local version, value = 0, parsed
+if stamped(parsed) then version, value = parsed[SCHEMA_KEY], parsed.value end
+
+local want = opts and opts.schema
+if not want then return value end
+
+if version > want then
+return fallback, ("state %s is schema %d; this software understands %d"):format(
+name, version, want)
+end
+if version < want then
+if not opts.migrate then
+return fallback, ("state %s is schema %d and nothing migrates it to %d"):format(
+name, version, want)
+end
+local ok, migrated = pcall(opts.migrate, value, version)
+if not ok then
+return fallback, ("state %s: migrating from schema %d failed: %s"):format(
+name, version, tostring(migrated))
+end
+value = migrated
+end
+return value
+end
+
+function state.write(name, value, opts)
+if opts and opts.schema then
+value = {[SCHEMA_KEY] = opts.schema, value = value}
+end
+return state.writeFile(pathFor(name), value)
+end
+
+function state.clear(name)
+local path = pathFor(name)
+if fs.exists(path) then fs.delete(path) end
+if fs.exists(path .. ".new") then fs.delete(path .. ".new") end
+end
+
+
+
+
+
+function state.update(name, fields, opts)
+local current, why = state.read(name, {}, opts)
+
+
+if why and opts and opts.schema then return false, why end
+if type(current) ~= "table" then current = {} end
+for k, v in pairs(fields) do current[k] = v end
+return state.write(name, current, opts)
+end
+
+return state

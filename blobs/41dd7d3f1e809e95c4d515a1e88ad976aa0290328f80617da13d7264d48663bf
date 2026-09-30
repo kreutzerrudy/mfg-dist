@@ -1,0 +1,87 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+
+local journal = {}
+
+local FILE = "actions"
+
+
+
+
+journal.LIMIT = 64
+
+
+
+
+journal.STEPS = 8
+
+
+
+
+
+function journal.record(entry)
+local all = state.read(FILE, nil)
+if type(all) ~= "table" or type(all.entries) ~= "table" then
+all = {entries = {}, nextSeq = 1}
+end
+
+local record = {
+seq = all.nextSeq or 1,
+action = entry.action,
+params = entry.params,
+status = entry.status,
+reason = entry.reason,
+by = entry.by,
+at = entry.at or os.epoch("utc"),
+steps = entry.steps,
+}
+
+all.entries[#all.entries + 1] = record
+all.nextSeq = record.seq + 1
+
+while #all.entries > journal.LIMIT do
+table.remove(all.entries, 1)
+end
+for index = 1, #all.entries - journal.STEPS do all.entries[index].steps = nil end
+
+state.write(FILE, all)
+return record
+end
+
+
+function journal.recent(count)
+local all = state.read(FILE, nil)
+if type(all) ~= "table" or type(all.entries) ~= "table" then return {} end
+
+local out = {}
+local entries = all.entries
+local first = math.max(1, #entries - (count or journal.LIMIT) + 1)
+for index = #entries, first, -1 do
+out[#out + 1] = entries[index]
+end
+return out
+end
+
+function journal.reset()
+state.clear(FILE)
+end
+
+return journal
