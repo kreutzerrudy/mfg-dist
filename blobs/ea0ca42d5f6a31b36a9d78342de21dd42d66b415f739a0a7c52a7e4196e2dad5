@@ -1,0 +1,1145 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local recipes = require("mfg.controller.recipes")
+local dispatch = require("mfg.controller.dispatch")
+local supervisor = require("mfg.controller.supervisor")
+local turtles = require("mfg.controller.turtles")
+local store = require("mfg.storage")
+local cli = require("mfg.storage.cli")
+local probe = require("mfg.storage.probe")
+local custody = require("mfg.storage.custody")
+local state = require("mfg.common.state")
+local pointlist = require("mfg.common.points")
+
+local args = {...}
+local cmd = args[1]
+
+
+
+
+
+
+local function source()
+local cfg = state.read("cluster", {})
+return cfg.source or require("mfg.common.config").setting("source")
+end
+
+local function marker()
+local cfg = state.read("cluster", {})
+return cfg.marker or "minecraft:name_tag"
+end
+
+local function requireSource()
+local path = source()
+if not store.isBound(path) then
+printError(path .. " is not bound to any device")
+print("run: mfgctl bind " .. path .. " <device...>")
+print("  or: mfgctl pool add   (every unclaimed chest, after a yes)")
+print("list candidates with: mfgctl peripherals")
+return nil
+end
+return path
+end
+
+
+
+local function usage()
+cli.paged({
+"mfgctl turtles | recipes | stock",
+"mfgctl bind <path> <device...>  attach devices to a mount point",
+"mfgctl unbind <path>",
+"mfgctl bindings               the mount table",
+"mfgctl mark <path> | --all    print an identity page into each chest",
+"mfgctl unclaimed              inventories no mount point owns",
+"mfgctl store <path>           one volume in detail",
+"mfgctl defrag <path>          merge fragmented stacks",
+"mfgctl orders | order-show <id>",
+"mfgctl receive <id> | deliver <id> | settle <id> | cancel <id>",
+"mfgctl custody <item>         physical vs spendable",
+"mfgctl probe <id>             discover a node's storage",
+"mfgctl marker [<item>]        the probe's marker item",
+"mfgctl pool <name...>         alias for bind /pool",
+"mfgctl pool add [<name...>] [--any] [--yes]",
+"                              add devices, or all unclaimed storage",
+"mfgctl peripherals            what is on the wired network",
+"mfgctl df                     the disk: free, and what uses it",
+"mfgctl register <id> <host> [<input> <output>]",
+"mfgctl label <id> [<label>]   assign the node its identity",
+"mfgctl recover <id>           climb the fix ladder",
+"mfgctl plan <recipe|item> <qty>  dry run",
+"mfgctl holds                  what players' carts hold",
+"mfgctl release <holder>       drop one holder's holds",
+"mfgctl mint <name> [--role turtle|builder|station|hmi]",
+"mfgctl clear-fault <id>",
+"mfgctl role <node> <role>     decide what a node should be",
+"mfgctl config <node> [<setting> [<value>]]  show, set or clear",
+"mfgctl publish <role>         check and sign a role's firmware",
+"mfgctl bind <path> --new      bind the one device whose modem goes on next",
+"mfgctl bind --script <file> /<machine> [<inventory>] [<port>=<chest>...]",
+"mfgctl script check|load <file> | forget <script> | scripts",
+"mfgctl machine enable|disable|forget|show <machine> | machines",
+"mfgctl machine limit <machine> <item> <at> [resume <n>] | off",
+"mfgctl signals                every signal port",
+"mfgctl signal <path> [<level> | pulse <ticks> | release]",
+})
+end
+
+
+
+
+local function operatorInvoke(name, params)
+local actions = require("mfg.common.actions")
+if not actions.get or not actions.get(name) then actions.load("controller") end
+return actions.invoke(name, params, {by = "mfgctl", operator = "console"})
+end
+
+
+
+
+local function scriptFile(path)
+if not path or not fs.exists(shell.resolve(path)) then
+printError("no such file: " .. tostring(path))
+return nil
+end
+local handle = fs.open(shell.resolve(path), "r")
+local text = handle.readAll()
+handle.close()
+return text
+end
+
+
+local function problems(list, label, toError)
+for _, p in ipairs(list or {}) do
+local line = ("  %s line %s:%s  %s"):format(label, tostring(p.line),
+tostring(p.col), p.message)
+if toError then printError(line) else print(line) end
+end
+end
+
+
+local function footprint(f)
+if not f then return end
+local function list(name, values)
+if values and #values > 0 then
+print(("  %-9s %s"):format(name, table.concat(values, ", ")))
+end
+end
+list("supplies", f.supplies)
+list("writes", f.writes)
+list("collects", f.collects)
+list("drives", f.drives)
+end
+
+
+local function loadScript(path)
+local source = scriptFile(path)
+if not source then return nil end
+local status, fields = operatorInvoke("register_script", {source = source})
+if status ~= "completed" then
+problems(fields and fields.errors, "error", true)
+if not (fields and fields.errors) then printError(tostring(fields and fields.reason)) end
+return nil
+end
+problems(fields.warnings, "warning")
+print(("script %s, revision %d%s"):format(fields.script, fields.rev,
+#fields.machines > 0 and ("; followed by " .. table.concat(fields.machines, ", "))
+or ""))
+for machine, why in pairs(fields.problems or {}) do
+printError(("  %s could not be refitted: %s"):format(machine, tostring(why)))
+end
+return fields.script
+end
+
+
+
+
+
+local function bindScript(args)
+local usageLine = "usage: mfgctl bind --script <file> /<machine> [<inventory>] "
+.. "[<port>=<chest>...]"
+local file, path = args[3], args[4]
+if not file or not path or path:sub(1, 1) ~= "/" then
+printError(usageLine)
+return
+end
+local device, chests = nil, nil
+for i = 5, #args do
+local port, chest = args[i]:match("^([^=]+)=(.+)$")
+if port then
+chests = chests or {}
+chests[port] = chest
+elseif device then
+printError(("one inventory only: %s and %s -- a chest is <port>=<chest>")
+:format(device, args[i]))
+return
+else
+device = args[i]
+end
+end
+local script = loadScript(file)
+if not script then return end
+local machine = path:sub(2)
+local status, fields = operatorInvoke("add_machine", {machine = machine,
+script = script, device = device, chests = chests})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+print(("machine %s, made from %s"):format(path, script))
+for _, bound in ipairs(fields.bound or {}) do
+local port = bound:match("[^/]+$")
+print("  bound " .. bound .. ((chests and chests[port]) and " (interface chest)" or ""))
+end
+if fields.unbound and #fields.unbound > 0 then
+print("still to bind:")
+for _, port in ipairs(fields.unbound) do
+print(("  mfgctl bind %s <device> ..."):format(port))
+end
+end
+print(("then: mfgctl machine enable %s"):format(machine))
+end
+
+
+
+
+local function bindNew(path)
+local hal = require("mfg.common.hal")
+local binder = require("mfg.controller.binder")
+if not path or path == "--new" then
+printError("usage: mfgctl bind <path> --new")
+return
+end
+local t, why = binder.target(path)
+if not t then printError(tostring(why)) return end
+local before = hal.peripherals().list()
+print("Turn on the modem of the ONE block to bind (right-click it).")
+print("If it is already on: hold Ctrl+T, turn the modem off, and start again.")
+local added, deadline = {}, os.clock() + binder.WAIT
+while os.clock() < deadline do
+sleep(1)
+added = {}
+for name in pairs(hal.peripherals().list()) do
+if not before[name] then added[#added + 1] = name end
+end
+if #added > 0 then sleep(1) break end
+end
+added = {}
+for name in pairs(hal.peripherals().list()) do
+if not before[name] then added[#added + 1] = name end
+end
+table.sort(added)
+if #added == 0 then
+printError(("nothing was added in %d seconds"):format(binder.WAIT))
+return
+elseif #added > 1 then
+printError(("%d devices were added: %s"):format(#added, table.concat(added, ", ")))
+print("turn on one modem at a time, and make sure each modem touches only one block")
+return
+end
+local device = added[1]
+local ok, bad = binder.fits(t, device)
+if not ok then printError(tostring(bad)) return end
+if not cli.confirm(("bind %s, %s, as %s?"):format(device, (binder.describe(device)),
+path)) then
+print("nothing bound")
+return
+end
+local face = nil
+if t.kind == "signal" then
+local rs = hal.redstone()
+local levels = {}
+for f in pairs(require("mfg.storage.mount").FACES) do
+levels[f] = rs.getAnalogInput(device, f)
+end
+print("Now flip a lever or press a button on the wire into it.")
+deadline = os.clock() + binder.WAIT
+while not face and os.clock() < deadline do
+sleep(0.5)
+for f, level in pairs(levels) do
+if rs.getAnalogInput(device, f) ~= level then face = f break end
+end
+end
+if not face then printError("no face changed -- nothing bound") return end
+end
+local bound, err = binder.bindDevice(path, device, face, "mfgctl")
+if not bound then printError(tostring(err)) return end
+print(("bound %s -> %s%s"):format(path, device, face and (" " .. face) or ""))
+end
+
+if cmd == nil or cmd == "help" then
+usage()
+
+elseif cmd == "df" then
+
+
+
+
+local function size(path)
+if not fs.isDir(path) then return fs.getSize(path) end
+local total = 0
+for _, name in ipairs(fs.list(path)) do total = total + size(fs.combine(path, name)) end
+return total
+end
+local function listed(dir)
+local rows = {}
+for _, name in ipairs(fs.list(dir)) do
+local path = fs.combine(dir, name)
+
+if fs.getDrive(path) == fs.getDrive("/") then
+rows[#rows + 1] = {path = "/" .. path, bytes = size(path),
+dir = fs.isDir(path)}
+end
+end
+table.sort(rows, function(a, b) return a.bytes > b.bytes end)
+return rows
+end
+local capacity = fs.getCapacity and fs.getCapacity("/") or nil
+local free = fs.getFreeSpace("/")
+if capacity then
+print(("disk: %d bytes, %d used, %d free (%d%% used)"):format(capacity,
+capacity - free, free, math.floor((capacity - free) * 100 / capacity)))
+else
+print(("disk: %d bytes free"):format(free))
+end
+local top = listed("")
+local files, other = 0, 0
+for _, row in ipairs(top) do
+if row.dir then
+print(("  %8d  %s/"):format(row.bytes, row.path))
+else
+files, other = files + 1, other + row.bytes
+end
+end
+print(("  %8d  %d files at the top level"):format(other, files))
+if fs.isDir("/mfg/state") then
+print("/mfg/state, the controller's own data:")
+for i, row in ipairs(listed("mfg/state")) do
+if i > 12 then print("  ...") break end
+print(("  %8d  %s"):format(row.bytes, row.path))
+end
+end
+
+elseif cmd == "peripherals" then
+
+
+
+local found = 0
+for _, name in ipairs(peripheral.getNames()) do
+local kind = peripheral.getType(name)
+local inventory = peripheral.hasType(name, "inventory") and " [inventory]" or ""
+print(("  %-24s %s%s"):format(name, kind, inventory))
+found = found + 1
+end
+if found == 0 then print("  nothing -- is a wired modem attached and activated?") end
+
+elseif cmd == "pool" then
+
+
+
+
+if not args[2] then
+print("pooled storage: " .. source())
+return
+end
+
+if args[2] == "add" then
+cli.add("mfgctl", source(), args, 3)
+return
+end
+local devices = {}
+for i = 2, #args do devices[#devices + 1] = args[i] end
+local record, err = store.bind(source(), devices, {coherence = store.EXCLUSIVE})
+if not record then printError(tostring(err)) return end
+print(("bound %s to %d device(s)"):format(source(), #devices))
+
+elseif cmd == "bind" then
+if args[2] == "--script" then
+bindScript(args)
+elseif args[3] == "--new" or args[2] == "--new" then
+bindNew(args[2] ~= "--new" and args[2] or args[3])
+else
+cli.bind("mfgctl", args)
+end
+
+elseif cmd == "unbind" then
+local ok, err = store.unbind(args[2] or "")
+if not ok then printError(tostring(err)) return end
+print("unbound " .. tostring(args[2]))
+
+elseif cmd == "bindings" then
+cli.bindings()
+
+elseif cmd == "unclaimed" then
+
+
+
+local storage, other = store.unclaimedByKind()
+if #storage + #other == 0 then
+print("every inventory on the network is claimed")
+return
+end
+print("on the network and owned by no mount point:")
+for _, entry in ipairs(storage) do print("  " .. entry.device .. "  (storage)") end
+for _, entry in ipairs(other) do
+print(("  %s  %s"):format(entry.device, tostring(entry.kind)))
+end
+if #storage > 0 then print("`mfgctl pool add` offers the storage ones") end
+
+elseif cmd == "store" then
+cli.store("mfgctl", args[2], "mfgctl defrag")
+
+elseif cmd == "defrag" then
+
+
+
+
+local path = args[2]
+if not path then
+printError("usage: mfgctl defrag <path>")
+print("only an exclusive volume can be defragmented (S8.8)")
+return
+end
+
+local before = store.slots(path)
+local result, err = store.defrag(path)
+if not result then printError(tostring(err)) return end
+
+print(("merged %d item(s) in %d call(s) across %d key(s)")
+:format(result.merged, result.calls, result.keys))
+print(("freed %d slot(s)"):format(result.slotsFreed))
+if before then
+local after = store.slots(path)
+print(("slots used: %d -> %d"):format(before.used, after.used))
+end
+if result.merged == 0 then
+print("nothing to merge -- already consolidated")
+end
+
+elseif cmd == "orders" then
+local any = false
+for id, order in pairs(custody.orders()) do
+any = true
+print(("%-10s %-11s %s x%s  from %s"):format(id, order.state,
+tostring(order.product), tostring(order.quantity), tostring(order.from)))
+if next(order.offManifest or {}) then
+
+
+for item, count in pairs(order.offManifest) do
+printError(("           OFF MANIFEST: %d %s held in %s")
+:format(count, item, custody.IN))
+end
+end
+end
+if not any then print("no orders") end
+
+elseif cmd == "order-show" then
+local statement = custody.statement(args[2] or "")
+if not statement then printError("no such order: " .. tostring(args[2])) return end
+
+local lines = cli.lines
+print(("%s  %s  from %s"):format(statement.id, statement.state,
+tostring(statement.from)))
+lines("declared in", statement.supplied)
+lines("received", statement.received)
+lines("OFF MANIFEST (held for the station)", statement.offManifest)
+lines("owed out", statement.owed)
+lines("produced", statement.produced)
+lines("delivered", statement.delivered)
+lines("consumed", statement.consumed)
+lines("committed now", statement.committed)
+lines("released to local at settlement", statement.releasedToLocal)
+lines("returned to the station", statement.returnedToStation)
+if statement.history then
+print("  history")
+for _, entry in ipairs(statement.history) do
+print(("    %-11s %s"):format(entry.state, tostring(entry.why)))
+end
+end
+
+elseif cmd == "receive" then
+local statement, err = custody.receive(args[2] or "")
+if not statement then printError(tostring(err)) return end
+print(("order %s is now %s"):format(args[2], statement.state))
+for item, count in pairs(statement.took) do
+print(("  took %d %s into %s"):format(count, item, custody.POOL))
+end
+for item, count in pairs(statement.short) do
+printError(("  short %d %s -- still awaited"):format(count, item))
+end
+for item, count in pairs(statement.offManifest) do
+printError(("  OFF MANIFEST %d %s -- left in %s, not spendable")
+:format(count, item, custody.IN))
+end
+
+elseif cmd == "deliver" then
+local sent, err = custody.deliver(args[2] or "")
+if not sent then printError(tostring(err)) return end
+for item, count in pairs(sent.sent) do
+print(("  sent %d %s to %s"):format(count, item, custody.OUT))
+end
+if not next(sent.sent) then print("  nothing to send") end
+print("order is " .. tostring(sent.state))
+
+elseif cmd == "settle" then
+local settled, err = custody.settle(args[2] or "")
+if not settled then printError(tostring(err)) return end
+print("order settled")
+for item, count in pairs(settled.released or {}) do
+print(("  %d %s released to local stock"):format(count, item))
+end
+
+elseif cmd == "cancel" then
+local cancelled, err = custody.cancel(args[2] or "", args[3])
+if not cancelled then printError(tostring(err)) return end
+print("order returned")
+for item, count in pairs(cancelled.returned or {}) do
+print(("  %d %s sent back to %s"):format(count, item, custody.OUT))
+end
+
+elseif cmd == "custody" then
+
+local item = args[2]
+if not item then printError("usage: mfgctl custody <item>") return end
+local e = custody.explain(item)
+print(("%s"):format(e.item))
+print(("  physical in %s   %d"):format(custody.POOL, e.physical))
+print(("  consigned        %d"):format(e.consigned))
+for id, count in pairs(e.consignedBy) do
+print(("    %-12s %d"):format(id, count))
+end
+print(("  owed out         %d"):format(e.owed))
+print(("  local (free)     %d"):format(e.localFree))
+
+elseif cmd == "marker" then
+if not args[2] then print("probe marker: " .. marker()) return end
+state.update("cluster", {marker = args[2]})
+print("probe marker set to " .. args[2])
+
+elseif cmd == "probe" then
+local id = args[2]
+if not id then printError("usage: mfgctl probe <turtle id>") return end
+local turtle = turtles.get(id)
+if not turtle then printError("no such turtle: " .. id) return end
+
+local from = requireSource()
+if not from then return end
+
+
+
+
+
+
+
+
+local points = turtles.points(turtle, {timeout = 3, attempts = 2})
+if not points then
+printError(("%s is not answering -- cannot probe a node that is not there")
+:format(id))
+print("mfgctl turtles distinguishes silent from unreachable")
+return
+end
+local version = points.points_version or 1
+if pointlist.outdated(version) then
+printError(("%s reports point list version %d, which predates the probe")
+:format(id, version))
+print("its software is older than this controller's. Either:")
+print("  update it   -- world-sync <world> " .. tostring(turtle.host)
+.. ":turtle")
+print("  or bind by hand:")
+print(("    mfgctl bind /%s/in  <device>"):format(id))
+print(("    mfgctl bind /%s/out <device>"):format(id))
+return
+end
+
+print(("probing %s with one %s from %s"):format(id, marker(), from))
+local found, err = probe.bind(id, {
+marker = marker(),
+source = from,
+observe = function()
+local observed, answer = turtles.observe(turtle,
+{timeout = 3, attempts = 2})
+if observed then return observed end
+
+
+
+
+
+if answer and answer.status == "rejected" then
+return nil, ("%s rejected probe_observe: %s"):format(id,
+tostring(answer.reason or "unknown command"))
+end
+return nil
+end,
+emit = function(item)
+return turtles.emitMarker(turtle, item, {timeout = 4, attempts = 2})
+end,
+})
+if not found then printError(tostring(err)) return end
+
+for path, device in pairs(found.bound) do
+print(("  %s -> %s"):format(path, device))
+end
+if found.transit then
+
+
+turtles.setTransit(id, found.transit)
+print(("  relay transit: %.1fs (recorded)"):format(found.transit))
+end
+if found.unbound then
+printError("  still unbound: " .. tostring(found.unbound))
+end
+
+elseif cmd == "recipes" then
+for _, def in ipairs(recipes.all()) do
+local inputs = {}
+for item, count in pairs(def.inputs) do
+inputs[#inputs + 1] = ("%dx %s"):format(count, item)
+end
+table.sort(inputs)
+print(("%s: %d %s  <-  %s"):format(
+def.label, def.output.count, def.output.item, table.concat(inputs, ", ")))
+end
+if #recipes.all() == 0 then
+print("no recipes -- register one from an HMI's Register app")
+end
+
+elseif cmd == "stock" then
+local name = requireSource()
+if not name then return end
+local contents, degraded = store.stock(name)
+if not contents then printError(tostring(degraded)) return end
+if degraded then
+printError("DEGRADED -- not counting: " .. table.concat(degraded, ", "))
+end
+local any = false
+for item, count in pairs(contents) do
+print(("  %-32s %d"):format(item, count))
+any = true
+end
+if not any then print("  (empty)") end
+
+elseif cmd == "register" then
+local id, host, input, output = args[2], args[3], args[4], args[5]
+if not (id and host) then
+printError("usage: mfgctl register <id> <host> [<input> <output>]")
+print("omit the devices and bind them with 'mfgctl probe " .. tostring(id) .. "'")
+return
+end
+
+
+
+local record = turtles.register(id, {host = host, input = input, output = output})
+print(("registered %s at %s"):format(id, host))
+for _, path in ipairs({record.input, record.output}) do
+print(("  %-10s %s"):format(path,
+store.isBound(path) and table.concat((store.status(path)).devices, ", ")
+or "UNBOUND -- run 'mfgctl probe " .. id .. "'"))
+end
+
+
+
+
+local labelled, why = turtles.setLabel(record, {timeout = 3, attempts = 2})
+if labelled then
+print(("  label      %s"):format(why))
+else
+print(("  label      NOT SET (%s) -- run 'mfgctl label %s' once it is up")
+:format(tostring(why), id))
+end
+
+elseif cmd == "recover" then
+local id = args[2]
+if not id then
+printError("usage: mfgctl recover <id>")
+return
+end
+
+local recovery = require("mfg.controller.recovery")
+local turtle = turtles.get(id)
+if not turtle then
+printError("no such turtle: " .. id)
+return
+end
+
+
+
+
+
+
+
+
+local schematic = require("mfg.turtle.schematic")
+local builder, skip = nil, nil
+local map = schematic.load("/mfg/schematic")
+if map then
+for name, entry in pairs(map.places) do
+local who = entry.label or name
+
+
+
+if entry.builder then
+if who == id then
+skip = {[recovery.DISPATCHED] = true}
+else
+builder = turtles.get(who)
+end
+end
+end
+end
+
+print("recovering " .. id .. " -- cheapest rung first, this takes a moment")
+local outcome, attempts = recovery.recover(id, {builder = builder, skip = skip})
+if not outcome then
+printError(tostring(attempts))
+return
+end
+
+for step, attempt in ipairs(attempts) do
+print(("  %d %-11s %s"):format(step, attempt.rung,
+attempt.ok and "OK" or tostring(attempt.why)))
+end
+if outcome == recovery.EXHAUSTED then
+printError(id .. ": every rung failed")
+else
+print(("%s: %s"):format(id, outcome))
+end
+
+elseif cmd == "label" then
+local id = args[2]
+if not id then
+printError("usage: mfgctl label <id> [<label>]")
+return
+end
+local turtle = turtles.get(id)
+if not turtle then
+printError("no such turtle: " .. id)
+return
+end
+local ok, result = turtles.setLabel(turtle, {label = args[3],
+timeout = 3, attempts = 2})
+if ok then
+print(("%s is labelled %s"):format(id, result))
+else
+printError(("could not label %s: %s"):format(id, tostring(result)))
+end
+
+elseif cmd == "turtles" then
+local any = false
+for id, turtle in pairs(turtles.all()) do
+any = true
+local points, answer = turtles.points(turtle, {timeout = 3, attempts = 2})
+if points then
+local version = points.points_version or 1
+print(("%-8s %-14s %-10s %-24s v%d"):format(id, turtle.host,
+points.state, points.pattern_id or "no pattern cached", version))
+if pointlist.outdated(version) then
+
+
+printError("         point list v" .. version
+.. " predates the probe commands -- update this node")
+end
+if points.fault then print("         fault: " .. points.fault) end
+else
+
+
+
+local condition = turtles.condition(turtle, {timeout = 2, attempts = 3})
+if condition == "silent" then
+print(("%-8s %-14s SILENT (reachable, program not answering)")
+:format(id, turtle.host))
+else
+print(("%-8s %-14s UNREACHABLE (network cannot reach it)")
+:format(id, turtle.host))
+end
+end
+end
+if not any then print("no turtles registered") end
+
+elseif cmd == "plan" then
+local name = requireSource()
+if not name then return end
+local what, qty = args[2], tonumber(args[3] or "1")
+if not what then printError("usage: mfgctl plan <recipe|item> <qty>") return end
+
+
+local def = recipes.get(what) or recipes.producing(what)
+for _, candidate in ipairs(recipes.all()) do
+if not def and candidate.label == what then def = candidate end
+end
+if not def then printError("no recipe makes " .. what .. " -- see mfgctl recipes") return end
+
+
+
+local available, breakdown = supervisor.available(name)
+if not available then printError(tostring(breakdown)) return end
+local plan, why = dispatch.plan(def, qty, available)
+if not plan then printError(tostring(why)) return end
+
+print(("to make %d %s: %d sets -> %d %s"):format(
+qty, def.label, plan.sets, plan.yield, plan.product))
+for i, step in ipairs(plan.steps) do
+print(("  %d. %-12s x%d  -> %d %s"):format(
+i, step.label, step.sets, step.count, step.produces))
+end
+print("drawn from the pool:")
+for item, count in pairs(plan.draws) do
+print(("  %-32s %d"):format(item, count))
+end
+if next(plan.short) then
+print("SHORT: " .. (supervisor.describeShort(plan, breakdown)))
+else
+print("nothing is short -- make would queue this")
+end
+
+elseif cmd == "mark" then
+
+
+cli.mark("mfgctl", args[2])
+
+elseif cmd == "holds" then
+
+
+
+local holds = require("mfg.controller.holds")
+local list = holds.list()
+if #list == 0 then print("no holds") return end
+local now = holds.clock()
+for _, entry in ipairs(list) do
+local age = math.floor((now - entry.touched) / 1000)
+print(("%s  touched %dm%02ds ago, lapses in %dm"):format(entry.holder,
+math.floor(age / 60), age % 60,
+math.max(0, math.ceil((holds.EXPIRES / 1000 - age) / 60))))
+local items = {}
+for item in pairs(entry.lines) do items[#items + 1] = item end
+table.sort(items)
+for _, item in ipairs(items) do
+print(("  %-32s %d"):format(item, entry.lines[item]))
+end
+end
+
+elseif cmd == "release" then
+if not args[2] then printError("usage: mfgctl release <holder> -- see mfgctl holds") return end
+local n = require("mfg.controller.holds").release(args[2])
+if n == 0 then printError("nothing is held for " .. args[2]) return end
+print(("released %d line%s held for %s"):format(n, n == 1 and "" or "s", args[2]))
+
+elseif cmd == "clear-fault" then
+local turtle = turtles.get(args[2] or "")
+if not turtle then printError("no such turtle: " .. tostring(args[2])) return end
+local answer = turtles.clearFault(turtle, {timeout = 4, attempts = 2})
+print(tostring(answer.status) .. (answer.reason and (": " .. answer.reason) or ""))
+
+elseif cmd == "mint" then
+
+
+
+
+local mint = require("mfg.controller.mint")
+local ip = require("ip")
+local netkeys = require("netkeys")
+
+local drive = nil
+for _, pname in ipairs(peripheral.getNames()) do
+if peripheral.getType(pname) == "drive" then drive = pname end
+end
+if not drive then printError("no disk drive adjacent") return end
+
+local mount = peripheral.call(drive, "getMountPath")
+if not mount then
+printError("nothing mountable in the drive")
+print("a computer must be TURNED ON ONCE before it has a filesystem")
+return
+end
+
+local subnets = netkeys.subnets()
+local own = subnets[1]
+
+
+
+local roles = require("mfg.common.roles")
+local role = "turtle"
+for i = 2, #args do
+if args[i] == "--role" then role = args[i + 1] end
+end
+if not roles[role] then
+printError(("unknown role: %s"):format(tostring(role)))
+local names = {}
+for name in pairs(roles) do names[#names + 1] = name end
+table.sort(names)
+print("roles: " .. table.concat(names, ", "))
+return
+end
+
+local DEFAULT_NAME = {
+turtle = "craft_turtle",
+builder = "builder1",
+station = "station1",
+hmi = "hmi1",
+controller = "mfg2",
+}
+local name = (args[2] and args[2]:sub(1, 2) ~= "--") and args[2]
+or DEFAULT_NAME[role] or role
+
+
+
+
+if role == "turtle" or role == "builder" then
+print("  (this image needs a TURTLE in the drive, not a computer)")
+end
+
+local lease, cfg = mint.node(mount, {
+role = role,
+name = name,
+network = own.network, prefix = own.prefix,
+controller = os.getComputerID(),
+})
+if not lease then printError(tostring(cfg)) return end
+
+print(("minted %s (%s) as %s at %s"):format(
+name, role, lease.instance, ip.format(lease.address)))
+if (cfg.toFetch or 0) > 0 then
+
+print(("its other %d files it fetches on first boot, from the dist repo"):format(
+cfg.toFetch))
+end
+print("take it out, place it, and turn it on -- it enrolls by itself")
+
+elseif cmd == "role" then
+if not args[2] or not args[3] then usage() return end
+local status, fields = operatorInvoke("assign_role", {node = args[2], role = args[3]})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+print(("%s is now a %s -- config rev %d"):format(args[2], fields.role, fields.rev))
+print("it takes effect when the node is given this config (at mint, for now)")
+
+elseif cmd == "config" then
+if not args[2] then usage() return end
+if args[3] then
+local status, fields = operatorInvoke("set_config",
+{node = args[2], key = args[3], value = args[4]})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+print(("%s %s %s -- config rev %d"):format(args[2], args[3],
+args[4] and ("= " .. args[4]) or "cleared", fields.rev))
+return
+end
+local status, fields = operatorInvoke("show_config", {node = args[2]})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+local doc = fields.config
+print(("%s: %s on a %s, config rev %d"):format(doc.node, doc.role, doc.platform, doc.rev))
+print("  firmware  " .. (doc.firmware and doc.firmware:sub(1, 16) or "(not published -- run publish)"))
+local names = {}
+for name in pairs(doc.settings) do names[#names + 1] = name end
+table.sort(names)
+for _, name in ipairs(names) do
+print(("  %-10s %s"):format(name, tostring(doc.settings[name])))
+end
+for i, entry in ipairs(doc.equipment) do
+print(("  slot %d    %s%s"):format(i, table.concat(entry, " or "), entry.pinned and "  (pinned)" or ""))
+end
+print(("  %d actions"):format(#doc.actions))
+local seen = fields.observed
+if seen then
+print(("  reports   firmware %s, rev %s, %s%s"):format(
+tostring(seen.firmware):sub(1, 16), tostring(seen.config_rev), tostring(seen.boot_state),
+seen.verified and "" or "  (name unverified)"))
+if seen.equipment_missing then
+print("  missing   " .. table.concat(seen.equipment_missing, ", "))
+end
+if seen.last_error then print("  last err  " .. tostring(seen.last_error)) end
+else
+print("  reports   nothing yet -- it has not checked in")
+end
+
+elseif cmd == "publish" then
+if not args[2] then usage() return end
+print("checking this controller's files against the manifest...")
+local status, fields = operatorInvoke("publish", {role = args[2]})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+print(("published %s: %d files, %d bytes, firmware %s"):format(
+fields.role, fields.files, fields.bytes, fields.firmware:sub(1, 16)))
+
+elseif cmd == "signals" then
+
+local status, fields = operatorInvoke("signals", {})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+if #fields.signals == 0 then print("no signal ports -- a machine script declares them") end
+for _, s in ipairs(fields.signals) do
+local where = s.bound and (s.device .. " " .. s.face) or "UNBOUND"
+print(("%-18s %-6s %-5s %-3s %s%s"):format(s.path, s.direction, s.kind,
+s.level and tostring(s.level) or "?", where,
+s.owner and ("  held by " .. s.owner) or ""))
+if s.problem and s.bound then printError("    " .. s.problem) end
+end
+
+elseif cmd == "signal" then
+
+local path, what = args[2], args[3]
+if not path then
+printError("usage: mfgctl signal <path> [<level> | pulse <ticks> | release]")
+return
+end
+local status, fields
+if not what then
+status, fields = operatorInvoke("read_signal", {signal = path})
+if status == "completed" then print(("%s = %d"):format(path, fields.level)) return end
+elseif what == "pulse" then
+status, fields = operatorInvoke("pulse", {signal = path, length = args[4] or "4"})
+elseif what == "release" then
+status, fields = operatorInvoke("release_signal", {signal = path})
+else
+status, fields = operatorInvoke("set_signal", {signal = path, level = what})
+end
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+print("done")
+
+elseif cmd == "script" or cmd == "scripts" then
+
+
+local verb = cmd == "scripts" and "list" or args[2]
+local target = args[3]
+
+if verb == "check" then
+local source = scriptFile(target)
+if not source then return end
+local _, fields = operatorInvoke("check_script", {source = source})
+if fields.ok then print("ok: machine type " .. tostring(fields.machine)) end
+problems(fields.errors, "error", true)
+problems(fields.warnings, "warning")
+if fields.ok then footprint(fields.footprint) end
+
+elseif verb == "load" then
+loadScript(target)
+
+elseif verb == "forget" then
+if not target then printError("usage: mfgctl script forget <script>") return end
+local status, fields = operatorInvoke("forget_script", {script = target})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+print("forgot script " .. target)
+
+elseif verb == "list" then
+local status, fields = operatorInvoke("scripts", {})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+if #fields.scripts == 0 then print("no scripts") end
+for _, s in ipairs(fields.scripts) do
+print(("%-14s rev %-3d machines: %s"):format(s.script, s.rev,
+#s.machines > 0 and table.concat(s.machines, ", ") or "none"))
+end
+
+else
+printError("usage: mfgctl script check|load <file> | forget <script> | list")
+end
+
+elseif cmd == "machine" or cmd == "machines" then
+
+
+local verb = cmd == "machines" and "list" or args[2]
+local target = args[3]
+
+if verb == "limit" then
+
+local item, at = args[4], args[5]
+if not target or not item then
+printError("usage: mfgctl machine limit <machine> <item> <at> [resume <n>] | off")
+return
+end
+local params = {machine = target}
+if item ~= "off" then
+params.item, params.at = item, at
+if args[6] == "resume" then params.resume = args[7] end
+end
+local status, fields = operatorInvoke("limit_machine", params)
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+local limit = fields.limit
+if limit then
+print(("%s pauses at %d %s, resumes below %d"):format(target, limit.at,
+limit.item, limit.resume))
+else
+print(target .. " has no limit")
+end
+
+elseif verb == "enable" or verb == "disable" or verb == "forget" then
+if not target then printError("usage: mfgctl machine " .. verb .. " <machine>") return end
+local status, fields = operatorInvoke(verb .. "_machine", {machine = target})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+print(("%s %s"):format(verb == "forget" and "forgot" or (verb .. "d"), target))
+if verb == "forget" and fields.unbound and #fields.unbound > 0 then
+print("  unbound: " .. table.concat(fields.unbound, ", "))
+end
+
+elseif verb == "list" then
+local status, fields = operatorInvoke("scripts", {})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+if #fields.machines == 0 then
+print("no machines -- mfgctl bind --script <file> /<name> <inventory>")
+end
+for _, m in ipairs(fields.machines) do
+print(("%-10s %-12s rev %-3s %-8s %s"):format(m.machine, m.script,
+tostring(m.rev), m.state, m.enabled and "enabled" or "disabled"))
+if m.state == "paused" and m.pausedBy then print("    " .. m.pausedBy) end
+if m.lastError then printError("    " .. m.lastError) end
+end
+
+elseif verb == "show" then
+if not target then printError("usage: mfgctl machine show <machine>") return end
+local status, fields = operatorInvoke("scripts", {machine = target})
+if status ~= "completed" then printError(tostring(fields and fields.reason)) return end
+local m = fields.machines[1]
+local lines = {("%s  made from %s rev %s  %s, %s"):format(m.machine, m.script,
+tostring(m.rev), m.state, m.enabled and "enabled" or "disabled")}
+if m.device then lines[#lines + 1] = "inventory: " .. m.device end
+local chestPorts = {}
+for port in pairs(m.chests or {}) do chestPorts[#chestPorts + 1] = port end
+table.sort(chestPorts)
+for _, port in ipairs(chestPorts) do
+lines[#lines + 1] = ("chest: %s <- %s"):format(port, m.chests[port])
+end
+if m.limit then
+lines[#lines + 1] = ("limit: pauses at %d %s, resumes below %d%s"):format(
+m.limit.at, m.limit.item, m.limit.resume,
+m.state == "paused" and m.pausedBy and ("  (paused: " .. m.pausedBy .. ")")
+or "")
+end
+if m.lastError then lines[#lines + 1] = "last error: " .. m.lastError end
+for _, run in ipairs(m.runs or {}) do
+lines[#lines + 1] = ("  %s  %-24s %s%s"):format(
+os.date("%H:%M:%S", math.floor(run.at / 1000)), run.handler,
+run.status, run.reason and (": " .. run.reason) or "")
+end
+lines[#lines + 1] = ""
+lines[#lines + 1] = m.source or ""
+cli.paged(lines)
+
+else
+printError("usage: mfgctl machine enable|disable|forget|show <machine> | limit "
+.. "<machine> <item> <at> [resume <n>] | machines")
+end
+else
+printError("unknown command: " .. tostring(cmd))
+usage()
+end

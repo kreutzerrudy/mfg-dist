@@ -1,0 +1,20 @@
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+
+
+function backend.list()
+local out = {}
+for _, name in ipairs(peripheral.getNames()) do
+out[name] = {peripheral.getType(name)}
+end
+return out
+end
+
+return backend

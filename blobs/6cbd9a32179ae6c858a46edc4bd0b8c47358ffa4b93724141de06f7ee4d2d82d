@@ -1,0 +1,293 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+
+local panes = {}
+
+
+
+
+
+
+
+
+
+
+
+panes.TOP = "top"
+panes.LEFT = "left"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+panes.LEADER = "tab"
+
+
+panes.CYCLE = panes.LEADER
+
+function panes.new(opts)
+opts = opts or {}
+return {
+title = opts.title,
+edge = opts.edge or panes.TOP,
+width = opts.width or 12,
+apps = {},
+order = {},
+current = nil,
+}
+end
+
+
+
+
+
+
+
+
+
+
+function panes.add(host, app)
+if type(app) ~= "table" or type(app.name) ~= "string" then
+return nil, "an app needs a name"
+end
+if type(app.render) ~= "function" then
+return nil, ("app %s needs a render function"):format(app.name)
+end
+if host.apps[app.name] then
+return nil, ("app %s is already declared"):format(app.name)
+end
+
+host.apps[app.name] = app
+host.order[#host.order + 1] = app.name
+if not host.current then host.current = app.name end
+return app
+end
+
+function panes.select(host, name)
+if not host.apps[name] then return false, "no such app: " .. tostring(name) end
+host.current = name
+return true
+end
+
+function panes.app(host)
+return host.apps[host.current]
+end
+
+
+
+local function indexElement(host, across)
+local children = {}
+
+
+
+
+
+local heading = host.title
+if host.leaderPending then
+heading = (heading and (heading .. " ") or "") .. "TAB.."
+elseif heading then
+heading = heading .. " tab+"
+end
+
+if heading and across then
+children[#children + 1] = doc.text(heading, {
+colour = host.leaderPending and "warn" or "label",
+keep = 3, name = "title"})
+children[#children + 1] = doc.gap(1)
+end
+
+for i, name in ipairs(host.order) do
+local app = host.apps[name]
+if across and i > 1 then children[#children + 1] = doc.gap(1) end
+
+local usable = (app.ready == nil) or app.ready()
+children[#children + 1] = doc.button(app.label or name, {
+
+
+key = input.scoped(panes.LEADER, app.key or tostring(i)),
+keyLabel = app.key or tostring(i),
+colour = (host.current == name) and "selected"
+or (usable and "action" or "dim"),
+action = {kind = "app", app = name},
+style = "tab",
+
+
+keep = (host.current == name) and doc.REQUIRED or (app.keep or (9 - i)),
+name = name,
+})
+end
+
+if across then
+
+return doc.row(children, {keep = doc.REQUIRED, name = "index", bg = "bar"})
+end
+return doc.stack(children, {width = host.width, keep = doc.REQUIRED,
+name = "index"})
+end
+
+panes.indexElement = indexElement
+
+
+
+
+
+
+
+
+function panes.document(host, width, height)
+local app = panes.app(host)
+if not app then
+return doc.stack({
+doc.text("NO APPS", {colour = "bad", keep = doc.REQUIRED}),
+}, {name = "empty"})
+end
+
+if host.edge == panes.LEFT then
+local paneWidth = math.max(1, width - host.width - 1)
+return doc.row({
+indexElement(host, false),
+doc.gap(1),
+app.render(paneWidth, height),
+}, {name = "host"})
+end
+
+local paneHeight = math.max(1, height - 1)
+return doc.stack({
+indexElement(host, true),
+app.render(width, paneHeight),
+}, {name = "host"})
+end
+
+function panes.render(host, width, height, opts)
+return doc.render(panes.document(host, width, height), width, height, opts)
+end
+
+
+
+
+
+
+
+
+function panes.shadowed(host, grid)
+local out = {}
+for _, name in ipairs(host.order) do
+local app = host.apps[name]
+if app.key then
+local bound = (grid.keys or {})[input.scoped(panes.LEADER, app.key)]
+if not bound or bound.kind ~= "app" or bound.app ~= name then
+out[#out + 1] = {app = name, key = app.key}
+end
+end
+end
+return out
+end
+
+
+
+
+
+function panes.handle(host, event, grid)
+if not event then return false end
+
+local isLeader = event.kind == "key" and keys
+and event.key == keys[panes.LEADER]
+
+
+if isLeader and host.leaderPending then
+host.leaderPending = false
+local at = 1
+for i, name in ipairs(host.order) do
+if name == host.current then at = i end
+end
+local nextName = host.order[(at % #host.order) + 1]
+if nextName then panes.select(host, nextName) end
+return true, {kind = "app", app = host.current}
+end
+
+
+
+if isLeader then
+host.leaderPending = true
+return true, {kind = "leader"}
+end
+
+
+
+
+
+if host.leaderPending then
+host.leaderPending = false
+local scoped = input.actionFor(grid, event, {leader = panes.LEADER})
+if scoped and scoped.kind == "app" then
+panes.select(host, scoped.app)
+return true, scoped
+end
+
+if event.kind == "char" then
+for i, name in ipairs(host.order) do
+local app = host.apps[name]
+if (app.key or tostring(i)) == event.char then
+panes.select(host, name)
+return true, {kind = "app", app = name}
+end
+end
+end
+return false
+end
+
+local action = input.actionFor(grid, event)
+if not action then
+
+
+
+local app = panes.app(host)
+if app and app.handle then return app.handle(nil, event) end
+return false
+end
+
+if action.kind == "app" then
+panes.select(host, action.app)
+return true, action
+end
+
+local app = panes.app(host)
+if app and app.handle then return app.handle(action, event), action end
+return false, action
+end
+
+return panes

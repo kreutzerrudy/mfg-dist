@@ -1,0 +1,46 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "show_me",
+label       = "Bind by showing, or by a new device",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "path", label = "Path", type = "text", required = false},
+{name = "mode", label = "Mode", type = "choice", choices = {"show", "new"},
+required = false},
+{name = "answer", label = "Bind the device found", type = "flag", required = false},
+{name = "cancel", label = "Cancel", type = "flag", required = false},
+},
+
+returns = {instructions = "text", seconds = "number"},
+
+run = function(params, ctx)
+if params.cancel then
+return rpc.COMPLETED, {cancelled = binder.showCancel()}
+end
+if params.answer ~= nil then
+local said, why = binder.showConfirm(params.answer)
+if not said then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {said = said}
+end
+local show, said = binder.showStart(params.path, ctx.by, params.mode)
+if not show then return rpc.REJECTED, {reason = tostring(said)} end
+return rpc.COMPLETED, {path = show.path, mode = show.mode, instructions = said,
+seconds = binder.WAIT}
+end,
+}

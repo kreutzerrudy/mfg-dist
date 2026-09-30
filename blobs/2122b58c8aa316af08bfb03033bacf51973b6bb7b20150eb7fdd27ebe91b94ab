@@ -1,0 +1,114 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local hal = {}
+
+local CONFIG = "/mfg/hal.cfg"
+
+local function configured()
+local text = require("mfg.common.state").readText(CONFIG)
+if not text then return nil end
+local mode = text:match("^%s*([%a]+)")
+if mode == "real" or mode == "mock" then return mode end
+return nil
+end
+
+function hal.mode()
+return configured() or (turtle and "real" or "real")
+end
+
+
+
+
+
+function hal.turtle()
+if hal.mode() == "mock" then return require("mfg.common.hal.turtle_mock") end
+return require("mfg.common.hal.turtle_real")
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function hal.redstone()
+if hal.mode() == "mock" then return require("mfg.common.hal.rs_mock") end
+return require("mfg.common.hal.rs_real")
+end
+
+
+
+function hal.peripherals()
+if hal.mode() == "mock" then return require("mfg.common.hal.periph_mock") end
+return require("mfg.common.hal.periph_real")
+end
+
+
+function hal.printer()
+if hal.mode() == "mock" then return require("mfg.common.hal.printer_mock") end
+return require("mfg.common.hal.printer_real")
+end
+
+local INVENTORY_BACKENDS = {
+mock = "mfg.storage.hal.inv_mock",
+real = "mfg.storage.hal.inv_real",
+}
+
+function hal.inventory()
+local name = INVENTORY_BACKENDS[hal.mode()] or INVENTORY_BACKENDS.real
+local ok, backend = pcall(require, name)
+if ok then return backend end
+
+error("no inventory backend on this node: " .. name .. " is not installed. "
+.. "A turtle deliberately does not carry mfg/storage (N4.3, R9.13) -- "
+.. "addressing inventories by name is the controller's job.", 2)
+end
+
+return hal
