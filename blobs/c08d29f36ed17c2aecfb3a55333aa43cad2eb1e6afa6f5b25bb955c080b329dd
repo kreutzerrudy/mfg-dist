@@ -1,0 +1,1150 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local hal = require("mfg.common.hal")
+local mount = require("mfg.storage.mount")
+local marks = require("mfg.storage.marks")
+
+local binder = {}
+
+binder.STATE = "binder"
+binder.SCAN = 5
+binder.IDLE_SCAN = 30
+binder.WAIT = 60
+binder.SETTLE = 3
+binder.TRAY_WAIT = 5
+binder.PAGE_WIDTH = 25
+
+binder.IN, binder.OUT = "/io/in", "/io/out"
+
+
+function binder.clock() return os.epoch("utc") end
+
+local function load()
+local data = state.read(binder.STATE, {})
+if type(data) ~= "table" then data = {} end
+return data
+end
+
+local function save(data) state.write(binder.STATE, data) end
+
+local function poolPath()
+local ok, config = pcall(require, "mfg.common.config")
+return (ok and config.setting("source")) or "/pool"
+end
+
+local function has(list, value)
+for _, v in ipairs(list or {}) do if v == value then return true end end
+return false
+end
+
+
+
+
+local function portSlots(record, name)
+local script = require("mfg.controller.scripts").get(record.script or "")
+for _, port in ipairs(script and script.ports or {}) do
+if port.name == name then return port.slots end
+end
+return nil
+end
+
+
+
+
+
+
+function binder.target(path)
+if type(path) ~= "string" or path == "" then return nil, "no path given" end
+local pool = poolPath()
+if path == pool then
+return {path = path, kind = "pool", methods = {"new", "page", "show"},
+words = "a new chest for the pool"}
+elseif path == binder.IN then
+return {path = path, kind = "door", methods = {"new", "page", "show"},
+words = "the chest players put things in"}
+elseif path == binder.OUT then
+return {path = path, kind = "door", methods = {"new", "page", "show"},
+words = "the chest withdrawals land in"}
+elseif path == marks.TRAY then
+return {path = path, kind = "tray", methods = {"new", "show"},
+words = "the chest under the printer's hopper"}
+end
+local record = mount.get(path)
+
+
+if record and not record.machine and not mount.isSignal(record)
+and path:sub(1, #pool + 1) == pool .. "/" then
+return {path = path, kind = "member", holds = record.holds,
+methods = {"new", "show", "page"},
+words = record.holds and ("the store for %s"):format(record.holds)
+or "the pool's general chests"}
+end
+if not record or not record.machine then
+return nil, ("%s can't be bound from here: only a machine's port, %s, %s, %s "
+.. "or %s"):format(path, binder.IN, binder.OUT, pool, marks.TRAY)
+end
+local name = path:match("[^/]+$")
+local machine = require("mfg.controller.scripts").machine(record.machine)
+local t = {path = path, machine = record.machine, port = name,
+script = machine and machine.script or record.script,
+direction = record.direction}
+if mount.isSignal(record) then
+t.kind, t.methods = "signal", {"new", "show"}
+t.words = ("%s's %s signal (%s)"):format(record.machine, name,
+tostring(record.direction))
+return t
+end
+t.slots = portSlots(record, name)
+if t.slots then
+
+t.kind, t.methods = "inventory", {"new", "show", "page"}
+else
+t.kind, t.methods = "chest", {"new", "page", "show"}
+end
+t.words = ("%s's %s chest (%s)"):format(record.machine, name,
+tostring(record.direction))
+return t
+end
+
+
+
+function binder.instructions(t, mode)
+if mode == "new" then
+return "Turn on the modem of the one block to bind (right-click it). If it is "
+.. "already on, stop, turn it off, start again, then turn it on."
+end
+if t.kind == "signal" then
+return "Power the face you wired, for a moment: flip a lever or press a "
+.. "button on the wire to it."
+elseif t.kind == "inventory" then
+return ("Put one item %s accepts into it now."):format(t.machine)
+elseif t.kind == "pool" then
+return "Put any item into the new pool chest now."
+end
+return ("Put any item into %s now."):format(t.words)
+end
+
+
+
+
+
+local function holding(device)
+local inv = hal.inventory()
+if not inv.isPresent(device) then return 0 end
+local n = 0
+for _, stack in pairs(inv.list(device) or {}) do
+if stack.name ~= marks.PAGE then n = n + stack.count end
+end
+return n
+end
+
+
+
+local function bindTo(t, device, opts)
+opts = opts or {}
+local store = require("mfg.storage")
+local by = opts.by or "binder"
+if t.kind == "pool" or t.kind == "member" then
+
+local path = t.kind == "pool" and mount.home(t.path) or t.path
+local record, why = store.extend(path, {device},
+{coherence = mount.EXCLUSIVE, by = by})
+if not record then return nil, why end
+require("mfg.storage.index").drop(device)
+return true
+elseif t.kind == "door" or t.kind == "tray" then
+local record, why = store.bind(t.path, {device}, {coherence = mount.RELAYED,
+by = by})
+if not record then return nil, why end
+return true
+elseif t.kind == "signal" then
+local record, why = store.bind(t.path, {device}, {face = opts.face, by = by})
+if not record then return nil, why end
+return true
+end
+local scripts = require("mfg.controller.scripts")
+local record, why
+if t.kind == "chest" or opts.asChest then
+record, why = scripts.addMachine(t.machine, t.script, nil, by, {[t.port] = device})
+else
+record, why = scripts.addMachine(t.machine, t.script, device, by)
+end
+if not record then return nil, why end
+return true
+end
+
+
+
+local function repoint(t, old, new, by)
+local n = holding(old)
+if n > 0 then
+return nil, ("%s still holds %d item%s -- empty it first"):format(old, n,
+n == 1 and "" or "s")
+end
+if t.kind == "pool" or t.kind == "member" then
+local path = t.kind == "pool" and mount.home(t.path) or t.path
+local record = mount.get(path)
+local devices = {}
+for _, device in ipairs(record.devices) do
+devices[#devices + 1] = (device == old) and new or device
+end
+local ok, why = require("mfg.storage").bind(path, devices,
+{coherence = record.coherence, holds = record.holds, by = by})
+if not ok then return nil, why end
+require("mfg.storage.index").drop(new)
+require("mfg.storage.index").drop(old)
+return true
+end
+return bindTo(t, new, {by = by, asChest = t.kind == "inventory"})
+end
+
+
+
+local function fit(line)
+if #line > binder.PAGE_WIDTH then return line:sub(1, binder.PAGE_WIDTH) end
+return line
+end
+
+
+local function wrap(text, into)
+local line = ""
+for word in text:gmatch("%S+") do
+if line == "" then
+line = word
+elseif #line + 1 + #word <= binder.PAGE_WIDTH then
+line = line .. " " .. word
+else
+into[#into + 1] = fit(line)
+line = word
+end
+end
+if line ~= "" then into[#into + 1] = fit(line) end
+end
+
+
+function binder.pageText(t, keep)
+local lines = {"mfg bind page", ""}
+if t.machine then
+wrap(("Machine %s (%s), port %s (%s)."):format(t.machine, tostring(t.script),
+t.port, tostring(t.direction)), lines)
+lines[#lines + 1] = ""
+wrap(("Put this page in the chest %s %s."):format(t.machine,
+t.direction == "output" and "puts its output into" or "takes this from"),
+lines)
+elseif t.kind == "pool" then
+wrap("Put this page in a new chest for the pool. The chest joins the pool.",
+lines)
+else
+wrap(("%s: %s. Put this page in that chest."):format(t.path, t.words), lines)
+end
+lines[#lines + 1] = ""
+wrap("It must be a chest on the network, with its modem on.", lines)
+lines[#lines + 1] = ""
+if keep then
+wrap("Leave the page there: it marks the chest, so it is found again if "
+.. "its modem is replaced.", lines)
+else
+wrap("Once the chest is bound, the page goes back to the tray.", lines)
+end
+return lines
+end
+
+
+local function trayPages()
+local inv = hal.inventory()
+local out = {}
+local devices = mount.isBound(marks.TRAY) and (mount.devices(marks.TRAY)) or {}
+for _, tray in ipairs(devices) do
+for slot, stack in pairs(inv.list(tray) or {}) do
+if stack.name == marks.PAGE then
+local key = marks.keyOf(stack.nbt and stack or inv.detail(tray, slot))
+if key then out[key] = {device = tray, slot = slot} end
+end
+end
+end
+return out
+end
+
+
+
+
+function binder.printBlocked()
+local printers = hal.printer()
+local printer = printers.names()[1]
+if not printer then
+return "no printer on the network: cable one to the controller, with paper "
+.. "and ink, and turn its modem on"
+end
+local levels = printers.levels(printer)
+if levels and (levels.paper < 1 or levels.ink < 1) then
+return ("the printer needs %s"):format(levels.paper < 1 and "paper" or "ink")
+end
+if not mount.isBound(marks.TRAY) then
+return ("no page tray: put a hopper under the printer into a cabled chest, "
+.. "and bind it as %s (Storage -> Chests -> tray, show me)"):format(marks.TRAY)
+end
+local present = mount.devices(marks.TRAY)
+if not present or #present == 0 then
+return ("the page tray (%s) is not on the network"):format(marks.TRAY)
+end
+return nil, printer
+end
+
+
+
+
+function binder.print(paths, opts)
+opts = opts or {}
+local keep = opts.keep ~= false
+if type(paths) ~= "table" or #paths == 0 then return nil, "no paths given" end
+local why, printer = binder.printBlocked()
+if why then return nil, why end
+
+local printers = hal.printer()
+local out = {}
+for _, path in ipairs(paths) do
+local t, bad = binder.target(path)
+if t and not has(t.methods, "page") then
+bad = ("%s can't hold a page: use show me"):format(path)
+t = nil
+end
+if not t then
+out[#out + 1] = {path = path, ok = false, text = bad}
+else
+local before = trayPages()
+local title = ("mfg bind %s %s"):format(path, marks.tag())
+local ok, err = printers.print(printer, title, binder.pageText(t, keep))
+local key = nil
+if ok then
+local deadline = binder.clock() + binder.TRAY_WAIT * 1000
+local used = marks.usedKeys()
+repeat
+for found in pairs(trayPages()) do
+if not before[found] and not used[found] then key = found break end
+end
+if key or binder.clock() >= deadline then break end
+sleep(0.5)
+until false
+if not key then
+ok, err = nil, ("no new page reached %s within %ds: is the hopper "
+.. "under the printer, and not locked by redstone?"):format(
+marks.TRAY, binder.TRAY_WAIT)
+end
+end
+if ok then
+local pending = marks.pending()
+pending[key] = {path = path, title = title, at = binder.clock(),
+by = opts.by, keep = keep}
+marks.savePending(pending)
+out[#out + 1] = {path = path, ok = true,
+text = ("printed: %s -- take it from the tray"):format(path)}
+else
+out[#out + 1] = {path = path, ok = false, text = tostring(err)}
+end
+end
+end
+return out
+end
+
+
+function binder.cancel(path)
+local pending = marks.pending()
+local n = 0
+for key, page in pairs(pending) do
+if not path or page.path == path then
+pending[key] = nil
+n = n + 1
+end
+end
+if n > 0 then marks.savePending(pending) end
+return n
+end
+
+
+
+local lastScan = nil
+
+local function isPrinter(kind)
+return type(kind) == "string" and kind:find("printer", 1, true) ~= nil
+end
+
+
+
+local function loosePages()
+local inv = hal.inventory()
+local out = {}
+for _, device in ipairs(mount.unclaimed()) do
+if not isPrinter(inv.kind(device)) then
+for slot, stack in pairs(inv.list(device) or {}) do
+if stack.name == marks.PAGE then
+local key = marks.keyOf(stack.nbt and stack or inv.detail(device, slot))
+if key then
+out[key] = out[key] or {}
+out[key][#out[key] + 1] = {device = device, slot = slot}
+end
+end
+end
+end
+end
+return out
+end
+
+
+local function markerPages()
+local out = {}
+for path, record in pairs(mount.all()) do
+for device, mark in pairs(record.marks or {}) do
+if mark.kind == "page" and mark.key then
+out[mark.key] = {path = path, device = device, mark = mark}
+end
+end
+end
+return out
+end
+
+
+local function bindPage(key, page, where)
+local t, why = binder.target(page.path)
+if not t then return nil, why end
+local by = page.by and ("page:" .. page.by) or "page"
+local ok
+local record = mount.get(page.path)
+local bound = record and #(record.devices or {}) > 0
+if bound and t.kind ~= "pool" and t.kind ~= "member" then
+
+if #record.devices ~= 1 then
+return nil, ("%s is bound to %d devices -- a page can't choose one")
+:format(page.path, #record.devices)
+end
+ok, why = repoint(t, record.devices[1], where.device, by)
+else
+ok, why = bindTo(t, where.device, {by = by, asChest = t.kind == "inventory"})
+end
+if not ok then return nil, why end
+
+local inv = hal.inventory()
+if page.keep ~= false then
+
+local markPath = t.kind == "pool" and mount.home(page.path) or page.path
+marks.adopt(markPath, where.device, where.slot, key, page.title)
+else
+local trays = mount.isBound(marks.TRAY) and (mount.devices(marks.TRAY)) or {}
+if trays[1] then inv.push(where.device, trays[1], where.slot, 1) end
+end
+return true
+end
+
+
+
+function binder.scan()
+lastScan = binder.clock()
+local events = {}
+local pending = marks.pending()
+local markers = markerPages()
+if not next(pending) and not next(markers) then return events end
+
+local loose = loosePages()
+local changed = false
+for key, places in pairs(loose) do
+local page = pending[key]
+local marker = markers[key]
+if page then
+if #places > 1 then
+local names = {}
+for _, p in ipairs(places) do names[#names + 1] = p.device end
+events[#events + 1] = {kind = "ambiguous", path = page.path,
+text = ("the page for %s is in %s -- take it out of all but one")
+:format(page.path, table.concat(names, " and "))}
+else
+local ok, why = bindPage(key, page, places[1])
+if ok then
+pending[key] = nil
+changed = true
+events[#events + 1] = {kind = "bound", path = page.path,
+text = ("bound %s: the chest its page was put in (%s)")
+:format(page.path, places[1].device)}
+else
+events[#events + 1] = {kind = "refused", path = page.path,
+text = ("the page for %s is in %s, but: %s"):format(page.path,
+places[1].device, tostring(why))}
+end
+end
+elseif marker and #places == 1 then
+
+local where = places[1]
+local t = binder.target(marker.path)
+local present = hal.inventory().isPresent(marker.device)
+if t and present then
+local ok, why = repoint(t, marker.device, where.device, "page moved")
+if ok then
+marks.move(marker.path, marker.device, where.device, where.slot)
+events[#events + 1] = {kind = "moved", path = marker.path,
+text = ("re-pointed %s: %s -> %s (its page moved)"):format(
+marker.path, marker.device, where.device)}
+else
+events[#events + 1] = {kind = "stuck", path = marker.path,
+text = ("the page for %s was moved to %s, but %s: put it "
+.. "back, or empty the old chest"):format(marker.path,
+where.device, tostring(why))}
+end
+end
+end
+end
+if changed then marks.savePending(pending) end
+return events
+end
+
+
+
+
+
+function binder.kinds()
+local inv = hal.inventory()
+local counts = {}
+for _, device in ipairs(mount.unclaimed()) do
+local kind = inv.kind(device)
+if kind and not isPrinter(kind) and not mount.isStorage(kind) then
+counts[kind] = (counts[kind] or 0) + 1
+end
+end
+local out = {}
+for kind, count in pairs(counts) do
+local words = ((kind:match(":(.+)$") or kind):gsub("_", " "))
+out[#out + 1] = {kind = kind, words = words, count = count}
+end
+table.sort(out, function(a, b)
+if a.count ~= b.count then return a.count > b.count end
+return a.kind < b.kind
+end)
+return out
+end
+
+
+
+local function manyBlocked(scriptName, group)
+local script = require("mfg.controller.scripts").get(scriptName or "")
+if not script then return ("no script called %s"):format(tostring(scriptName)) end
+if type(group) ~= "string" or not group:match("^[a-z0-9_%-]+$") then
+return ("a group is one lowercase name, like smelter -- not %s"):format(
+tostring(group))
+end
+for _, port in ipairs(script.ports or {}) do
+if port.slots then return nil end
+end
+return ("%s's ports have no slots, so one block can't bind them: give its ports "
+.. "slots in the editor (a furnace: feed slots 1, fuel slots 2, made slots 3)")
+:format(scriptName)
+end
+
+
+
+function binder.nextName(group, scriptName)
+local scripts = require("mfg.controller.scripts")
+local letter = (tostring(scriptName):match("%a") or "m"):lower()
+local n = 1
+while scripts.machine(("%s/%s%d"):format(group, letter, n))
+or #mount.list(("/%s/%s%d"):format(group, letter, n)) > 0 do
+n = n + 1
+end
+return ("%s/%s%d"):format(group, letter, n)
+end
+
+
+
+function binder.makeMany(scriptName, group, kind, by)
+local why = manyBlocked(scriptName, group)
+if why then return nil, why end
+local inv = hal.inventory()
+local devices = {}
+for _, device in ipairs(mount.unclaimed()) do
+if inv.kind(device) == kind then devices[#devices + 1] = device end
+end
+if #devices == 0 then
+return nil, ("no unbound %s on the network"):format(tostring(kind))
+end
+local scripts = require("mfg.controller.scripts")
+local out = {made = {}, failed = {}}
+for _, device in ipairs(devices) do
+local name = binder.nextName(group, scriptName)
+local record, err = scripts.addMachine(name, scriptName, device, by)
+if record then
+out.made[#out.made + 1] = name
+else
+out.failed[#out.failed + 1] = tostring(err)
+end
+end
+return out
+end
+
+
+
+
+
+
+
+
+
+local watching = {}
+
+
+local function signature(listing)
+local parts = {}
+for slot, stack in pairs(listing or {}) do
+parts[#parts + 1] = ("%d:%s:%s:%d"):format(slot, stack.name,
+tostring(stack.nbt), stack.count)
+end
+table.sort(parts)
+return table.concat(parts, ",")
+end
+
+
+
+
+
+local function snapshot(t, show)
+local out = {}
+if show.mode == "new" or show.mode == "many" then
+for name in pairs(hal.peripherals().list()) do out[name] = true end
+return out
+end
+if t.kind == "signal" then
+local rs = hal.redstone()
+local used = {}
+for _, record in pairs(mount.all()) do
+if mount.isSignal(record) and record.face then
+for _, device in ipairs(record.devices or {}) do
+used[device .. "|" .. record.face] = true
+end
+end
+end
+for _, device in ipairs(rs.names()) do
+if not show.only or show.only == device then
+for face in pairs(mount.FACES) do
+local id = device .. "|" .. face
+if not used[id] then
+local ok, level = pcall(rs.getAnalogInput, device, face)
+if ok then out[id] = level end
+end
+end
+end
+end
+return out
+end
+local inv = hal.inventory()
+for _, device in ipairs(mount.unclaimed()) do
+local kind = inv.kind(device)
+if not isPrinter(kind) and not (t.kind == "inventory" and mount.isStorage(kind)) then
+out[device] = signature(inv.list(device))
+end
+end
+return out
+end
+
+
+local function blockWords(kind)
+kind = tostring(kind or "peripheral")
+return ((kind:match(":(.+)$") or kind):gsub("_", " "))
+end
+
+
+local function kindWords(t, id)
+if t.kind == "signal" then return "a redstone face" end
+return "a " .. blockWords(hal.inventory().kind(id) or "inventory")
+end
+
+
+
+function binder.describe(device)
+local inv = hal.inventory()
+if inv.isPresent(device) then
+local size = inv.size(device) or 0
+local items = 0
+for _, stack in pairs(inv.list(device) or {}) do items = items + stack.count end
+return ("a %s (%d slot%s, %s)"):format(blockWords(inv.kind(device)), size,
+size == 1 and "" or "s", items == 0 and "empty"
+or ("%d item%s"):format(items, items == 1 and "" or "s")), "inventory"
+end
+local types = hal.peripherals().list()[device] or {}
+if hal.redstone().isPresent(device) then
+return "a " .. blockWords(types[1] or "redstone device"), "redstone"
+end
+return "a " .. blockWords(types[1]), "other"
+end
+
+
+local function fits(t, device)
+local words, what = binder.describe(device)
+if t.kind == "signal" then
+if what ~= "redstone" then
+return nil, ("that is %s, not a redstone relay or integrator"):format(words)
+end
+elseif what ~= "inventory" then
+return nil, ("that is %s, not something that holds items"):format(words)
+end
+return true
+end
+
+local function finish(data, ok, text)
+local show = data.show
+data.last = {id = show.id, path = show.path, ok = ok, text = text,
+at = binder.clock(), by = show.by}
+data.show = nil
+save(data)
+watching = {}
+return {kind = ok and "shown" or "unshown", path = show.path, text = text}
+end
+
+
+
+local function bindFound(show, t, device, face)
+local by = show.by and ("shown:" .. show.by) or "shown"
+local record = mount.get(show.path)
+if t.kind == "door" or t.kind == "tray" or t.kind == "chest" then
+local old = record and record.devices and record.devices[1]
+if old and old ~= device then return repoint(t, old, device, by) end
+return bindTo(t, device, {by = by})
+end
+return bindTo(t, device, {face = face, by = by})
+end
+
+
+
+function binder.bindDevice(path, device, face, by)
+local t, why = binder.target(path)
+if not t then return nil, why end
+local ok, err = fits(t, device)
+if not ok then return nil, err end
+return bindFound({path = path, by = by}, t, device, face)
+end
+
+binder.fits = fits
+
+
+local function newId(now)
+return ("%d-%d"):format(now, math.random(1, 99999))
+end
+
+
+
+function binder.showStart(path, by, mode, opts)
+mode = mode or "show"
+opts = opts or {}
+local t, why
+if mode == "many" then
+
+why = manyBlocked(opts.script, opts.group)
+if why then return nil, why end
+path = "/" .. opts.group
+t = {kind = "many"}
+else
+t, why = binder.target(path)
+if not t then return nil, why end
+if not has(t.methods, mode) then
+return nil, ("%s can't be bound that way"):format(path)
+end
+end
+local data = load()
+local now = binder.clock()
+local current = data.show
+if current and now < (current.deadline or 0) then
+return nil, ("%s is waiting on %s -- one at a time"):format(
+tostring(current.by or "someone"), current.path)
+end
+data.show = {id = newId(now), path = path, by = by, started = now, mode = mode,
+state = "starting", deadline = now + (binder.WAIT + binder.SETTLE + 5) * 1000,
+script = opts.script, group = opts.group, made = mode == "many" and {} or nil}
+save(data)
+return data.show, binder.instructions(t, mode)
+end
+
+
+function binder.showCancel()
+local data = load()
+local show = data.show
+if not show then return false end
+if show.mode == "many" and #(show.made or {}) > 0 then
+finish(data, true, ("made %d under %s: %s"):format(#show.made, show.path,
+table.concat(show.made, ", ")))
+return true
+end
+finish(data, false, "cancelled")
+return true
+end
+
+
+
+
+function binder.showConfirm(yes)
+local data = load()
+local show = data.show
+if not show or show.state ~= "confirm" then return nil, "nothing is waiting for a yes" end
+if not yes then
+finish(data, false, "not bound: the player said no")
+return "not bound", true
+end
+local t, why = binder.target(show.path)
+if not t then
+finish(data, false, why)
+return nil, why
+end
+if t.kind == "signal" then
+local now = binder.clock()
+show.mode, show.only, show.state = "show", show.candidate, "starting"
+show.id, show.candidate, show.words = newId(now), nil, nil
+show.deadline = now + (binder.WAIT + binder.SETTLE + 5) * 1000
+save(data)
+return binder.instructions(t, "show"), false
+end
+local ok, err = bindFound(show, t, show.candidate)
+if ok then
+finish(data, true, ("bound %s: %s"):format(show.path, tostring(show.words)))
+return "bound " .. show.path, true
+end
+finish(data, false, tostring(err))
+return nil, err
+end
+
+
+local function watchNew(data, show, t, now)
+if show.state == "confirm" then
+if now >= show.deadline then return finish(data, false, "not confirmed in time") end
+return nil
+end
+local current = snapshot(t, show)
+local added, removed = {}, {}
+for name in pairs(current) do
+if not watching.snap[name] and not watching.noisy[name] then added[#added + 1] = name end
+end
+for name in pairs(watching.snap) do
+if not current[name] then removed[#removed + 1] = name end
+end
+table.sort(added)
+
+if now < watching.settleUntil then
+
+for _, name in ipairs(added) do watching.noisy[name] = true end
+watching.snap = current
+return nil
+end
+if show.state ~= "watching" then
+show.state = "watching"
+show.deadline = now + binder.WAIT * 1000
+save(data)
+end
+
+
+local claimed = mount.claimed()
+for _, name in ipairs(removed) do
+watching.snap[name] = nil
+if claimed[name] and show.lost ~= claimed[name] then
+show.lost = claimed[name]
+save(data)
+end
+end
+
+if #added == 1 then
+local device = added[1]
+local ok, why = fits(t, device)
+if not ok then return finish(data, false, why) end
+show.state, show.candidate = "confirm", device
+show.words = (binder.describe(device))
+show.deadline = now + binder.WAIT * 1000
+save(data)
+return nil
+elseif #added > 1 then
+local words = {}
+for i = 1, math.min(#added, 3) do words[#words + 1] = (binder.describe(added[i])) end
+return finish(data, false, ("%d devices were added (%s) -- nothing bound. Turn "
+.. "on one modem at a time, and make sure each modem touches only one "
+.. "block."):format(#added, table.concat(words, ", ")))
+elseif now >= show.deadline then
+return finish(data, false, ("nothing was added in %d seconds -- if its modem "
+.. "was already on, turn it off, start again, then turn it on"):format(
+binder.WAIT))
+end
+return nil
+end
+
+
+
+local function watchMany(data, show, now)
+local current = snapshot(nil, show)
+local added = {}
+for name in pairs(current) do
+if not watching.snap[name] and not watching.noisy[name] then added[#added + 1] = name end
+end
+table.sort(added)
+if now < watching.settleUntil then
+for _, name in ipairs(added) do watching.noisy[name] = true end
+watching.snap = current
+return nil
+end
+if show.state ~= "watching" then
+show.state = "watching"
+show.deadline = now + binder.WAIT * 1000
+save(data)
+end
+for _, name in ipairs(added) do watching.snap[name] = true end
+
+if #added == 1 then
+local device = added[1]
+local words, what = binder.describe(device)
+if what ~= "inventory" then
+show.note = ("that was %s, not a machine -- skipped"):format(words)
+else
+local name = binder.nextName(show.group, show.script)
+local record, err = require("mfg.controller.scripts").addMachine(name,
+show.script, device, show.by and ("shown:" .. show.by) or "shown")
+if record then
+show.made[#show.made + 1] = name
+show.note = ("made %s from %s"):format(name, words)
+else
+show.note = ("%s: %s -- skipped"):format(words, tostring(err))
+end
+end
+show.deadline = now + binder.WAIT * 1000
+save(data)
+elseif #added > 1 then
+show.note = ("%d devices at once -- skipped. Turn on one modem at a time, and "
+.. "make sure each modem touches only one block."):format(#added)
+show.deadline = now + binder.WAIT * 1000
+save(data)
+elseif now >= show.deadline then
+if #show.made > 0 then
+return finish(data, true, ("made %d under %s: %s"):format(#show.made,
+show.path, table.concat(show.made, ", ")))
+end
+return finish(data, false, ("nothing was added in %d seconds"):format(binder.WAIT))
+end
+return nil
+end
+
+
+local function watch(data, now)
+local show = data.show
+if show.mode == "many" then
+if watching.id ~= show.id then
+watching = {id = show.id, snap = snapshot(nil, show),
+settleUntil = now + binder.SETTLE * 1000, noisy = {}}
+show.state = "settling"
+save(data)
+return nil
+end
+return watchMany(data, show, now)
+end
+local t, why = binder.target(show.path)
+if not t then return finish(data, false, why) end
+
+if watching.id ~= show.id then
+watching = {id = show.id, snap = snapshot(t, show),
+settleUntil = now + binder.SETTLE * 1000, noisy = {}}
+show.state = "settling"
+save(data)
+return nil
+end
+if show.mode == "new" then return watchNew(data, show, t, now) end
+
+local current = snapshot(t, show)
+local changed = {}
+for id, value in pairs(current) do
+local before = watching.snap[id]
+if before == nil then
+watching.snap[id] = value
+elseif before ~= value and not watching.noisy[id] then
+changed[#changed + 1] = id
+end
+end
+table.sort(changed)
+
+if now < watching.settleUntil then
+
+for _, id in ipairs(changed) do watching.noisy[id] = true end
+watching.snap = current
+return nil
+end
+if show.state ~= "watching" then
+show.state = "watching"
+show.deadline = now + binder.WAIT * 1000
+save(data)
+end
+
+if #changed == 1 then
+local id = changed[1]
+local device, face = id, nil
+if t.kind == "signal" then device, face = id:match("^(.*)|(%a+)$") end
+local ok, err = bindFound(show, t, device, face)
+if ok then
+return finish(data, true, ("bound %s"):format(show.path))
+end
+return finish(data, false, tostring(err))
+elseif #changed > 1 then
+local words = {}
+for i = 1, math.min(#changed, 3) do words[#words + 1] = kindWords(t, changed[i]) end
+return finish(data, false, ("%d things changed at once (%s) -- nothing bound; "
+.. "try again"):format(#changed, table.concat(words, ", ")))
+elseif now >= show.deadline then
+local left = next(watching.noisy) and " (anything already working was left "
+.. "out: stop it, then try again)" or ""
+return finish(data, false, ("nothing changed in %d seconds%s"):format(
+binder.WAIT, left))
+end
+return nil
+end
+
+
+
+
+
+function binder.tick()
+local now = binder.clock()
+local events = {}
+local data = load()
+if data.show then
+local event = watch(data, now)
+if event then events[#events + 1] = event end
+end
+local every = next(marks.pending()) and binder.SCAN or binder.IDLE_SCAN
+if not lastScan or now - lastScan >= every * 1000 then
+for _, event in ipairs(binder.scan()) do events[#events + 1] = event end
+end
+return events
+end
+
+
+function binder._reset()
+lastScan, watching = nil, {}
+end
+
+
+
+local function waitingPaths()
+local waiting = {}
+for _, page in pairs(marks.pending()) do waiting[page.path] = true end
+return waiting
+end
+
+
+
+function binder.doors()
+local waiting = waitingPaths()
+local out = {}
+local pool = poolPath()
+local paths = {binder.IN, binder.OUT, marks.TRAY, pool}
+
+for _, member in ipairs(mount.members(pool)) do paths[#paths + 1] = member end
+for _, path in ipairs(paths) do
+local t = binder.target(path)
+if t then
+local record = mount.get(path)
+local devices = record and #(record.devices or {}) or 0
+if t.kind == "pool" then devices = #((mount.devices(path)) or {}) end
+if t.kind == "pool" and not record then
+devices = 0
+for _, member in ipairs(mount.members(path)) do
+devices = devices + #(mount.get(member).devices or {})
+end
+end
+out[#out + 1] = {path = path, kind = t.kind, words = t.words,
+methods = t.methods, devices = devices, holds = t.holds,
+pending = waiting[path] or nil}
+end
+end
+return out
+end
+
+
+
+
+function binder.addStore(name, holds)
+local pool = poolPath()
+if type(name) ~= "string" or not name:match("^[a-z0-9_%-]+$") then
+return nil, ("a store's name is one lowercase word, like wood -- not %s"):format(
+tostring(name))
+end
+if name == mount.GENERAL then
+return nil, ("%s is the pool's general chests"):format(mount.GENERAL)
+end
+if type(holds) ~= "string" or not holds:match("^#?[%w_%-%.]+:[%w_%-%./]+$") then
+return nil, ("a store holds an item, like minecraft:oak_log, or a tag, like "
+.. "#minecraft:logs -- not %s"):format(tostring(holds))
+end
+if mount.get(pool) then mount.migrateGroup(pool) end
+local path = pool .. "/" .. name
+if mount.get(path) then return nil, path .. " already exists" end
+local record, why = mount.declare(path, {holds = holds, coherence = mount.EXCLUSIVE})
+if not record then return nil, why end
+return path
+end
+
+
+
+function binder.todo()
+local machines = require("mfg.controller.machines")
+local waiting = waitingPaths()
+local out = {}
+for _, machine in ipairs(machines.all()) do
+for _, record in ipairs(machines.unbound(machine)) do
+local t = binder.target(record.path)
+if t then
+out[#out + 1] = {path = record.path, machine = machine, script = t.script,
+port = t.port, kind = t.kind, direction = record.direction,
+signal = mount.isSignal(record) or nil, words = t.words,
+methods = t.methods, pending = waiting[record.path] or nil}
+end
+end
+end
+return out
+end
+
+
+
+function binder.status(prefix)
+local now = binder.clock()
+local pages = {}
+for _, page in pairs(marks.pending()) do
+local p = page.path
+if not prefix or p == prefix or p:sub(1, #prefix + 1) == prefix .. "/" then
+pages[#pages + 1] = {path = p, at = page.at, by = page.by, keep = page.keep}
+end
+end
+table.sort(pages, function(a, b)
+if a.path ~= b.path then return a.path < b.path end
+return (a.at or 0) < (b.at or 0)
+end)
+local data = load()
+local show = data.show
+if show and now >= (show.deadline or 0) + 5000 then show = nil end
+local out = {pages = pages, last = data.last, now = now}
+if show then
+local instructions
+if show.mode == "many" then
+instructions = ("Turn on the machines' modems ONE AT A TIME; each becomes "
+.. "the next %s under %s. Done when you are."):format(
+tostring(show.script), show.path)
+else
+local t = binder.target(show.path)
+instructions = t and binder.instructions(t, show.mode) or nil
+end
+out.show = {path = show.path, by = show.by, state = show.state, mode = show.mode,
+left = math.max(0, math.floor(((show.deadline or now) - now) / 1000)),
+instructions = instructions,
+found = show.state == "confirm" and show.words or nil, lost = show.lost,
+made = show.made, note = show.note}
+end
+return out
+end
+
+return binder
