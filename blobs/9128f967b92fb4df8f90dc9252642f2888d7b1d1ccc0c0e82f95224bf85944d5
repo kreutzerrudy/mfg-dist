@@ -1,0 +1,107 @@
+
+
+
+
+
+
+
+
+
+
+
+local store = require("mfg.storage")
+local actions = require("mfg.common.actions")
+local rpc = require("mfg.common.rpc")
+
+local ports = {}
+
+ports.IN = "/io/in"
+ports.OUT = "/io/out"
+ports.POLL = 5
+ports.TIDY = 30
+
+
+function ports.contents(path)
+if not store.isBound(path) then return {} end
+return store.stock(path) or {}
+end
+
+
+
+
+
+
+function ports.intake(opts)
+opts = opts or {}
+if not store.isBound(ports.IN) then return nil end
+if next(ports.contents(ports.IN)) == nil then return nil end
+local invoke = opts.invoke or actions.invoke
+return invoke("take_in", {}, {by = "intake"})
+end
+
+
+
+
+function ports.fullText(pool, left, from)
+local byStore = {}
+for item, count in pairs(left) do
+local where = pool
+if store.isGroup(pool) then
+local _, storePath = store.allowedFor(pool, item)
+where = storePath or pool
+end
+byStore[where] = byStore[where] or {}
+table.insert(byStore[where], ("%d %s"):format(count, item))
+end
+local parts = {}
+for where, items in pairs(byStore) do
+table.sort(items)
+parts[#parts + 1] = ("%s is full: %s"):format(where, table.concat(items, ", "))
+end
+table.sort(parts)
+return ("%s -- still waiting in %s"):format(table.concat(parts, "; "), from)
+end
+
+
+
+
+
+function ports.tidy(pool)
+pool = pool or require("mfg.common.config").setting("source")
+if not store.isGroup(pool) then return 0 end
+local moved = 0
+for _, member in ipairs(store.members(pool)) do
+local record = store.mounts()[member]
+if record and not record.holds and #(record.devices or {}) > 0 then
+for item in pairs(store.manifest(member) or {}) do
+local _, storePath = store.allowedFor(pool, item)
+if storePath and (store.room(storePath, item) or 0) > 0 then
+moved = moved + (store.move(member, storePath, item, 64) or 0)
+end
+end
+end
+end
+return moved
+end
+
+
+function ports.run(opts)
+local lastTidy = 0
+while true do
+local ok, status, fields = pcall(ports.intake, opts)
+if not ok then
+print("intake: " .. tostring(status))
+elseif status and status ~= rpc.COMPLETED then
+print("intake: " .. tostring(fields and fields.reason))
+end
+local now = os.epoch("utc")
+if now - lastTidy >= ports.TIDY * 1000 then
+lastTidy = now
+local tidied, why = pcall(ports.tidy)
+if not tidied then print("tidy: " .. tostring(why)) end
+end
+sleep(ports.POLL)
+end
+end
+
+return ports

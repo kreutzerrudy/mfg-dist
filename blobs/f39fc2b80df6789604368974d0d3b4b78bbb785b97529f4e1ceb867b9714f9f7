@@ -1,0 +1,56 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+
+
+
+
+return {
+name        = "bind_pages",
+label       = "What is waiting to be bound",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "prefix", label = "Prefix", type = "text", required = false},
+},
+
+returns = {pages = "table", show = "table", last = "table", now = "number"},
+
+run = function(params)
+local scripts = require("mfg.controller.scripts")
+local out = binder.status(params.prefix)
+out.printBlocked = binder.printBlocked()
+out.doors = binder.doors()
+out.todo = binder.todo()
+out.kinds = binder.kinds()
+
+local pool = require("mfg.common.config").setting("source")
+local store = require("mfg.storage")
+local names = store.describe(pool) or {}
+out.items = {}
+for item in pairs(store.stock(pool) or {}) do
+local known = names[item]
+out.items[#out.items + 1] = {item = item, name = known and known.name or item}
+end
+table.sort(out.items, function(a, b) return a.name:lower() < b.name:lower() end)
+out.types, out.machines = {}, {}
+for _, record in ipairs(scripts.all()) do
+
+
+local slotted = false
+for _, port in ipairs(record.ports or {}) do
+if port.slots then slotted = true end
+end
+out.types[#out.types + 1] = {script = record.name, rev = record.rev,
+slotted = slotted}
+end
+for _, record in ipairs(scripts.machines()) do
+out.machines[#out.machines + 1] = record.name
+end
+return rpc.COMPLETED, out
+end,
+}

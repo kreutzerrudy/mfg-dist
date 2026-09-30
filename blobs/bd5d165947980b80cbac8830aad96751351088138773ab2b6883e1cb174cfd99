@@ -1,0 +1,1160 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local hal = require("mfg.common.hal")
+local mount = require("mfg.storage.mount")
+local index = require("mfg.storage.index")
+local marks = require("mfg.storage.marks")
+
+local store = {}
+
+store.EXCLUSIVE = mount.EXCLUSIVE
+store.RELAYED = mount.RELAYED
+
+
+
+
+
+local YIELD_EVERY = 8
+
+
+
+
+local ASSUMED_STACK = 64
+
+
+
+
+
+
+
+
+function store.key(name, nbt)
+if nbt == nil or nbt == "" then return name end
+return name .. "#" .. nbt
+end
+
+function store.parse(key)
+local name, nbt = key:match("^([^#]+)#(.+)$")
+if name then return name, nbt end
+return key, nil
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function store.selector(sel)
+if type(sel) == "table" then return sel end
+if type(sel) ~= "string" then return nil end
+if sel:sub(1, 1) == "#" then
+return {kind = "tag", tag = sel:sub(2)}
+end
+local name, nbt = sel:match("^([^#]+)#(.+)$")
+if name then return {kind = "key", name = name, nbt = nbt, key = sel} end
+return {kind = "id", name = sel}
+end
+
+
+
+
+
+
+
+
+
+
+
+
+local attrs = {}
+
+function store.forget()
+attrs = {}
+index.reset()
+end
+
+
+
+
+
+
+
+local function learn(key, device, slot)
+if attrs[key] then return attrs[key] end
+if not device or not slot then return nil end
+
+local detail = hal.inventory().detail(device, slot)
+if not detail then return nil end
+
+attrs[key] = {
+maxCount = detail.maxCount,
+tags = detail.tags or {},
+displayName = detail.displayName,
+}
+return attrs[key]
+end
+
+
+
+local function stackLimit(key, sample)
+local known = attrs[key]
+if not known and sample then known = learn(key, sample.device, sample.slot) end
+if known and known.maxCount then return known.maxCount, true end
+return ASSUMED_STACK, false
+end
+
+local function tagsOf(key, sample)
+local known = attrs[key]
+if not known and sample then known = learn(key, sample.device, sample.slot) end
+return known and known.tags or nil
+end
+
+
+
+
+
+
+local function satisfies(selector, key, sample)
+if selector.kind == "id" then
+local name = store.parse(key)
+return name == selector.name, true
+elseif selector.kind == "key" then
+return key == selector.key, true
+elseif selector.kind == "tag" then
+local tags = tagsOf(key, sample)
+if not tags then return false, false end
+return tags[selector.tag] == true, true
+end
+return false, true
+end
+
+
+
+
+
+
+local function cacheable(record)
+return record.coherence == mount.EXCLUSIVE
+end
+
+local function listingOf(device, useCache)
+if useCache then
+local entry = index.get(device)
+if entry then return entry.listing, entry.size end
+end
+
+local inv = hal.inventory()
+local listing = inv.list(device)
+if not listing then return nil, nil end
+local size = inv.size(device) or 0
+
+if useCache then index.put(device, listing, size) end
+return listing, size
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function devicesOf(path, record)
+local present, missing = mount.devices(path)
+if missing and #missing > 0 and record.marks and not mount.isSignal(record) then
+local rebound = marks.recover(path, missing)
+if #rebound > 0 then
+if store.onRebind then
+for _, event in ipairs(rebound) do pcall(store.onRebind, path, event) end
+end
+record = mount.get(path)
+present, missing = mount.devices(path)
+end
+end
+return record, present or {}, missing or {}
+end
+
+local survey
+local allowedFor
+
+
+
+
+
+local function surveyGroup(path)
+local out = {
+path = path, group = true,
+record = {path = path, coherence = mount.EXCLUSIVE, devices = {}},
+devices = {}, missing = {}, listings = {}, sizes = {}, manifest = {},
+sample = {}, freeSlots = 0, only = {},
+members = {}, memberOf = {}, holds = {},
+}
+for _, member in ipairs(mount.members(path)) do
+local record = mount.get(member)
+local holds = record.holds and store.selector(record.holds) or nil
+out.members[#out.members + 1] = {path = member, holds = holds,
+text = record.holds}
+if #(record.devices or {}) > 0 then
+local view = survey(member)
+if view then
+for _, device in ipairs(view.devices) do
+out.devices[#out.devices + 1] = device
+out.record.devices[#out.record.devices + 1] = device
+out.memberOf[device] = member
+out.holds[device] = holds
+out.listings[device] = view.listings[device]
+out.sizes[device] = view.sizes[device]
+out.only[device] = view.only[device]
+end
+for _, device in ipairs(view.missing) do out.missing[#out.missing + 1] = device end
+for key, count in pairs(view.manifest) do
+out.manifest[key] = (out.manifest[key] or 0) + count
+if not out.sample[key] then out.sample[key] = view.sample[key] end
+end
+out.freeSlots = out.freeSlots + view.freeSlots
+end
+end
+end
+return out
+end
+
+survey = function(path)
+local record = mount.get(path)
+if not record then
+if mount.isGroup(path) then return surveyGroup(path) end
+return nil, "no such storage: " .. tostring(path)
+end
+if mount.isSignal(record) then
+return nil, ("%s is a signal, not a volume"):format(path)
+end
+if #record.devices == 0 then
+return nil, ("%s is declared but UNBOUND"):format(path)
+end
+
+local present, missing
+record, present, missing = devicesOf(path, record)
+local useCache = cacheable(record)
+
+local out = {
+path = path,
+record = record,
+devices = present,
+missing = missing,
+listings = {},
+sizes = {},
+manifest = {},
+sample = {},
+freeSlots = 0,
+only = {},
+}
+
+for _, device in ipairs(present) do
+local listing, size = listingOf(device, useCache)
+if listing and record.slots then
+
+local slots, kept = {}, {}
+for _, slot in ipairs(record.slots) do
+if slot <= (size or 0) then
+slots[#slots + 1] = slot
+kept[slot] = listing[slot]
+end
+end
+listing, size = kept, #slots
+out.only[device] = slots
+end
+
+
+if listing and not record.slots and marks.stale(record, device, listing, size) then
+marks.observe(path, device, listing, size)
+record = mount.get(path)
+end
+
+
+local hidden, strays = nil, nil
+if listing then hidden, strays = marks.hidden(record, device, listing) end
+
+
+if strays and store.onStrayPage and path ~= marks.TRAY then
+pcall(store.onStrayPage, path, device, strays)
+end
+if hidden then
+local kept, gone = {}, 0
+for slot, stack in pairs(listing) do
+if hidden[slot] then gone = gone + 1 else kept[slot] = stack end
+end
+listing, size = kept, math.max(0, (size or 0) - gone)
+end
+if listing then
+out.listings[device] = listing
+out.sizes[device] = size
+
+local occupied = 0
+for slot, stack in pairs(listing) do
+occupied = occupied + 1
+local key = store.key(stack.name, stack.nbt)
+out.manifest[key] = (out.manifest[key] or 0) + stack.count
+if not out.sample[key] then
+out.sample[key] = {device = device, slot = slot}
+end
+end
+out.freeSlots = out.freeSlots + math.max(0, (size or 0) - occupied)
+end
+end
+
+return out
+end
+
+
+
+
+
+
+function store.manifest(path)
+local view, err = survey(path)
+if not view then return nil, err end
+return view.manifest, (#view.missing > 0) and view.missing or nil
+end
+
+
+
+
+
+
+function store.stock(path)
+local manifest, degraded = store.manifest(path)
+if not manifest then return nil, degraded end
+
+local totals = {}
+for key, count in pairs(manifest) do
+local name = store.parse(key)
+totals[name] = (totals[name] or 0) + count
+end
+return totals, degraded
+end
+
+
+
+
+
+
+
+
+
+function store.describe(path, budget)
+local view, err = survey(path)
+if not view then return nil, err end
+budget = budget or 8
+local out = {}
+for key in pairs(view.manifest) do
+local known = attrs[key]
+if not known and budget > 0 then
+local sample = view.sample[key]
+if sample then
+known = learn(key, sample.device, sample.slot)
+budget = budget - 1
+end
+end
+local id = store.parse(key)
+if known and not out[id] then
+out[id] = {name = known.displayName, stack = known.maxCount}
+end
+end
+return out
+end
+
+function store.count(path, sel)
+local view, err = survey(path)
+if not view then return nil, err end
+if not sel then
+local total = 0
+for _, count in pairs(view.manifest) do total = total + count end
+return total
+end
+
+local selector = store.selector(sel)
+if not selector then return nil, "not a selector: " .. tostring(sel) end
+
+local total = 0
+for key, count in pairs(view.manifest) do
+if satisfies(selector, key, view.sample[key]) then total = total + count end
+end
+return total
+end
+
+function store.freeSlots(path)
+local view, err = survey(path)
+if not view then return nil, err end
+return view.freeSlots
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function store.room(path, sel)
+local view, err = survey(path)
+if not view then return nil, err end
+
+local selector = store.selector(sel)
+if not selector then return nil, "not a selector: " .. tostring(sel) end
+
+local best, bestExact = nil, true
+local considered = false
+
+
+local function freeIn(allowed)
+if not allowed then return view.freeSlots end
+local free = 0
+for device in pairs(allowed) do
+local occupied = 0
+for _ in pairs(view.listings[device] or {}) do occupied = occupied + 1 end
+free = free + math.max(0, (view.sizes[device] or 0) - occupied)
+end
+return free
+end
+
+for key in pairs(view.manifest) do
+if satisfies(selector, key, view.sample[key]) then
+considered = true
+local limit, known = stackLimit(key, view.sample[key])
+local allowed = allowedFor(view, key, view.sample[key])
+
+
+local headroom = 0
+for device, listing in pairs(view.listings) do
+if not allowed or allowed[device] then
+for _, stack in pairs(listing) do
+if store.key(stack.name, stack.nbt) == key
+and stack.count < limit then
+headroom = headroom + (limit - stack.count)
+end
+end
+end
+end
+
+local total = headroom + freeIn(allowed) * limit
+if best == nil or total > best then
+best, bestExact = total, known
+end
+end
+end
+
+if considered then return best, bestExact end
+
+
+
+
+local limit = ASSUMED_STACK
+local exact = false
+local allowed = nil
+if selector.kind ~= "tag" then
+local key = selector.key or selector.name
+if attrs[key] and attrs[key].maxCount then
+limit, exact = attrs[key].maxCount, true
+end
+allowed = allowedFor(view, key, nil)
+end
+return freeIn(allowed) * limit, exact
+end
+
+
+
+
+
+
+
+
+
+function store.resolve(path, sel)
+local view, err = survey(path)
+if not view then return nil, err end
+
+local selector = store.selector(sel)
+if not selector then return nil, "not a selector: " .. tostring(sel) end
+
+local best, bestCount = nil, -1
+for key, count in pairs(view.manifest) do
+if satisfies(selector, key, view.sample[key]) and count > bestCount then
+best, bestCount = key, count
+end
+end
+
+if not best then
+return nil, ("nothing matching %s is in %s"):format(tostring(sel), path)
+end
+return best, nil
+end
+
+
+
+function store.locate(sel)
+local found = {}
+for _, path in ipairs(mount.volumes()) do
+if mount.isBound(path) then
+local n = store.count(path, sel)
+if n and n > 0 then
+found[#found + 1] = {path = path, count = n}
+end
+end
+end
+table.sort(found, function(a, b) return a.count > b.count end)
+return found
+end
+
+function store.status(path)
+local record = mount.get(path)
+if not record and mount.isGroup(path) then
+
+local out = {path = path, coherence = mount.EXCLUSIVE, bound = false,
+devices = {}, missing = {}, degraded = false, group = true,
+members = mount.members(path)}
+for _, member in ipairs(out.members) do
+local sub = store.status(member)
+if sub and sub.bound then out.bound = true end
+for _, d in ipairs(sub and sub.devices or {}) do out.devices[#out.devices + 1] = d end
+for _, d in ipairs(sub and sub.missing or {}) do out.missing[#out.missing + 1] = d end
+end
+out.degraded = #out.missing > 0
+return out
+end
+if not record then return nil, "no such storage: " .. tostring(path) end
+
+local present, missing
+if #record.devices > 0 then
+record, present, missing = devicesOf(path, record)
+else
+present, missing = mount.devices(path)
+end
+return {
+path = path,
+node = record.node,
+role = record.role,
+coherence = record.coherence,
+bound = #record.devices > 0,
+devices = present or {},
+missing = missing or {},
+degraded = (missing and #missing > 0) or false,
+}
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+function store.audit()
+local points, degraded, unbound = {}, {}, {}
+
+for path in pairs(mount.all()) do
+points[#points + 1] = path
+end
+table.sort(points)
+
+local report = {points = {}, degraded = degraded, unbound = unbound}
+for _, path in ipairs(points) do
+local view = store.status(path)
+report.points[#report.points + 1] = view
+if not view.bound then
+unbound[#unbound + 1] = path
+elseif view.degraded then
+degraded[#degraded + 1] = {path = path, missing = view.missing}
+end
+end
+
+report.ok = (#degraded == 0)
+return report
+end
+
+
+
+
+
+
+
+allowedFor = function(view, key, sample)
+if not view.group then return nil end
+local exactStore, tagStore = nil, nil
+for _, member in ipairs(view.members) do
+local sel = member.holds
+if sel then
+local tag = sel.kind == "tag"
+if (not tag or not tagStore) and satisfies(sel, key, sample) then
+if tag then tagStore = tagStore or member.path
+else exactStore = exactStore or member.path end
+end
+end
+end
+local want = exactStore and "exact" or (tagStore and "tag") or "general"
+local set = {}
+for _, device in ipairs(view.devices) do
+local sel = view.holds[device]
+local class = "general"
+if sel then
+class = satisfies(sel, key, sample) and (sel.kind == "tag" and "tag" or "exact")
+or "other"
+end
+if class == want then set[device] = true end
+end
+return set, exactStore or tagStore
+end
+store.allowedFor = function(path, key)
+local view = survey(path)
+if not view then return nil end
+return allowedFor(view, key, view.sample[key])
+end
+
+
+
+
+
+
+local function destinations(view, key, limit, allowed)
+local holding, empty = {}, {}
+
+for _, device in ipairs(view.devices) do
+if not allowed or allowed[device] then
+local listing = view.listings[device]
+local headroom, occupied = 0, 0
+for _, stack in pairs(listing or {}) do
+occupied = occupied + 1
+if store.key(stack.name, stack.nbt) == key and stack.count < limit then
+headroom = headroom + (limit - stack.count)
+end
+end
+local free = math.max(0, (view.sizes[device] or 0) - occupied)
+
+if headroom > 0 then
+holding[#holding + 1] = {device = device, headroom = headroom, free = free}
+else
+empty[#empty + 1] = {device = device, free = free}
+end
+end
+end
+
+table.sort(holding, function(a, b) return a.headroom > b.headroom end)
+table.sort(empty, function(a, b) return a.free > b.free end)
+
+local order = {}
+for _, entry in ipairs(holding) do order[#order + 1] = entry.device end
+for _, entry in ipairs(empty) do order[#order + 1] = entry.device end
+return order
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function sources(view, key)
+local found = {}
+for device, listing in pairs(view.listings) do
+local rank = (view.holds and view.holds[device]) and 1 or 0
+for slot, stack in pairs(listing) do
+if store.key(stack.name, stack.nbt) == key then
+found[#found + 1] = {device = device, slot = slot, count = stack.count,
+rank = rank}
+end
+end
+end
+table.sort(found, function(a, b)
+if a.rank ~= b.rank then return a.rank < b.rank end
+return a.count < b.count
+end)
+return found
+end
+
+
+
+
+
+
+
+local function pushInto(dest, device, src, key, limit, remaining)
+local inv = hal.inventory()
+local only = dest.only and dest.only[device]
+if not only then
+local n, err = inv.push(src.device, device, src.slot, remaining)
+return n, err, 1
+end
+
+local listing = dest.listings[device] or {}
+local moved, calls, lastErr = 0, 0, nil
+local want = math.min(remaining, src.count or remaining)
+for _, slot in ipairs(only) do
+if moved >= want then break end
+local held = listing[slot]
+if not held or (store.key(held.name, held.nbt) == key and held.count < limit) then
+local n, err = inv.push(src.device, device, src.slot, want - moved, slot)
+calls = calls + 1
+if not n then
+lastErr = err
+elseif n > 0 then
+moved = moved + n
+local name, nbt = store.parse(key)
+listing[slot] = {name = name, nbt = nbt,
+count = (held and held.count or 0) + n}
+end
+end
+end
+if src.count then src.count = src.count - moved end
+if moved == 0 and lastErr then return nil, lastErr, calls end
+return moved, nil, math.max(calls, 1)
+end
+
+
+
+
+
+
+
+
+
+
+local function heldNow(src, key)
+local detail = hal.inventory().detail(src.device, src.slot)
+if not detail or store.key(detail.name, detail.nbt) ~= key then return 0 end
+return detail.count or 0
+end
+
+function store.move(from, to, sel, wanted)
+local source, sErr = survey(from)
+if not source then return 0, sErr end
+local dest, dErr = survey(to)
+if not dest then return 0, dErr end
+
+if #source.devices == 0 then
+return 0, ("%s has no reachable devices"):format(from)
+end
+if #dest.devices == 0 then
+return 0, ("%s has no reachable devices"):format(to)
+end
+
+local selector = store.selector(sel)
+if not selector then return 0, "not a selector: " .. tostring(sel) end
+
+
+
+
+local candidates = {}
+for key, count in pairs(source.manifest) do
+if satisfies(selector, key, source.sample[key]) then
+candidates[#candidates + 1] = {key = key, count = count}
+end
+end
+table.sort(candidates, function(a, b) return a.count > b.count end)
+
+local moved, calls = 0, 0
+local blocked = {}
+local lastErr = nil
+local stale = false
+
+for _, candidate in ipairs(candidates) do
+if moved >= wanted then break end
+local key = candidate.key
+local limit = stackLimit(key, source.sample[key])
+local allowed, storePath = allowedFor(dest, key, source.sample[key])
+local order = destinations(dest, key, limit, allowed)
+blocked = {}
+
+
+local full = storePath and ("%s is full"):format(storePath) or nil
+if #order == 0 and full then lastErr = full end
+
+for _, src in ipairs(sources(source, key)) do
+if moved >= wanted then break end
+
+local remaining = wanted - moved
+local placedAny = false
+local gone = false
+local left = src.count or 0
+
+for _, device in ipairs(order) do
+if remaining <= 0 then break end
+if not blocked[device] then
+local asked = math.min(remaining, left)
+local n, err, used = pushInto(dest, device, src, key, limit,
+remaining)
+calls = calls + (used or 1)
+
+
+
+
+
+
+
+
+
+
+
+if not n then
+lastErr = tostring(err)
+else
+if n > 0 then
+moved = moved + n
+remaining = remaining - n
+left = left - n
+placedAny = true
+index.consumed(src.device, src.slot, n)
+index.drop(device)
+end
+if n < asked then
+local now = heldNow(src, key)
+if now < left then
+stale = true
+index.drop(src.device)
+left = now
+end
+if now == 0 then
+gone = true
+break
+end
+
+
+
+if n == 0 then blocked[device] = true end
+end
+end
+
+if calls % YIELD_EVERY == 0 then sleep(0) end
+end
+end
+
+if not placedAny and not gone then
+
+if full then break end
+return moved, lastErr or ("%s is full"):format(to)
+end
+end
+end
+
+if moved == 0 and #candidates == 0 then
+return 0, ("%s holds nothing matching %s"):format(from, tostring(sel))
+end
+if moved < wanted and stale then
+return moved, ("%s held less %s than its listing said: %d of %d found (the "
+.. "listing was out of date, and is read again)"):format(from,
+tostring(sel), moved, wanted)
+end
+return moved, lastErr
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function store.slots(path)
+local view, err = survey(path)
+if not view then return nil, err end
+
+local total, occupied = 0, 0
+local perKey = {}
+
+for device, listing in pairs(view.listings) do
+total = total + (view.sizes[device] or 0)
+for _, stack in pairs(listing) do
+occupied = occupied + 1
+local key = store.key(stack.name, stack.nbt)
+perKey[key] = (perKey[key] or 0) + 1
+end
+end
+
+local keys, reclaimable = 0, 0
+for _, count in pairs(perKey) do
+keys = keys + 1
+reclaimable = reclaimable + (count - 1)
+end
+
+return {
+total = total,
+used = occupied,
+free = total - occupied,
+keys = keys,
+reclaimable = reclaimable,
+degraded = #view.missing > 0,
+}
+end
+
+
+
+
+
+
+
+
+
+
+
+function store.summary(path)
+local record = mount.get(path)
+if not record and mount.isGroup(path) then
+record = {coherence = mount.EXCLUSIVE, devices = {"group"}}
+end
+if not record then return nil, "no such storage: " .. tostring(path) end
+
+local out = {
+path = path,
+coherence = record.coherence,
+node = record.node,
+role = record.role,
+bound = #record.devices > 0,
+devices = {},
+missing = {},
+degraded = false,
+}
+
+if not out.bound then return out end
+
+
+
+
+
+local view, err = survey(path)
+if not view then return out, err end
+
+out.devices = view.devices or {}
+out.missing = view.missing or {}
+out.degraded = #out.missing > 0
+
+local total, occupied, items = 0, 0, 0
+local perKey = {}
+for device, listing in pairs(view.listings) do
+total = total + (view.sizes[device] or 0)
+for _, stack in pairs(listing) do
+occupied = occupied + 1
+items = items + stack.count
+local key = store.key(stack.name, stack.nbt)
+perKey[key] = (perKey[key] or 0) + 1
+end
+end
+
+local keys, reclaimable = 0, 0
+for _, count in pairs(perKey) do
+keys = keys + 1
+reclaimable = reclaimable + (count - 1)
+end
+
+out.manifest = view.manifest
+out.items = items
+out.slots = {total = total, used = occupied, free = total - occupied,
+keys = keys, reclaimable = reclaimable, degraded = out.degraded}
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function store.defrag(path, opts)
+opts = opts or {}
+local record = mount.get(path)
+if not record and mount.isGroup(path) then
+
+
+local total = {merged = 0, slotsFreed = 0, calls = 0, keys = 0}
+for _, member in ipairs(mount.members(path)) do
+local r = mount.isBound(member) and store.defrag(member, opts)
+if r then
+for k in pairs(total) do total[k] = total[k] + (r[k] or 0) end
+end
+end
+return total
+end
+if not record then return nil, "no such storage: " .. tostring(path) end
+
+
+
+if record.coherence ~= mount.EXCLUSIVE then
+return nil, ("%s is %s -- only an exclusive volume may be defragmented "
+.. "(S8.2)"):format(path, tostring(record.coherence))
+end
+
+local view, err = survey(path)
+if not view then return nil, err end
+
+local inv = hal.inventory()
+local result = {merged = 0, slotsFreed = 0, calls = 0, keys = 0}
+
+
+local byKey = {}
+for device, listing in pairs(view.listings) do
+for slot, stack in pairs(listing) do
+local key = store.key(stack.name, stack.nbt)
+byKey[key] = byKey[key] or {}
+table.insert(byKey[key], {device = device, slot = slot, count = stack.count})
+end
+end
+
+for key, slots in pairs(byKey) do
+if #slots > 1 then
+result.keys = result.keys + 1
+
+
+table.sort(slots, function(a, b) return a.count < b.count end)
+
+local lo, hi = 1, #slots
+while lo < hi do
+local from, to = slots[lo], slots[hi]
+
+if from.count <= 0 then
+lo = lo + 1
+else
+local moved = inv.push(from.device, to.device, from.slot,
+from.count, to.slot)
+result.calls = result.calls + 1
+
+if not moved or moved == 0 then
+
+
+
+
+
+hi = hi - 1
+else
+from.count = from.count - moved
+to.count = to.count + moved
+result.merged = result.merged + moved
+index.consumed(from.device, from.slot, moved)
+index.drop(to.device)
+
+if from.count <= 0 then
+result.slotsFreed = result.slotsFreed + 1
+lo = lo + 1
+end
+end
+
+if result.calls % YIELD_EVERY == 0 then sleep(0) end
+end
+end
+end
+end
+
+return result
+end
+
+
+function store.drain(from, to)
+local manifest, err = store.manifest(from)
+if not manifest then return nil, err end
+
+local drained = {}
+for key, count in pairs(manifest) do
+local moved = store.move(from, to, key, count)
+if moved > 0 then
+local name = store.parse(key)
+drained[name] = (drained[name] or 0) + moved
+end
+end
+return drained
+end
+
+
+
+
+
+
+store.bind = mount.bind
+store.unbind = mount.unbind
+store.declare = mount.declare
+store.mounts = mount.all
+store.list = mount.list
+store.volumes = mount.volumes
+store.isBound = mount.isBound
+store.unclaimed = mount.unclaimed
+store.unclaimedByKind = mount.unclaimedByKind
+store.isStorage = mount.isStorage
+store.extend = mount.extend
+store.members = mount.members
+store.isGroup = mount.isGroup
+store.home = mount.home
+store.pathOf = mount.pathOf
+store.valid = mount.valid
+
+return store

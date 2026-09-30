@@ -1,0 +1,393 @@
+
+
+
+
+
+
+local store = require("mfg.storage")
+
+local cli = {}
+
+
+function cli.lines(label, tbl)
+if not tbl or not next(tbl) then return end
+print("  " .. label)
+for item, count in pairs(tbl) do
+print(("    %-34s %s"):format(item, tostring(count)))
+end
+end
+
+
+
+
+function cli.paged(lines)
+local _, height = term.getSize()
+textutils.pagedPrint(table.concat(lines, "\n"), height - 2)
+end
+
+
+
+
+
+
+function cli.confirm(question)
+os.queueEvent("mfg_confirm")
+os.pullEvent("mfg_confirm")
+write(question .. " [y/N] ")
+local answer = (read() or ""):lower():match("^%s*(.-)%s*$")
+return answer == "y" or answer == "yes"
+end
+
+
+function cli.slots(text)
+if type(text) ~= "string" or text == "" then return nil end
+local out = {}
+for part in text:gmatch("[^,]+") do
+local a, b = part:match("^(%d+)%-(%d+)$")
+if a then
+a, b = tonumber(a), tonumber(b)
+if a > b then return nil end
+for slot = a, b do out[#out + 1] = slot end
+elseif part:match("^%d+$") then
+out[#out + 1] = tonumber(part)
+else
+return nil
+end
+end
+return #out > 0 and out or nil
+end
+
+
+
+
+local function bindSignal(tool, path, args)
+local device, face = args[3], args[4]
+if not device or not face then
+printError(("usage: %s bind %s <relay|local> <face>"):format(tool, path))
+return
+end
+if device ~= "local" and not peripheral.isPresent(device) then
+printError("not on the network: " .. device)
+print("a relay is named like redstoneIntegrator_0 or redstone_relay_0;")
+print("`local` is this computer")
+return
+end
+local record, err = store.bind(path, {device}, {face = face})
+if not record then printError(tostring(err)) return end
+print(("bound %s -> %s %s (%s %s)"):format(path, device, face,
+tostring(record.direction), tostring(record.kind)))
+end
+
+
+
+function cli.bind(tool, args)
+local path = args[2]
+if not path or not args[3] then
+printError(("usage: %s bind <path> <device...> [--slots 1-3] "
+.. "[--interface]"):format(tool))
+print("paths look like /pool or /t1/in")
+print(("a signal: %s bind <path> <relay|local> <face>"):format(tool))
+return
+end
+
+local declared = require("mfg.storage.mount").get(path)
+if declared and (declared.kind == "level" or declared.kind == "flag") then
+return bindSignal(tool, path, args)
+end
+
+local devices, slots, via, holds = {}, nil, nil, nil
+local i = 3
+while i <= #args do
+local word = args[i]
+if word == "--holds" then
+
+holds = args[i + 1]
+if not holds then
+printError("--holds takes an item or a tag: minecraft:oak_log, #minecraft:logs")
+return
+end
+i = i + 2
+elseif word == "--slots" then
+slots = cli.slots(args[i + 1])
+if not slots then
+printError("--slots takes a list or a range: 1,2 or 1-9")
+return
+end
+i = i + 2
+elseif word == "--interface" then
+via = "interface"
+i = i + 1
+else
+devices[#devices + 1] = word
+i = i + 1
+end
+end
+if #devices == 0 then printError("no device given") return end
+
+
+
+
+local absent = {}
+for _, device in ipairs(devices) do
+if not peripheral.isPresent(device) then absent[#absent + 1] = device end
+end
+if #absent > 0 then
+printError("not on the network: " .. table.concat(absent, ", "))
+print("names are namespaced, e.g. minecraft:chest_0")
+print("and check the wired modem on each is ACTIVATED (right-click it)")
+return
+end
+
+
+
+
+
+local exclusive = (path == "/pool" or path == "/cache" or path:sub(1, 6) == "/pool/")
+if exclusive and (slots or via) then
+printError(path .. " is the pool: whole chests only")
+return
+end
+if holds and path:sub(1, 6) ~= "/pool/" then
+printError("--holds is for a store in the pool, like /pool/wood")
+return
+end
+if store.isGroup(path) then
+printError(("%s is a group: bind its general chests as %s, or a store as "
+.. "%s/<name> --holds <item>"):format(path, store.home(path), path))
+return
+end
+local record, err = store.bind(path, devices,
+{coherence = exclusive and store.EXCLUSIVE or store.RELAYED,
+slots = slots, via = via, holds = holds})
+if not record then printError(tostring(err)) return end
+print(("bound %s -> %s%s (%s%s%s)"):format(path, table.concat(devices, ", "),
+slots and (" slots " .. table.concat(slots, ",")) or "",
+record.coherence, via and ", interface" or "",
+record.holds and (", holds " .. record.holds) or ""))
+end
+
+
+
+
+
+
+
+
+
+
+function cli.add(tool, path, args, first)
+local named, any, yes = {}, false, false
+for i = first or 1, #args do
+local word = args[i]
+if word == "--any" then any = true
+elseif word == "--yes" or word == "-y" then yes = true
+else named[#named + 1] = word end
+end
+
+local exclusive = (path == "/pool" or path == "/cache" or path:sub(1, 6) == "/pool/")
+local coherence = exclusive and store.EXCLUSIVE or store.RELAYED
+local inv = require("mfg.common.hal").inventory()
+
+local devices = {}
+if #named > 0 then
+
+local absent = {}
+for _, device in ipairs(named) do
+if inv.isPresent(device) then devices[#devices + 1] = device
+else absent[#absent + 1] = device end
+end
+if #absent > 0 then
+printError("not an inventory on the network: " .. table.concat(absent, ", "))
+return
+end
+else
+local storage, other = store.unclaimedByKind()
+local offered = storage
+if any then
+offered = {}
+for _, entry in ipairs(storage) do offered[#offered + 1] = entry end
+for _, entry in ipairs(other) do offered[#offered + 1] = entry end
+other = {}
+end
+
+local lines = {}
+for _, entry in ipairs(offered) do
+devices[#devices + 1] = entry.device
+local size = inv.size(entry.device)
+lines[#lines + 1] = ("  %-30s %s slots"):format(entry.device,
+tostring(size or "?"))
+end
+if #other > 0 then
+lines[#lines + 1] = "left alone, not storage (--any, or add by name):"
+for _, entry in ipairs(other) do
+lines[#lines + 1] = ("  %-30s %s"):format(entry.device,
+tostring(entry.kind))
+end
+end
+
+if #devices == 0 then
+print("no unclaimed storage on the network")
+if #lines > 0 then cli.paged(lines) end
+return
+end
+print(("unclaimed storage to add to %s:"):format(path))
+cli.paged(lines)
+
+if not yes then
+
+print(("Their contents become %s stock%s."):format(path, exclusive
+and ", and nothing else may put items in or take them out" or ""))
+print("A turtle's input or output chest must be bound first.")
+if not cli.confirm(("add %d to %s?"):format(#devices, path)) then
+print("nothing added")
+return
+end
+end
+end
+
+local record, added = store.extend(path, devices, {coherence = coherence})
+if not record then printError(tostring(added)) return end
+local slots = store.slots(path)
+print(("added %d to %s: %d device(s)%s"):format(#added, path, #record.devices,
+slots and (", " .. slots.total .. " slots") or ""))
+end
+
+
+
+local function where(status)
+if #status.devices == 0 then return "UNBOUND" end
+local text = table.concat(status.devices, ", ")
+local record = require("mfg.storage.mount").get(status.path) or {}
+if record.face then text = text .. " " .. record.face end
+if record.slots then text = text .. " slots " .. table.concat(record.slots, ",") end
+if record.via == "interface" then text = text .. " (interface)" end
+return text
+end
+
+function cli.bindings()
+local paths = store.list()
+if #paths == 0 then print("nothing bound") return end
+for _, path in ipairs(paths) do
+local status = store.status(path)
+local record = require("mfg.storage.mount").get(path) or {}
+local kind = record.kind and record.kind ~= "volume"
+and (record.direction or "") .. " " .. record.kind or status.coherence
+print(("%-14s %-10s %s"):format(path, kind, where(status)))
+if status.degraded then
+
+
+printError("               DEGRADED, missing: "
+.. table.concat(status.missing, ", "))
+end
+cli.marksLine(record, status)
+end
+
+local waiting = {}
+for _, page in pairs(require("mfg.storage.marks").pending()) do
+waiting[#waiting + 1] = page.path
+end
+table.sort(waiting)
+if #waiting > 0 then print("pages out: " .. table.concat(waiting, ", ")) end
+end
+
+
+
+function cli.marksLine(record, status)
+if record.kind and record.kind ~= "volume" or record.slots then return end
+if #status.devices == 0 then return end
+local marks = require("mfg.storage.marks")
+local inv = require("mfg.common.hal").inventory()
+local parts, gone = {}, false
+for _, device in ipairs(status.devices) do
+local said = marks.status(record, device, inv.list(device)) or "unmarked"
+if said == "MARKER GONE" then gone = true end
+parts[#parts + 1] = device:gsub("^minecraft:", "") .. " " .. said
+end
+local line = "               " .. table.concat(parts, ", ")
+if gone then printError(line .. " -- mfgctl mark " .. record.path) else print(line) end
+if record.rebound then
+local ago = math.floor((os.epoch("utc") - (record.rebound.at or 0)) / 60000)
+print(("               rebound %dm ago: %s -> %s, by %s"):format(ago,
+record.rebound.from, record.rebound.to, tostring(record.rebound.how)))
+end
+end
+
+
+function cli.mark(tool, path)
+if not path then
+printError(("usage: %s mark <path> | --all"):format(tool))
+return
+end
+local marks = require("mfg.storage.marks")
+local mount = require("mfg.storage.mount")
+local paths = {path}
+if path == "--all" then
+paths = {}
+for _, each in ipairs(mount.volumes()) do
+local record = mount.get(each)
+if #record.devices > 0 and not record.slots and each ~= marks.TRAY then
+paths[#paths + 1] = each
+end
+end
+end
+for _, each in ipairs(paths) do
+local results, why = marks.mark(each)
+if not results then
+printError(each .. ": " .. tostring(why))
+if path ~= "--all" then return end
+else
+for _, result in ipairs(results) do
+local line = ("%s %s: %s"):format(each, result.device, result.text)
+if result.status == "failed" or result.status == "missing" then
+printError(line)
+else
+print(line)
+end
+end
+end
+end
+end
+
+
+
+function cli.store(tool, path, defrag)
+if not path then printError(("usage: %s store <path>"):format(tool)) return end
+
+local status, sErr = store.status(path)
+if not status then printError(tostring(sErr)) return end
+
+print(("%s  %s"):format(path, status.coherence))
+print("  devices: " .. (#status.devices > 0
+and table.concat(status.devices, ", ") or "UNBOUND"))
+if status.degraded then
+printError("  DEGRADED, missing: " .. table.concat(status.missing, ", "))
+end
+if not status.bound then return end
+
+local manifest, degraded = store.manifest(path)
+if not manifest then printError(tostring(degraded)) return end
+
+
+
+
+local slots = store.slots(path)
+if slots then
+print(("  slots: %d used, %d free of %d   keys: %d")
+:format(slots.used, slots.free, slots.total, slots.keys))
+if slots.reclaimable > 0 and defrag then
+
+
+
+print(("  up to %d slot(s) reclaimable -- run '%s %s'")
+:format(slots.reclaimable, defrag, path))
+end
+end
+local any = false
+for key, count in pairs(manifest) do
+print(("    %-34s %d"):format(key, count))
+any = true
+end
+if not any then print("    (empty)") end
+end
+
+return cli

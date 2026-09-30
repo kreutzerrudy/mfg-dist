@@ -1,0 +1,30 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+
+
+
+return {
+name        = "add_store",
+label       = "Make a store in the pool",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "name", label = "Name", type = "text", required = true,
+help = "One lowercase word, like wood."},
+{name = "holds", label = "Holds", type = "text", required = true,
+help = "An item, like minecraft:oak_log, or a tag, like #minecraft:logs."},
+},
+
+returns = {path = "text"},
+
+run = function(params)
+local path, why = binder.addStore(params.name, params.holds)
+if not path then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {path = path, holds = params.holds}
+end,
+}
