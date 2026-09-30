@@ -1,0 +1,149 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+
+
+
+
+
+
+
+
+
+
+
+
+
+controller = {
+trees = {"mfg/common", "mfg/boot", "mfg/storage", "mfg/controller", "mfg/tools"},
+files = {"mfg/turtle/schematic.lua"},
+actions = {"mfg/common/actions/transmit.lua", "mfg/common/actions/receive.lua", "mfg/storage/actions/stock.lua", "mfg/storage/actions/count.lua", "mfg/storage/actions/locate.lua", "mfg/storage/actions/move.lua", "mfg/storage/actions/drain.lua", "mfg/controller/actions/run_batch.lua", "mfg/controller/actions/offer.lua", "mfg/controller/actions/serve_operator.lua", "mfg/controller/actions/publish.lua", "mfg/controller/actions/assign_role.lua", "mfg/controller/actions/set_config.lua", "mfg/controller/actions/show_config.lua", "mfg/controller/actions/register_recipe.lua", "mfg/controller/actions/forget_recipe.lua", "mfg/controller/actions/make.lua", "mfg/controller/actions/jobs.lua", "mfg/controller/actions/cancel_job.lua", "mfg/controller/actions/schedule.lua", "mfg/controller/actions/unschedule.lua", "mfg/controller/actions/schedules.lua", "mfg/controller/actions/take_in.lua", "mfg/controller/actions/withdraw.lua", "mfg/controller/actions/available.lua", "mfg/controller/actions/hold.lua", "mfg/controller/actions/read_signal.lua", "mfg/controller/actions/signals.lua", "mfg/controller/actions/set_signal.lua", "mfg/controller/actions/pulse.lua", "mfg/controller/actions/release_signal.lua", "mfg/controller/actions/supply.lua", "mfg/controller/actions/collect.lua", "mfg/controller/actions/check_script.lua", "mfg/controller/actions/register_script.lua", "mfg/controller/actions/forget_script.lua", "mfg/controller/actions/add_machine.lua", "mfg/controller/actions/enable_machine.lua", "mfg/controller/actions/disable_machine.lua", "mfg/controller/actions/forget_machine.lua", "mfg/controller/actions/limit_machine.lua", "mfg/controller/actions/scripts.lua", "mfg/controller/actions/print_bind_pages.lua", "mfg/controller/actions/cancel_bind_page.lua", "mfg/controller/actions/show_me.lua", "mfg/controller/actions/bind_pages.lua", "mfg/controller/actions/add_machines.lua", "mfg/controller/actions/add_store.lua", "mfg/controller/actions/trash.lua"},
+services = "mfg.controller.services",
+aliases = {mfgctl = "/mfg/tools/mfgctl", storecheck = "/mfg/tools/storecheck", perfcheck = "/mfg/tools/perfcheck", moncheck = "/mfg/tools/moncheck"},
+authority = true,
+platform = "computer",
+equipment = {},
+settings = {"source", "parent", "dist"},
+},
+
+
+
+turtle = {
+trees = {"mfg/common", "mfg/boot"},
+files = {"mfg/turtle/node.lua", "mfg/turtle/rtu.lua", "mfg/turtle/services.lua", "mfg/turtle/check.lua"},
+actions = {"mfg/common/actions/transmit.lua", "mfg/common/actions/receive.lua", "mfg/turtle/actions/serve_control.lua", "mfg/turtle/actions/fill.lua", "mfg/turtle/actions/return_unused.lua", "mfg/turtle/actions/pattern_fill.lua", "mfg/turtle/actions/craft.lua", "mfg/turtle/actions/deposit.lua"},
+services = "mfg.turtle.services",
+aliases = {check = "/mfg/turtle/check"},
+platform = "turtle",
+equipment = {{"minecraft:crafting_table"}, {"computercraft:wireless_modem_normal", "computercraft:wireless_modem_advanced", pinned = true}},
+settings = {"controller", "feed.mode", "feed.side"},
+},
+
+
+
+builder = {
+trees = {"mfg/common", "mfg/boot"},
+files = {"mfg/turtle/builder.lua", "mfg/turtle/builderd.lua", "mfg/turtle/nav.lua", "mfg/turtle/odometry.lua", "mfg/turtle/schematic.lua"},
+actions = {"mfg/common/actions/transmit.lua", "mfg/common/actions/receive.lua"},
+startup = "/mfg/turtle/builderd",
+
+
+
+platform = "turtle",
+equipment = {{"computercraft:wireless_modem_normal", "computercraft:wireless_modem_advanced", pinned = true}},
+settings = {},
+},
+
+
+
+
+station = {
+trees = {"mfg/common", "mfg/boot", "mfg/storage", "mfg/station"},
+files = {},
+actions = {"mfg/common/actions/transmit.lua", "mfg/common/actions/receive.lua", "mfg/storage/actions/stock.lua", "mfg/storage/actions/count.lua", "mfg/storage/actions/locate.lua", "mfg/storage/actions/move.lua", "mfg/storage/actions/drain.lua"},
+startup = "/mfg/station/stationd",
+aliases = {stationctl = "/mfg/station/stationctl"},
+platform = "computer",
+equipment = {},
+settings = {},
+},
+
+
+
+
+
+hmi = {
+trees = {"mfg/common", "mfg/boot", "mfg/hmi"},
+files = {},
+actions = {"mfg/common/actions/transmit.lua", "mfg/common/actions/receive.lua"},
+services = "mfg.hmi.services",
+platform = "computer",
+equipment = {},
+settings = {"controller", "source"},
+},
+}

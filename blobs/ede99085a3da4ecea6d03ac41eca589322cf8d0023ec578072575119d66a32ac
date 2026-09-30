@@ -1,0 +1,324 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local check = require("mfg.common.script.check")
+local format = require("mfg.common.script.format")
+
+local schema = {}
+
+schema.HOLE = "?"
+
+local L = check.LIMITS
+
+local function slot(field, type, extra)
+local s = extra or {}
+s.field, s.type = field, type
+return s
+end
+
+
+
+local function optional(field, type, word)
+return {field = field, type = type, word = word, optional = true}
+end
+
+local COUNT = {min = 1, max = L.supplyMax}
+
+
+schema.KINDS = {
+port = {place = "header", label = "port", pieces = {
+slot("direction", "direction"), slot("name", "name"), ":", slot("type", "porttype"),
+optional("slots", "slots", "slots"), optional("safe", "safe", "safe")},
+new = {direction = "input", type = "volume"}},
+
+every = {place = "top", label = "every", block = true, pieces = {
+"every", slot("every", "duration", {min = L.everyMin, max = 24 * 72000})},
+new = {every = {n = 10, unit = "s"}}},
+when = {place = "top", label = "when", block = true, pieces = {
+"when", slot("cond", "cond")}},
+on = {place = "top", label = "on", block = true, pieces = {
+"on", slot("event", "event")}, new = {event = "start"}},
+
+["if"] = {place = "block", label = "if", block = true, pieces = {
+"if", slot("cond", "cond")}},
+["repeat"] = {place = "block", label = "repeat", block = true, pieces = {
+"repeat", slot("n", "count", {min = 1, max = L.repeatMax})}},
+supply = {place = "block", label = "supply", pieces = {
+"supply", slot("n", "count", COUNT), slot("item", "item"), "to",
+slot("port", "port", {kind = "volume", direction = "input"})}},
+stock = {place = "block", label = "stock", pieces = {
+"stock", slot("port", "port", {kind = "volume", direction = "input"}), "with",
+slot("n", "count", COUNT), slot("item", "item")}},
+collect = {place = "block", label = "collect", pieces = {
+"collect", slot("port", "port", {kind = "volume", direction = "output"})}},
+trash = {place = "block", label = "trash", pieces = {
+"trash", slot("item", "item"), "from", slot("port", "port", {kind = "volume"})}},
+move = {place = "block", label = "move", pieces = {
+"move", slot("n", "count", COUNT), slot("item", "item"),
+"from", slot("from", "port", {kind = "volume"}),
+"to", slot("to", "port", {kind = "volume", direction = "input"})}},
+set = {place = "block", label = "set", pieces = {
+"set", slot("port", "port", {kind = "signal", direction = "output"}), "to",
+slot("value", "value", {by = "port"})}},
+pulse = {place = "block", label = "pulse", pieces = {
+"pulse", slot("port", "port", {kind = "signal", direction = "output"}), "for",
+slot("length", "duration", {min = 1, max = L.pulseMax})}},
+wait = {place = "block", label = "wait", pieces = {
+"wait", slot("length", "duration", {min = 1, max = L.waitMax})}},
+waituntil = {place = "block", label = "wait until", pieces = {
+"wait", "until", slot("cond", "cond"),
+"within", slot("within", "duration", {min = L.withinMin, max = L.waitMax})}},
+let = {place = "block", label = "let", pieces = {
+"let", slot("name", "name"), "=", slot("value", "cond")}},
+alarm = {place = "block", label = "alarm", pieces = {
+"alarm", slot("text", "text", {max = L.textMax})}},
+clearalarm = {place = "block", label = "clear alarm", pieces = {"clear", "alarm"}},
+stop = {place = "block", label = "stop", pieces = {"stop"}},
+}
+
+
+schema.PALETTE = {
+header = {"port"},
+top = {"every", "when", "on"},
+block = {"if", "repeat", "supply", "stock", "collect", "trash", "move", "set", "pulse",
+"wait", "waituntil", "let", "alarm", "clearalarm", "stop"},
+}
+
+
+schema.CHOICES = {
+direction = {"input", "output"},
+porttype = {"volume", "level", "flag"},
+event = {"start", "stop"},
+unit = {"t", "s", "m"},
+}
+
+
+
+local function copy(value)
+if type(value) ~= "table" then return value end
+local out = {}
+for k, v in pairs(value) do out[k] = copy(v) end
+return out
+end
+
+
+
+function schema.new(kind, id)
+local row = schema.KINDS[kind]
+if not row then error("schema: no kind " .. tostring(kind), 2) end
+local n = copy(row.new or {})
+n.kind, n.id, n.span = kind, id, {}
+if row.block then n.body = {} end
+return n
+end
+
+
+function schema.slots(kind)
+local out = {}
+for _, piece in ipairs((schema.KINDS[kind] or {}).pieces or {}) do
+if type(piece) == "table" then out[#out + 1] = piece end
+end
+return out
+end
+
+
+
+
+local function exprHoles(e, out)
+if e == nil then
+out[#out + 1] = "a value"
+return
+end
+local k = e.kind
+if k == "cmp" or k == "and" or k == "or" then
+exprHoles(e.left, out)
+exprHoles(e.right, out)
+elseif k == "not" or k == "paren" then
+exprHoles(e.expr, out)
+elseif k == "count" then
+if not e.item then out[#out + 1] = "the item" end
+if not e.port then out[#out + 1] = "the port" end
+elseif k == "free" then
+if not e.item then out[#out + 1] = "the item" end
+end
+end
+
+
+
+function schema.holes(n)
+local out = {}
+local row = schema.KINDS[n.kind]
+if not row then return out end
+for _, piece in ipairs(row.pieces) do
+if type(piece) == "table" and not piece.optional then
+local v = n[piece.field]
+if piece.type == "cond" or (piece.type == "value" and v ~= nil) then
+exprHoles(v, out)
+elseif v == nil or v == "" then
+out[#out + 1] = piece.field == "n" and "how many" or ("the " .. piece.field)
+end
+end
+end
+if row.block and #(n.body or {}) == 0 then out[#out + 1] = "a line under it" end
+if n.orelse and #n.orelse == 0 then out[#out + 1] = "a line under its else" end
+return out
+end
+
+
+
+
+function schema.expr(e)
+if e == nil then return schema.HOLE end
+local k = e.kind
+if k == "cmp" then
+return ("%s %s %s"):format(schema.expr(e.left), e.op or schema.HOLE,
+schema.expr(e.right))
+elseif k == "and" or k == "or" then
+return ("%s %s %s"):format(schema.expr(e.left), k, schema.expr(e.right))
+elseif k == "not" then
+return "not " .. schema.expr(e.expr)
+elseif k == "paren" then
+return "(" .. schema.expr(e.expr) .. ")"
+elseif k == "count" then
+return ("count %s in %s"):format(e.item or schema.HOLE, e.port or schema.HOLE)
+elseif k == "free" then
+return "free " .. (e.item or schema.HOLE)
+end
+return format.expr(e)
+end
+
+
+
+function schema.value(piece, v, opts)
+if v == nil or v == "" then return schema.HOLE end
+local t = piece.type
+if t == "duration" then return tostring(v.n) .. tostring(v.unit)
+elseif t == "cond" or t == "value" or t == "safe" then return schema.expr(v)
+elseif t == "slots" then return format.slots(v)
+elseif t == "text" then return '"' .. v .. '"'
+elseif t == "item" and opts and opts.itemName then return opts.itemName(v)
+end
+return tostring(v)
+end
+
+
+
+local function offers(n, piece)
+if n.kind ~= "port" then return false end
+if piece.field == "slots" then return n.type == "volume" end
+if piece.field == "safe" then return n.type ~= "volume" and n.direction == "output" end
+return false
+end
+
+
+
+
+
+function schema.parts(n, opts)
+local out = {}
+local row = schema.KINDS[n.kind]
+if not row then return {{text = tostring(n.kind)}} end
+for _, piece in ipairs(row.pieces) do
+if type(piece) == "string" then
+out[#out + 1] = {text = piece}
+elseif piece.optional then
+if n[piece.field] ~= nil then
+out[#out + 1] = {text = piece.word}
+out[#out + 1] = {text = schema.value(piece, n[piece.field], opts),
+piece = piece}
+elseif opts and opts.offer and offers(n, piece) then
+out[#out + 1] = {text = "+" .. piece.word, piece = piece, offer = true}
+end
+else
+out[#out + 1] = {text = schema.value(piece, n[piece.field], opts), piece = piece}
+end
+end
+return out
+end
+
+
+
+function schema.text(n, opts)
+local words = {}
+for _, part in ipairs(schema.parts(n, opts)) do words[#words + 1] = part.text end
+return table.concat(words, " ")
+end
+
+
+
+
+
+
+function schema.rows(script)
+local out = {{node = script, depth = 0, kind = "machine"}}
+for index, port in ipairs(script.ports or {}) do
+out[#out + 1] = {node = port, depth = 1, kind = "port", list = script.ports,
+index = index, place = "header"}
+end
+local function block(list, depth)
+for index, s in ipairs(list) do
+out[#out + 1] = {node = s, depth = depth, kind = s.kind, list = list,
+index = index, place = "block"}
+if s.body then block(s.body, depth + 1) end
+if s.orelse then
+out[#out + 1] = {node = s, depth = depth, kind = "else", list = list,
+index = index, place = "block"}
+block(s.orelse, depth + 1)
+end
+end
+end
+for index, h in ipairs(script.handlers or {}) do
+out[#out + 1] = {node = h, depth = 0, kind = h.kind, list = script.handlers,
+index = index, place = "top"}
+block(h.body or {}, 1)
+end
+return out
+end
+
+
+function schema.each(script, fn)
+for _, port in ipairs(script.ports or {}) do fn(port) end
+local function block(list)
+for _, s in ipairs(list or {}) do
+fn(s)
+block(s.body)
+block(s.orelse)
+end
+end
+for _, h in ipairs(script.handlers or {}) do
+fn(h)
+block(h.body)
+end
+end
+
+
+function schema.maxId(t)
+local top = 0
+local function walk(v)
+if type(v) ~= "table" then return end
+if type(v.id) == "number" and v.id > top then top = v.id end
+for k, child in pairs(v) do
+if k ~= "span" then walk(child) end
+end
+end
+walk(t)
+return top
+end
+
+return schema

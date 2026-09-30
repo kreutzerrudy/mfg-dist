@@ -1,0 +1,593 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+local lex = require("mfg.common.script.lex")
+
+local parse = {}
+
+parse.LANG = 1
+
+local DIRECTIONS = {input = true, output = true}
+local PORT_KINDS = {volume = true, level = true, flag = true}
+
+
+
+local Cursor = {}
+Cursor.__index = Cursor
+
+local function cursor(line, p)
+return setmetatable({line = line, toks = line.tokens, i = 1, p = p}, Cursor)
+end
+
+function Cursor:peek() return self.toks[self.i] end
+
+function Cursor:col()
+local tok = self.toks[self.i] or self.toks[#self.toks]
+if not tok then return 1 end
+return self.toks[self.i] and tok.col or (tok.col + #tostring(tok.v))
+end
+
+function Cursor:fail(message)
+error({parse = true, line = self.line.line, col = self:col(), message = message}, 0)
+end
+
+function Cursor:take() local tok = self.toks[self.i]; self.i = self.i + 1; return tok end
+
+function Cursor:isWord(word)
+local tok = self:peek()
+return tok ~= nil and tok.t == "word" and tok.v == word
+end
+
+function Cursor:isOp(op)
+local tok = self:peek()
+return tok ~= nil and tok.t == "op" and tok.v == op
+end
+
+function Cursor:word(word)
+if not self:isWord(word) then
+local tok = self:peek()
+self:fail(("expected `%s`%s"):format(word,
+tok and (", found " .. tostring(tok.v)) or " at the end of the line"))
+end
+return self:take()
+end
+
+function Cursor:op(op)
+if not self:isOp(op) then self:fail(("expected `%s`"):format(op)) end
+return self:take()
+end
+
+
+function Cursor:name(what)
+local tok = self:peek()
+if not tok or tok.t ~= "word" then
+self:fail(("expected %s"):format(what))
+end
+if lex.KEYWORDS[tok.v] then
+self:fail(("`%s` is a keyword and cannot be %s"):format(tok.v, what))
+end
+return self:take().v
+end
+
+function Cursor:kind(t, what)
+local tok = self:peek()
+if not tok or tok.t ~= t then self:fail(("expected %s"):format(what)) end
+return self:take()
+end
+
+function Cursor:finish()
+local tok = self:peek()
+if tok then self:fail(("unexpected %s at the end of the line"):format(tostring(tok.v))) end
+end
+
+
+
+local function node(p, kind, line, col, fields)
+p.nextId = p.nextId + 1
+fields = fields or {}
+fields.kind = kind
+fields.id = p.nextId
+fields.span = {line = line, col = col}
+return fields
+end
+
+
+
+local parseCond
+
+local function primary(c)
+local tok = c:peek()
+if not tok then c:fail("expected a value") end
+local line = c.line.line
+if tok.t == "num" then
+c:take()
+return node(c.p, "num", line, tok.col, {value = tok.v})
+elseif tok.t == "dur" then
+c:take()
+return node(c.p, "dur", line, tok.col, {n = tok.v, unit = tok.unit})
+elseif tok.t == "item" then
+c:take()
+return node(c.p, "item", line, tok.col, {value = tok.v})
+elseif tok.t == "text" then
+c:take()
+return node(c.p, "text", line, tok.col, {value = tok.v})
+elseif tok.t == "op" and tok.v == "(" then
+c:take()
+local inner = parseCond(c)
+c:op(")")
+return node(c.p, "paren", line, tok.col, {expr = inner})
+elseif tok.t == "word" then
+if tok.v == "on" or tok.v == "off" then
+c:take()
+return node(c.p, "onoff", line, tok.col, {value = tok.v == "on"})
+elseif tok.v == "count" then
+c:take()
+local item = c:kind("item", "an item, like minecraft:coal").v
+c:word("in")
+local port = c:name("a port")
+return node(c.p, "count", line, tok.col, {item = item, port = port})
+elseif tok.v == "free" then
+c:take()
+local item = c:kind("item", "an item, like minecraft:coal").v
+return node(c.p, "free", line, tok.col, {item = item})
+end
+local name = c:name("a value")
+return node(c.p, "name", line, tok.col, {name = name})
+end
+c:fail(("expected a value, found %s"):format(tostring(tok.v)))
+end
+
+local RELOPS = {["<"] = true, ["<="] = true, [">"] = true, [">="] = true,
+["="] = true, ["!="] = true}
+
+local function rel(c)
+local left = primary(c)
+local tok = c:peek()
+if tok and tok.t == "op" and RELOPS[tok.v] then
+c:take()
+local right = primary(c)
+return node(c.p, "cmp", left.span.line, left.span.col,
+{op = tok.v, left = left, right = right})
+end
+return left
+end
+
+local function neg(c)
+if c:isWord("not") then
+local tok = c:take()
+return node(c.p, "not", c.line.line, tok.col, {expr = rel(c)})
+end
+return rel(c)
+end
+
+local function conj(c)
+local left = neg(c)
+while c:isWord("and") do
+c:take()
+left = node(c.p, "and", left.span.line, left.span.col, {left = left, right = neg(c)})
+end
+return left
+end
+
+parseCond = function(c)
+local left = conj(c)
+while c:isWord("or") do
+c:take()
+left = node(c.p, "or", left.span.line, left.span.col, {left = left, right = conj(c)})
+end
+return left
+end
+
+local function duration(c, what)
+local tok = c:kind("dur", what or "a duration, like 5s, 4t or 2m")
+return {n = tok.v, unit = tok.unit}
+end
+
+local function literal(c)
+local tok = c:peek()
+local line = c.line.line
+if tok and tok.t == "num" then
+c:take()
+return node(c.p, "num", line, tok.col, {value = tok.v})
+elseif tok and tok.t == "word" and (tok.v == "on" or tok.v == "off") then
+c:take()
+return node(c.p, "onoff", line, tok.col, {value = tok.v == "on"})
+end
+c:fail("expected a level (0-15) or on/off")
+end
+
+
+
+
+
+local function tree(lines, errors)
+local root = {children = {}, level = -1}
+local stack = {root}
+local notes = {}
+for _, line in ipairs(lines) do
+if line.bad then
+
+line.skip = true
+end
+if line.blank then
+
+elseif #line.tokens == 0 and not line.bad then
+notes[#notes + 1] = line.comment
+else
+local level = line.indent
+while stack[#stack].level >= level do table.remove(stack) end
+local parent = stack[#stack]
+if level > parent.level + 1 and not line.bad then
+errors[#errors + 1] = {line = line.line, col = 1,
+message = "indented too far: one step (one tab) more than "
+.. "the line it belongs to"}
+line.skip = true
+end
+local entry = {line = line, children = {}, level = level, notes = notes}
+notes = {}
+parent.children[#parent.children + 1] = entry
+stack[#stack + 1] = entry
+end
+end
+return root.children, notes
+end
+
+local function attach(n, entry)
+if #entry.notes > 0 then n.notes = entry.notes end
+if entry.line.comment then n.comment = entry.line.comment end
+return n
+end
+
+local parseBlock
+
+
+local function statement(p, entry)
+local c = cursor(entry.line, p)
+local tok = c:peek()
+local line, col = entry.line.line, tok.col
+local function done(n)
+c:finish()
+return attach(n, entry)
+end
+local function needsBlock(n)
+if #entry.children == 0 and not p.headOnly then
+c:fail(("`%s` needs an indented block under it"):format(tok.v))
+end
+c:finish()
+attach(n, entry)
+n.body = parseBlock(p, entry.children)
+return n
+end
+local function noBlock()
+if #entry.children > 0 then
+error({parse = true, line = entry.children[1].line.line, col = 1,
+message = ("nothing may be indented under `%s`"):format(tok.v)}, 0)
+end
+end
+
+if tok.t ~= "word" then c:fail("a line starts with a keyword") end
+local word = tok.v
+c:take()
+
+if word == "if" then
+return needsBlock(node(p, "if", line, col, {cond = parseCond(c)}))
+elseif word == "repeat" then
+return needsBlock(node(p, "repeat", line, col,
+{n = c:kind("num", "how many times, 1-64").v}))
+end
+
+noBlock()
+if word == "supply" then
+local n = c:kind("num", "how many").v
+local item = c:kind("item", "an item, like minecraft:coal").v
+c:word("to")
+return done(node(p, "supply", line, col, {n = n, item = item, port = c:name("a port")}))
+elseif word == "stock" then
+local port = c:name("a port")
+c:word("with")
+local n = c:kind("num", "how many").v
+local item = c:kind("item", "an item, like minecraft:coal").v
+return done(node(p, "stock", line, col, {port = port, n = n, item = item}))
+elseif word == "collect" then
+return done(node(p, "collect", line, col, {port = c:name("a port")}))
+elseif word == "trash" then
+
+local item = c:kind("item", "an item, like minecraft:cobblestone").v
+c:word("from")
+return done(node(p, "trash", line, col, {item = item, port = c:name("a port")}))
+elseif word == "move" then
+local n = c:kind("num", "how many").v
+local item = c:kind("item", "an item, like minecraft:coal").v
+c:word("from")
+local from = c:name("a port")
+c:word("to")
+return done(node(p, "move", line, col, {n = n, item = item, from = from,
+to = c:name("a port")}))
+elseif word == "set" then
+local port = c:name("a port")
+c:word("to")
+return done(node(p, "set", line, col, {port = port, value = literal(c)}))
+elseif word == "pulse" then
+local port = c:name("a port")
+c:word("for")
+return done(node(p, "pulse", line, col, {port = port, length = duration(c)}))
+elseif word == "wait" then
+if c:isWord("until") then
+c:take()
+local cond = parseCond(c)
+if not c:isWord("within") then
+c:fail("`wait until` needs `within <duration>`: how long before it "
+.. "gives up")
+end
+c:take()
+return done(node(p, "waituntil", line, col, {cond = cond,
+within = duration(c)}))
+end
+return done(node(p, "wait", line, col, {length = duration(c)}))
+elseif word == "let" then
+local name = c:name("a name")
+c:op("=")
+return done(node(p, "let", line, col, {name = name, value = parseCond(c)}))
+elseif word == "alarm" then
+return done(node(p, "alarm", line, col,
+{text = c:kind("text", "the alarm's text, in double quotes").v}))
+elseif word == "clear" then
+c:word("alarm")
+return done(node(p, "clearalarm", line, col))
+elseif word == "stop" then
+return done(node(p, "stop", line, col))
+elseif word == "else" then
+c:fail("`else` without an `if` just above it")
+end
+c:fail(("`%s` does not start a statement"):format(word))
+end
+
+
+parseBlock = function(p, entries)
+local out = {}
+for _, entry in ipairs(entries) do
+if entry.line.skip then
+
+else
+local first = entry.line.tokens[1]
+local ok, result = pcall(function()
+if first and first.t == "word" and first.v == "else"
+and #entry.line.tokens == 1 then
+local prev = out[#out]
+if not prev or prev.kind ~= "if" or prev.orelse then
+error({parse = true, line = entry.line.line, col = first.col,
+message = "`else` without an `if` just above it"}, 0)
+end
+if #entry.children == 0 then
+error({parse = true, line = entry.line.line, col = first.col,
+message = "`else` needs an indented block under it"}, 0)
+end
+if #entry.notes > 0 then prev.elseNotes = entry.notes end
+prev.elseComment = entry.line.comment
+prev.orelse = parseBlock(p, entry.children)
+return nil
+end
+return statement(p, entry)
+end)
+if not ok then
+if type(result) == "table" and result.parse then
+p.errors[#p.errors + 1] = {line = result.line, col = result.col,
+message = result.message}
+else
+error(result, 0)
+end
+elseif result then
+out[#out + 1] = result
+end
+end
+end
+return out
+end
+
+
+
+local function port(p, entry)
+local c = cursor(entry.line, p)
+local tok = c:peek()
+if not tok or tok.t ~= "word" or not DIRECTIONS[tok.v] then
+c:fail("a port starts with `input` or `output`")
+end
+c:take()
+local name = c:name("a port name")
+c:op(":")
+local kindTok = c:kind("word", "volume, level or flag")
+if not PORT_KINDS[kindTok.v] then
+c.i = c.i - 1
+c:fail("a port is a volume, a level or a flag")
+end
+local n = node(p, "port", entry.line.line, tok.col,
+{direction = tok.v, name = name, type = kindTok.v})
+
+
+if c:isWord("slots") then
+c:take()
+local list, seen = {}, {}
+repeat
+if #list > 0 then c:op(",") end
+local from = c:kind("num", "a slot number").v
+local to = from
+if c:isOp("-") then
+c:take()
+to = c:kind("num", "the last slot of the range").v
+if to < from then c:fail("a slot range runs upwards: 1-3, not 3-1") end
+end
+for slot = from, to do
+if not seen[slot] then list[#list + 1] = slot; seen[slot] = true end
+end
+until not c:isOp(",")
+table.sort(list)
+n.slots = list
+end
+if c:isWord("safe") then
+c:take()
+n.safe = literal(c)
+end
+c:finish()
+if #entry.children > 0 then
+error({parse = true, line = entry.children[1].line.line, col = 1,
+message = "nothing may be indented under a port"}, 0)
+end
+return attach(n, entry)
+end
+
+local function handler(p, entry)
+local c = cursor(entry.line, p)
+local tok = c:peek()
+local line, col = entry.line.line, tok and tok.col or 1
+local n
+if c:isWord("every") then
+c:take()
+n = node(p, "every", line, col, {every = duration(c)})
+elseif c:isWord("when") then
+c:take()
+n = node(p, "when", line, col, {cond = parseCond(c)})
+elseif c:isWord("on") then
+c:take()
+local event = c:peek()
+if not event or event.t ~= "word" or (event.v ~= "start" and event.v ~= "stop") then
+c:fail("`on start` or `on stop`")
+end
+c:take()
+n = node(p, "on", line, col, {event = event.v})
+else
+c:fail("a handler starts with `every`, `when` or `on`")
+end
+c:finish()
+if #entry.children == 0 and not p.headOnly then
+c:fail("a handler needs an indented block under it")
+end
+attach(n, entry)
+n.body = parseBlock(p, entry.children)
+return n
+end
+
+
+
+function parse.parse(source)
+local lines, errors = lex.lines(source)
+local p = {nextId = 0, errors = errors}
+local entries, trailing = tree(lines, errors)
+
+local script = {kind = "script", lang = parse.LANG, id = 0, span = {line = 1, col = 1},
+ports = {}, handlers = {}}
+
+local function guard(fn)
+local ok, err = pcall(fn)
+if not ok then
+if type(err) == "table" and err.parse then
+errors[#errors + 1] = {line = err.line, col = err.col, message = err.message}
+else
+error(err, 0)
+end
+end
+end
+
+local first = entries[1]
+if not first then
+errors[#errors + 1] = {line = 1, col = 1,
+message = "a script starts with `machine <name>`"}
+elseif not first.line.skip then
+guard(function()
+local c = cursor(first.line, p)
+c:word("machine")
+script.machine = c:name("the machine's name")
+c:finish()
+script.span = {line = first.line.line, col = 1}
+attach(script, first)
+for _, child in ipairs(first.children) do
+if not child.line.skip then
+guard(function() script.ports[#script.ports + 1] = port(p, child) end)
+end
+end
+end)
+end
+
+for i = 2, #entries do
+local entry = entries[i]
+if not entry.line.skip then
+guard(function() script.handlers[#script.handlers + 1] = handler(p, entry) end)
+end
+end
+
+if #trailing > 0 then script.trailing = trailing end
+script.nextId = p.nextId
+table.sort(errors, function(a, b)
+if a.line ~= b.line then return a.line < b.line end
+return (a.col or 0) < (b.col or 0)
+end)
+return script, errors
+end
+
+
+
+
+
+
+
+
+
+
+function parse.line(text, place, nextId)
+local lines, errors = lex.lines(text)
+local p = {nextId = nextId or 0, errors = errors, headOnly = true}
+if #errors > 0 then return nil, p.nextId, errors end
+local found = nil
+for _, line in ipairs(lines) do
+if not line.blank then
+if found or #line.tokens == 0 then
+return nil, p.nextId, {{line = 1, col = 1,
+message = "type one line, starting with a keyword"}}
+end
+found = line
+end
+end
+if not found then
+return nil, p.nextId, {{line = 1, col = 1, message = "the line is empty"}}
+end
+local entry = {line = found, children = {}, notes = {}}
+local ok, result = pcall(function()
+if place == "header" then return port(p, entry) end
+if place == "top" then return handler(p, entry) end
+local first = found.tokens[1]
+if first.t == "word" and first.v == "else" then
+error({parse = true, line = found.line, col = first.col,
+message = "`else` is added from the palette, under an `if`"}, 0)
+end
+return statement(p, entry)
+end)
+if not ok then
+if type(result) == "table" and result.parse then
+return nil, p.nextId, {{line = 1, col = result.col, message = result.message}}
+end
+error(result, 0)
+end
+if #p.errors > 0 then return nil, p.nextId, p.errors end
+result.span = {}
+return result, p.nextId, {}
+end
+
+
+function parse.ticks(d)
+if not d then return 0 end
+if d.unit == "t" then return d.n end
+if d.unit == "s" then return d.n * 20 end
+if d.unit == "m" then return d.n * 1200 end
+return 0
+end
+
+return parse

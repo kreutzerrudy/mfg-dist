@@ -1,0 +1,48 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local store = require("mfg.storage")
+local machines = require("mfg.controller.machines")
+
+
+
+
+
+
+
+
+local TRASH = "/trash"
+
+return {
+name        = "trash",
+label       = "Trash an item from a machine",
+tier        = "orchestrated",
+uses        = {"move"},
+policy      = true,
+destructive = true,
+
+parameters = {
+{name = "port", label = "Port", type = "path", required = true,
+choices = {source = "ports"}, help = "A machine's volume."},
+{name = "item", label = "Item", type = "item", required = true},
+},
+
+returns = {trashed = "number"},
+
+run = function(params, ctx)
+local _, bad = machines.volume(params.port)
+if bad then return rpc.REJECTED, {reason = bad} end
+if not store.isBound(TRASH) then
+return rpc.REJECTED, {reason = "no trash can: bind one as /trash (the HMI's "
+.. "Bind app, New device, or mfgctl bind /trash <device>)"}
+end
+local have = store.count(params.port, params.item) or 0
+if have <= 0 then return rpc.COMPLETED, {trashed = 0} end
+
+local status, fields = actions.invoke("move", {from = params.port, to = TRASH,
+item = params.item, count = have}, ctx)
+if status ~= rpc.COMPLETED then
+return rpc.REJECTED, {reason = tostring(fields and fields.reason)}
+end
+return rpc.COMPLETED, {trashed = fields.moved or 0}
+end,
+}
