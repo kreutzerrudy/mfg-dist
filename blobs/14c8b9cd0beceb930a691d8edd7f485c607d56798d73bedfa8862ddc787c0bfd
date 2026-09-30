@@ -1,0 +1,44 @@
+local rpc = require("mfg.common.rpc")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "add_machine",
+label       = "Make a machine from a script",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "machine", label = "Machine", type = "text", required = true,
+help = "Its name, like f1, or in a group, like smelter/f1."},
+{name = "script", label = "Script", type = "text", required = true},
+{name = "device", label = "Inventory", type = "text", required = false,
+help = "The machine's inventory peripheral, for the ports with slots."},
+{name = "chests", label = "Interface chests", type = "ports", required = false,
+help = "Port name to chest, for ports bound to a chest beside the machine."},
+},
+
+returns = {bound = "table", unbound = "table"},
+
+run = function(params, ctx)
+local record, result = scripts.addMachine(params.machine, params.script,
+params.device, ctx.by, params.chests)
+if not record then return rpc.REJECTED, {reason = tostring(result)} end
+return rpc.COMPLETED, {machine = record.name, script = record.script,
+enabled = record.enabled, bound = result.bound, unbound = result.unbound}
+end,
+}

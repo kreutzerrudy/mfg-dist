@@ -1,0 +1,37 @@
+local rpc = require("mfg.common.rpc")
+local binder = require("mfg.controller.binder")
+
+
+
+
+
+
+
+return {
+name        = "add_machines",
+label       = "Make many machines from a script",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "script", label = "Script", type = "text", required = true},
+{name = "group", label = "Group", type = "text", required = true,
+help = "The path they go under, like smelter."},
+{name = "kind", label = "Block", type = "text", required = true,
+help = "Every unbound block of this kind, like minecraft:furnace."},
+},
+
+returns = {made = "table", failed = "table"},
+
+run = function(params, ctx)
+local result, why = binder.makeMany(params.script, params.group, params.kind,
+ctx.by)
+if not result then return rpc.REJECTED, {reason = tostring(why)} end
+if #result.made == 0 then
+return rpc.REJECTED, {reason = tostring(result.failed[1]), failed = result.failed}
+end
+return rpc.COMPLETED, {made = result.made, failed = result.failed,
+group = params.group}
+end,
+}
