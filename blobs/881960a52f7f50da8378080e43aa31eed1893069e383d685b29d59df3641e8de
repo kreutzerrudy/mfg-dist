@@ -1,0 +1,596 @@
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local hal = require("mfg.common.hal")
+
+local mount = {}
+
+local STATE_FILE = "mounts"
+
+
+
+
+
+
+
+
+local SEGMENT = "^[a-z0-9_%-]+$"
+
+mount.EXCLUSIVE = "exclusive"
+mount.RELAYED = "relayed"
+
+
+
+
+
+
+mount.VOLUME = "volume"
+mount.KINDS = {volume = true, level = true, flag = true}
+mount.FACES = {top = true, bottom = true, left = true, right = true,
+front = true, back = true}
+
+function mount.kindOf(record)
+return record and record.kind or mount.VOLUME
+end
+
+function mount.isSignal(record)
+local kind = mount.kindOf(record)
+return kind == "level" or kind == "flag"
+end
+
+function mount.valid(path)
+if type(path) ~= "string" then return false end
+if path:sub(1, 1) ~= "/" then return false end
+if #path < 2 then return false end
+if path:sub(-1) == "/" then return false end
+if path:find("//", 1, true) then return false end
+
+for segment in path:gmatch("[^/]+") do
+if not segment:match(SEGMENT) then return false end
+end
+return true
+end
+
+function mount.all()
+local records = state.read(STATE_FILE, {})
+if type(records) ~= "table" then return {} end
+return records
+end
+
+function mount.get(path)
+return mount.all()[path]
+end
+
+
+
+
+
+
+function mount.list(prefix, kind)
+local out = {}
+for path, record in pairs(mount.all()) do
+if not prefix or prefix == "/" or path == prefix
+or path:sub(1, #prefix + 1) == prefix .. "/" then
+if not kind or (kind == "signal") == mount.isSignal(record) then
+out[#out + 1] = path
+end
+end
+end
+table.sort(out)
+return out
+end
+
+
+
+function mount.volumes(prefix)
+return mount.list(prefix, mount.VOLUME)
+end
+
+
+
+
+
+local function conflict(path, records)
+for existing in pairs(records) do
+if existing ~= path then
+if existing:sub(1, #path + 1) == path .. "/" then
+return existing .. " is already bound below " .. path
+end
+if path:sub(1, #existing + 1) == existing .. "/" then
+return existing .. " is already bound above " .. path
+end
+end
+end
+return nil
+end
+
+
+
+
+
+
+
+function mount.declare(path, opts)
+opts = opts or {}
+if not mount.valid(path) then
+return nil, "not a valid mount path: " .. tostring(path)
+end
+
+local records = mount.all()
+local clash = conflict(path, records)
+if clash then return nil, clash end
+
+local existing = records[path]
+local function keep(field)
+if opts[field] ~= nil then return opts[field] end
+return existing and existing[field]
+end
+
+local kind = keep("kind")
+if kind ~= nil and not mount.KINDS[kind] then
+return nil, ("not a kind of port: %s"):format(tostring(kind))
+end
+
+
+local kept = existing
+if existing and mount.isSignal(existing) ~= mount.isSignal({kind = kind}) then
+kept = nil
+end
+
+records[path] = {
+path = path,
+node = keep("node"),
+role = keep("role"),
+devices = kept and kept.devices or {},
+coherence = keep("coherence") or mount.RELAYED,
+position = keep("position"),
+bound = kept and kept.bound,
+by = kept and kept.by,
+
+
+
+kind = kind,
+direction = keep("direction"),
+safe = keep("safe"),
+machine = keep("machine"),
+script = keep("script"),
+face = kept and kept.face,
+slots = kept and kept.slots,
+via = kept and kept.via,
+
+
+
+marks = kept and kept.marks,
+rebound = kept and kept.rebound,
+
+
+
+holds = keep("holds"),
+
+
+system = kept and kept.system,
+}
+state.write(STATE_FILE, records)
+return records[path]
+end
+
+
+
+local function networkOf(device)
+local ok, net = pcall(hal.network)
+if not ok then return nil end
+return net.system(device)
+end
+
+local function parentOf(path)
+return path:match("^(.*)/[^/]+$") or ""
+end
+
+
+
+
+local function shareConflict(path, device, slots, records)
+for other, record in pairs(records) do
+if other ~= path and not mount.isSignal(record) then
+for _, held in ipairs(record.devices or {}) do
+if held == device then
+if not slots or not record.slots then
+return ("%s is already bound to %s"):format(device, other)
+end
+if parentOf(other) ~= parentOf(path) then
+return ("%s is already bound to %s, another machine's")
+:format(device, other)
+end
+local mine = {}
+for _, slot in ipairs(slots) do mine[slot] = true end
+for _, slot in ipairs(record.slots) do
+if mine[slot] then
+return ("slot %d of %s is already bound to %s")
+:format(slot, device, other)
+end
+end
+end
+end
+end
+end
+return nil
+end
+
+
+local function cleanSlots(given)
+local slots, seen = {}, {}
+for _, slot in ipairs(given) do
+if type(slot) ~= "number" or slot < 1 or math.floor(slot) ~= slot then
+return nil, "slots are whole numbers from 1, not " .. tostring(slot)
+end
+if not seen[slot] then
+slots[#slots + 1] = slot
+seen[slot] = true
+end
+end
+if #slots == 0 then return nil, "no slots given" end
+table.sort(slots)
+return slots
+end
+
+
+
+
+
+
+
+function mount.bind(path, devices, opts)
+opts = opts or {}
+if type(devices) == "string" then devices = {devices} end
+if type(devices) ~= "table" or #devices == 0 then
+return nil, "bind needs at least one device"
+end
+
+local existing = mount.get(path)
+local signal = mount.isSignal({kind = opts.kind or (existing and existing.kind)})
+
+
+if signal then
+if #devices ~= 1 then return nil, "a signal binds to one device" end
+if not mount.FACES[opts.face or ""] then
+return nil, ("a signal needs a face -- top, bottom, left, right, front "
+.. "or back -- not %s"):format(tostring(opts.face))
+end
+if opts.slots then return nil, "a signal has no slots" end
+elseif opts.face then
+return nil, ("%s is a volume, and a volume has no face"):format(path)
+else
+
+
+
+
+for _, device in ipairs(devices) do
+if mount.FACES[device] then
+return nil, ("%s is touching the computer, and CC cannot move items "
+.. "between it and chests on the network. Put a wired modem on "
+.. "that chest, cable it in, right-click the modem, and bind the "
+.. "name it prints"):format(device)
+end
+end
+end
+
+
+
+local system = nil
+if not signal then
+for _, device in ipairs(devices) do system = networkOf(device) or system end
+end
+if system then
+if #devices ~= 1 then
+return nil, "a storage network binds to its one bridge, alone (SN1.2)"
+end
+if opts.slots then return nil, "a storage network has no slots" end
+if opts.machine or (existing and existing.machine) then
+return nil, "a storage network can only be a member of the pool (SN1.3)"
+end
+local copy = {}
+for k, v in pairs(opts) do copy[k] = v end
+copy.coherence = mount.RELAYED
+opts = copy
+end
+
+
+local slots = nil
+if opts.slots then
+if #devices ~= 1 then return nil, "a slot-scoped volume has one device" end
+local why
+slots, why = cleanSlots(opts.slots)
+if not slots then return nil, why end
+end
+
+if not signal then
+local records = mount.all()
+for _, device in ipairs(devices) do
+local clash = shareConflict(path, device, slots, records)
+if clash then return nil, clash end
+end
+end
+
+local declared, err = mount.declare(path, opts)
+if not declared then return nil, err end
+
+local records = mount.all()
+local record = records[path]
+record.devices = {}
+for _, device in ipairs(devices) do record.devices[#record.devices + 1] = device end
+record.face = signal and opts.face or nil
+record.slots = slots
+record.via = (not signal) and opts.via or nil
+record.system = system
+record.bound = os.epoch("utc")
+record.by = opts.by or "manual"
+state.write(STATE_FILE, records)
+return record
+end
+
+
+
+
+
+
+function mount.extend(path, devices, opts)
+opts = opts or {}
+if type(devices) == "string" then devices = {devices} end
+local existing = mount.get(path)
+if existing and mount.isSignal(existing) then
+return nil, ("%s is a signal, not a volume"):format(path)
+end
+
+if existing and existing.system then
+return nil, ("%s is a storage network, and a network is one bridge: bind "
+.. "another as its own member"):format(path)
+end
+
+if existing and existing.slots then
+return nil, ("%s is slots of one device and cannot take another"):format(path)
+end
+
+local all, seen, added = {}, {}, {}
+for _, device in ipairs(existing and existing.devices or {}) do
+all[#all + 1], seen[device] = device, true
+end
+for _, device in ipairs(devices or {}) do
+if not seen[device] then
+all[#all + 1], seen[device] = device, true
+added[#added + 1] = device
+end
+end
+if #added == 0 then return nil, "nothing new to add to " .. path end
+
+local record, err = mount.bind(path, all, {
+coherence = existing and existing.coherence or opts.coherence,
+via = existing and existing.via,
+by = opts.by,
+})
+if not record then return nil, err end
+return record, added
+end
+
+
+
+function mount.unbind(path)
+local records = mount.all()
+local record = records[path]
+if not record then return false, "not bound: " .. tostring(path) end
+if record.machine then
+record.devices, record.face, record.slots, record.via = {}, nil, nil, nil
+record.bound, record.by = nil, nil
+else
+records[path] = nil
+end
+state.write(STATE_FILE, records)
+return true
+end
+
+
+
+function mount.forget(path)
+local records = mount.all()
+if not records[path] then return false, "no such point: " .. tostring(path) end
+records[path] = nil
+state.write(STATE_FILE, records)
+return true
+end
+
+function mount.isBound(path)
+local record = mount.get(path)
+if not record then
+
+for _, member in ipairs(mount.members(path)) do
+if #(mount.get(member).devices or {}) > 0 then return true end
+end
+return false
+end
+return #record.devices > 0
+end
+
+
+
+
+
+
+
+
+
+function mount.members(path)
+if type(path) ~= "string" or path == "" then return {} end
+local out = {}
+for member, record in pairs(mount.all()) do
+if member:sub(1, #path + 1) == path .. "/" and not record.machine
+and not mount.isSignal(record) then
+out[#out + 1] = member
+end
+end
+table.sort(out)
+return out
+end
+
+
+function mount.isGroup(path)
+return mount.get(path) == nil and #mount.members(path) > 0
+end
+
+
+
+mount.GENERAL = "cluster"
+function mount.home(path)
+if mount.get(path) then return path end
+return path .. "/" .. mount.GENERAL
+end
+
+
+
+
+function mount.migrateGroup(path)
+local records = mount.all()
+local record = records[path]
+if not record or record.machine or mount.isSignal(record) then return nil end
+local to = path .. "/" .. mount.GENERAL
+if records[to] then return nil end
+record.path = to
+records[to], records[path] = record, nil
+state.write(STATE_FILE, records)
+return to
+end
+
+
+
+
+
+
+
+
+function mount.devices(path)
+local record = mount.get(path)
+if not record then return nil, nil, "not bound: " .. tostring(path) end
+
+
+
+local backend
+if mount.isSignal(record) then backend = hal.redstone()
+elseif record.system then backend = hal.network()
+else backend = hal.inventory() end
+local present, missing = {}, {}
+for _, device in ipairs(record.devices) do
+if backend.isPresent(device) then
+present[#present + 1] = device
+else
+missing[#missing + 1] = device
+end
+end
+return present, missing
+end
+
+
+function mount.claimed()
+local claimed = {}
+for _, record in pairs(mount.all()) do
+for _, device in ipairs(record.devices) do claimed[device] = record.path end
+end
+return claimed
+end
+
+
+
+
+
+
+
+function mount.unclaimed()
+local inv = hal.inventory()
+local claimed = mount.claimed()
+local out = {}
+for _, device in ipairs(inv.names()) do
+if not claimed[device] then out[#out + 1] = device end
+end
+table.sort(out)
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local STORAGE_WORDS = {chest = true, barrel = true, shulker = true, crate = true}
+local SHARED_WORDS = {ender = true, dimensional = true, personal = true,
+limited = true, lootr = true}
+local SHARED_MODS = {enderstorage = true, dimstorage = true, lootr = true}
+
+function mount.isStorage(kind)
+if type(kind) ~= "string" then return false end
+local mod, id = kind:match("^([^:]+):(.+)$")
+if not mod then mod, id = "minecraft", kind end
+if SHARED_MODS[mod] then return false end
+
+local storage = false
+for word in id:gmatch("[^_/]+") do
+if SHARED_WORDS[word] then return false end
+if STORAGE_WORDS[word] then storage = true end
+end
+return storage
+end
+
+
+
+function mount.unclaimedByKind()
+local inv = hal.inventory()
+local storage, other = {}, {}
+for _, device in ipairs(mount.unclaimed()) do
+local kind = inv.kind(device)
+local entry = {device = device, kind = kind}
+if mount.isStorage(kind) then
+storage[#storage + 1] = entry
+else
+other[#other + 1] = entry
+end
+end
+return storage, other
+end
+
+
+
+function mount.pathOf(device)
+return mount.claimed()[device]
+end
+
+function mount.holders(device)
+local out = {}
+for path, record in pairs(mount.all()) do
+for _, held in ipairs(record.devices or {}) do
+if held == device then out[#out + 1] = path end
+end
+end
+table.sort(out)
+return out
+end
+
+return mount

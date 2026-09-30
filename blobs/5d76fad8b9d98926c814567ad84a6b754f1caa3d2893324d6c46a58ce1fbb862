@@ -1,0 +1,160 @@
+
+
+
+
+
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+
+
+local SYSTEMS = {rsBridge = "rs", rs_bridge = "rs", meBridge = "me", me_bridge = "me"}
+
+
+local UNLIMITED = 2 ^ 31
+
+function backend.system(name)
+if type(name) ~= "string" or not peripheral.isPresent(name) then return nil end
+for _, kind in ipairs({peripheral.getType(name)}) do
+if SYSTEMS[kind] then return SYSTEMS[kind] end
+end
+return nil
+end
+
+function backend.isPresent(name)
+return backend.system(name) ~= nil
+end
+
+function backend.names()
+local found = {}
+for _, name in ipairs(peripheral.getNames()) do
+if backend.system(name) then found[#found + 1] = name end
+end
+table.sort(found)
+return found
+end
+
+local function wrap(name)
+if not backend.system(name) then
+return nil, "no storage network bridge named " .. tostring(name)
+end
+return peripheral.wrap(name)
+end
+
+
+
+function backend.connected(name)
+local bridge = wrap(name)
+if not bridge then return false end
+local ok, connected = pcall(bridge.isConnected)
+return ok and connected == true
+end
+
+
+
+local function tagSet(tags)
+local out = {}
+for k, v in pairs(tags or {}) do
+if type(k) == "number" then out[v] = true else out[k] = true end
+end
+return out
+end
+
+
+
+
+function backend.list(name)
+local bridge, why = wrap(name)
+if not bridge then return nil, why end
+local ok, items, err = pcall(bridge.listItems)
+if not ok then return nil, tostring(items) end
+if type(items) ~= "table" then return nil, tostring(err or "not connected") end
+local out = {}
+for _, entry in ipairs(items) do
+out[#out + 1] = {
+name = entry.name,
+count = entry.amount or entry.count or 0,
+fingerprint = entry.fingerprint,
+displayName = entry.displayName,
+tags = tagSet(entry.tags),
+hasNbt = entry.nbt ~= nil,
+}
+end
+return out
+end
+
+local function call(bridge, method, ...)
+if not bridge[method] then return nil end
+local ok, value = pcall(bridge[method], ...)
+if ok and type(value) == "number" then return value end
+return nil
+end
+
+
+
+function backend.capacity(name, stored)
+local bridge, why = wrap(name)
+if not bridge then return nil, why end
+if backend.system(name) == "me" then
+
+local free = call(bridge, "getAvailableItemStorage")
+local total = call(bridge, "getTotalItemStorage")
+if not free then return nil, "the bridge gave no capacity" end
+return {free = free * 8, total = (total or 0) * 8, exact = false}
+end
+local disk = call(bridge, "getMaxItemDiskStorage") or 0
+local external = call(bridge, "getMaxItemExternalStorage") or 0
+if disk < 0 or external < 0 then
+return {free = UNLIMITED, total = UNLIMITED, exact = false}
+end
+local total = disk + external
+return {free = math.max(0, total - (stored or 0)), total = total, exact = false}
+end
+
+
+function backend.count(name, fingerprint)
+local bridge = wrap(name)
+if not bridge then return 0 end
+local ok, item = pcall(bridge.getItem, {fingerprint = fingerprint})
+if not ok or type(item) ~= "table" then return 0 end
+return item.amount or item.count or 0
+end
+
+
+local function bridgeFilter(filter)
+local out = {}
+for k, v in pairs(filter) do out[k] = v end
+if out.fromSlot then out.fromSlot = out.fromSlot - 1 end
+if out.toSlot then out.toSlot = out.toSlot - 1 end
+return out
+end
+
+local function moved(ok, n, err)
+if not ok then return nil, tostring(n) end
+if type(n) ~= "number" then return nil, tostring(err or "the bridge moved nothing") end
+if n == 0 and err then return 0, tostring(err) end
+return n
+end
+
+
+
+function backend.export(name, filter, target)
+local bridge, why = wrap(name)
+if not bridge then return nil, why end
+return moved(pcall(bridge.exportItemToPeripheral, bridgeFilter(filter), target))
+end
+
+
+function backend.import(name, filter, source)
+local bridge, why = wrap(name)
+if not bridge then return nil, why end
+return moved(pcall(bridge.importItemFromPeripheral, bridgeFilter(filter), source))
+end
+
+return backend
