@@ -1,0 +1,81 @@
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local store = require("mfg.storage")
+local mount = require("mfg.storage.mount")
+local pockets = require("mfg.controller.pockets")
+
+local loadouts = {}
+
+loadouts.STATE = "loadouts"
+
+
+function loadouts.valid(name)
+return type(name) == "string" and name:match("^[a-z0-9_%-]+$") ~= nil
+end
+
+function loadouts.path(owner, name)
+return ("/players/%s/loadouts/%s"):format(pockets.segment(owner), name)
+end
+
+local function worn() return state.read(loadouts.STATE, {}) end
+
+function loadouts.worn(owner)
+return worn()[pockets.segment(owner)]
+end
+
+function loadouts.setWorn(owner, name)
+local all = worn()
+all[pockets.segment(owner)] = name
+state.write(loadouts.STATE, all)
+end
+
+
+function loadouts.list(owner)
+local out = {}
+local prefix = ("/players/%s/loadouts/"):format(pockets.segment(owner))
+for path in pairs(mount.all()) do
+if path:sub(1, #prefix) == prefix then out[#out + 1] = path:sub(#prefix + 1) end
+end
+table.sort(out)
+return out
+end
+
+
+
+
+function loadouts.save(owner, name)
+local moved, why = store.unloadInventory(pockets.inventoryPath(owner),
+loadouts.path(owner, name))
+loadouts.setWorn(owner, name)
+return moved, why
+end
+
+
+
+
+function loadouts.swap(owner, name)
+local current = loadouts.worn(owner)
+if not current or not mount.get(loadouts.path(owner, current)) then
+return nil, "save what you're carrying as a loadout first"
+end
+if not loadouts.valid(name) or not mount.get(loadouts.path(owner, name)) then
+return nil, ("%s has no loadout called %s"):format(owner, tostring(name))
+end
+if current == name then return {out = 0, into = 0, note = "already worn"} end
+local inventory = pockets.inventoryPath(owner)
+local out, outWhy = store.unloadInventory(inventory, loadouts.path(owner, current))
+if outWhy then
+
+return nil, ("saved %d into %s, but %s -- nothing loaded"):format(out, current, outWhy)
+end
+local into, inWhy = store.loadInventory(loadouts.path(owner, name), inventory)
+loadouts.setWorn(owner, name)
+return {out = out, into = into, note = inWhy}
+end
+
+return loadouts

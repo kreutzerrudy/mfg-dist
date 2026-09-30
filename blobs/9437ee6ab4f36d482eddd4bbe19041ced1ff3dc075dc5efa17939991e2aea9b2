@@ -1,0 +1,366 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local L = {}
+
+L.MAX_TRIES = 3
+L.JOURNAL_VERSION = 1
+
+local function P(root, path) return fs.combine(root or "/", path) end
+
+
+
+
+
+
+function L.readTable(path)
+if not fs.exists(path) then
+local temp = path .. ".new"
+if not fs.exists(temp) then return nil end
+fs.move(temp, path)
+end
+local handle = fs.open(path, "r")
+if not handle then return nil end
+local text = handle.readAll()
+handle.close()
+local ok, value = pcall(textutils.unserialize, text)
+if ok then return value end
+return nil
+end
+
+function L.writeTable(path, value)
+local dir = fs.getDir(path)
+if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+local temp = path .. ".new"
+if fs.exists(temp) then fs.delete(temp) end
+local handle = fs.open(temp, "w")
+handle.write(textutils.serialize(value))
+handle.close()
+if fs.exists(path) then fs.delete(path) end
+fs.move(temp, path)
+end
+
+function L.record(root) return L.readTable(P(root, "boot/record")) end
+function L.writeRecord(root, record) L.writeTable(P(root, "boot/record"), record) end
+
+
+
+function L.manifestPaths(path)
+local set = {}
+if not fs.exists(path) then return nil end
+local handle = fs.open(path, "r")
+if not handle then return nil end
+for line in handle.readAll():gmatch("[^\r\n]+") do
+local file = line:match("^file%s+(%S+)")
+if file then set[file] = true end
+end
+handle.close()
+return set
+end
+
+local function listFiles(dir, prefix, out)
+out = out or {}
+if not fs.isDir(dir) then return out end
+for _, name in ipairs(fs.list(dir)) do
+local full = fs.combine(dir, name)
+local rel = prefix and (prefix .. "/" .. name) or name
+if fs.isDir(full) then listFiles(full, rel, out) else out[#out + 1] = rel end
+end
+table.sort(out)
+return out
+end
+L.listFiles = listFiles
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function journalPath(root) return P(root, "boot/journal") end
+local function progressPath(root) return P(root, "boot/journal.at") end
+
+function L.writeJournal(root, steps, kind)
+L.writeTable(journalPath(root), {v = L.JOURNAL_VERSION, kind = kind, steps = steps})
+if fs.exists(progressPath(root)) then fs.delete(progressPath(root)) end
+end
+
+function L.hasJournal(root)
+return fs.exists(journalPath(root)) or fs.exists(journalPath(root) .. ".new")
+end
+
+local function doStep(root, step, notes)
+local op = step[1]
+if op == "move" then
+local from, to = P(root, step[2]), P(root, step[3])
+if fs.exists(from) then
+local dir = fs.getDir(to)
+if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
+if fs.exists(to) then fs.delete(to) end
+fs.move(from, to)
+elseif not fs.exists(to) then
+notes[#notes + 1] = "nothing to move: " .. step[2]
+end
+elseif op == "delete" then
+local path = P(root, step[2])
+if fs.exists(path) then fs.delete(path) end
+else
+error("journal step this stage 0 does not understand: " .. tostring(op), 0)
+end
+end
+
+
+
+function L.replay(root, limit)
+local journal = L.readTable(journalPath(root))
+if not journal then return true, {} end
+if journal.v ~= L.JOURNAL_VERSION then
+error(("journal version %s; this stage 0 understands %d"):format(
+tostring(journal.v), L.JOURNAL_VERSION), 0)
+end
+local at = L.readTable(progressPath(root)) or 0
+local notes, done = {}, 0
+for i = at + 1, #journal.steps do
+if limit and done >= limit then return false, notes end
+doStep(root, journal.steps[i], notes)
+L.writeTable(progressPath(root), i)
+done = done + 1
+end
+fs.delete(journalPath(root))
+if fs.exists(progressPath(root)) then fs.delete(progressPath(root)) end
+return true, notes
+end
+
+
+
+
+function L.canRollBack(root)
+return fs.exists(P(root, "boot/prev/record"))
+end
+
+
+
+
+
+function L.rollbackSteps(root, why)
+local prevRecord = L.readTable(P(root, "boot/prev/record"))
+if not prevRecord then return nil, "no previous generation to roll back to" end
+local current = L.record(root) or {}
+local steps = {}
+
+local active = L.manifestPaths(P(root, "boot/firmware")) or {}
+local previous = L.manifestPaths(P(root, "boot/prev/firmware"))
+if previous then
+local added = {}
+for path in pairs(active) do
+if not previous[path] then added[#added + 1] = path end
+end
+table.sort(added)
+for _, path in ipairs(added) do steps[#steps + 1] = {"delete", path} end
+end
+
+for _, rel in ipairs(listFiles(P(root, "boot/prev/files"))) do
+steps[#steps + 1] = {"move", "boot/prev/files/" .. rel, rel}
+end
+
+if fs.isDir(P(root, "boot/prev/state")) then
+for _, rel in ipairs(listFiles(P(root, "mfg/state"))) do
+if rel ~= "actions" and rel ~= "actions.new" then
+steps[#steps + 1] = {"delete", "mfg/state/" .. rel}
+end
+end
+for _, rel in ipairs(listFiles(P(root, "boot/prev/state"))) do
+steps[#steps + 1] = {"move", "boot/prev/state/" .. rel, "mfg/state/" .. rel}
+end
+end
+
+for _, name in ipairs({"firmware", "config"}) do
+if fs.exists(P(root, "boot/prev/" .. name)) then
+steps[#steps + 1] = {"move", "boot/prev/" .. name, "boot/" .. name}
+end
+end
+
+prevRecord.state = "committed"
+prevRecord.tries = 0
+prevRecord.rolled_back_from = current.active
+prevRecord.rolled_back_because = why
+L.writeTable(P(root, "boot/rollback.record"), prevRecord)
+steps[#steps + 1] = {"move", "boot/rollback.record", "boot/record"}
+steps[#steps + 1] = {"delete", "boot/prev"}
+return steps
+end
+
+function L.rollback(root, why)
+local steps, bad = L.rollbackSteps(root, why)
+if not steps then return nil, bad end
+L.writeJournal(root, steps, "rollback")
+return L.replay(root)
+end
+
+
+
+local function lastError(root, text)
+L.writeTable(P(root, "boot/last_error"), {at = os.epoch("utc"), error = text})
+end
+
+
+
+
+
+
+function L.boot(root, hooks)
+hooks = hooks or {}
+local say = hooks.say or print
+local warn = hooks.warn or printError
+local reboot = hooks.reboot or function() sleep(3) os.reboot() end
+local run = hooks.run or function()
+return require("mfg.boot").run(root, {shell = shell})
+end
+
+if L.hasJournal(root) then
+local ok, finished = pcall(L.replay, root)
+if not ok then
+lastError(root, "journal: " .. tostring(finished))
+warn("could not finish the boot journal: " .. tostring(finished))
+return "recovery"
+end
+end
+
+local record = L.record(root)
+if not record then
+warn("no boot record: this computer is not managed by the bootloader")
+return "unmanaged"
+end
+
+if record.state == "trial" then
+record.tries = (record.tries or 0) + 1
+L.writeRecord(root, record)
+if record.tries > L.MAX_TRIES then
+
+
+
+local prior = L.readTable(P(root, "boot/last_error"))
+local why = ("boot set failed %d trial boots"):format(record.tries - 1)
+local cause = type(prior) == "table" and type(prior.error) == "string" and prior.error or nil
+
+
+if cause and cause:find("trial boots", 1, true) then cause = cause:match("%(last: (.*)%)") end
+if cause then why = why .. " (last: " .. cause .. ")" end
+if not L.canRollBack(root) then
+lastError(root, why .. ", and there is nothing to roll back to")
+warn(why .. ", and there is nothing to roll back to -- recovery")
+return "recovery"
+end
+warn(why .. " -- rolling back to the previous generation")
+local ok, err = pcall(L.rollback, root, why)
+if not ok then
+lastError(root, "rollback: " .. tostring(err))
+warn("rollback failed: " .. tostring(err))
+return "recovery"
+end
+reboot()
+return "rolledback"
+end
+say(("boot set on trial, attempt %d of %d"):format(record.tries, L.MAX_TRIES))
+end
+
+local ok, err = pcall(run, root)
+
+
+
+
+
+if not ok and tostring(err):find("Terminated$") then
+say("stopped by operator -- run /startup to boot again")
+return "stopped"
+end
+
+local why = ok and "the boot stages returned; the node stopped" or tostring(err)
+lastError(root, why)
+
+
+record = L.record(root) or record
+if record.state == "trial" then
+warn("boot failed on trial: " .. why)
+reboot()
+return "reboot"
+end
+warn("boot failed on a COMMITTED boot set -- recovery: " .. why)
+warn("see /boot/last_error. The previous generation is kept in /boot/prev.")
+return "recovery"
+end
+
+
+
+
+
+
+
+
+function L.owner(root)
+local path = P(root, "mfg/enroll.cfg")
+if not fs.exists(path) then return nil end
+local handle = fs.open(path, "r")
+if not handle then return nil end
+local text = handle.readAll()
+handle.close()
+return text and text:match("owner%s+(%S+)") or nil
+end
+
+function L.locked(owner, why)
+while true do
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+print("This pocket belongs to " .. owner .. ".")
+print("")
+print("It runs only in their inventory, with the controller reachable.")
+if why then
+print("")
+printError(why)
+end
+print("")
+print("Hold Ctrl+R to try again.")
+os.pullEventRaw("mfg_locked_forever")
+end
+end
+
+if select(1, ...) == "--lib" then return L end
+
+local owner = L.owner("/")
+if owner then os.pullEvent = os.pullEventRaw end
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+local outcome = L.boot("/")
+if owner then L.locked(owner, "the boot stopped: " .. tostring(outcome)) end

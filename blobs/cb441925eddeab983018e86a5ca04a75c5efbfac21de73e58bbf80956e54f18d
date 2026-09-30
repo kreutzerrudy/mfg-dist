@@ -1,0 +1,334 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+local services = require("mfg.common.services")
+
+local controller = {}
+
+
+
+
+local function netReady()
+if require("net").ready() then return true end
+return false, "the netstack has not come up"
+end
+
+local function acknetReady()
+if require("acknet").isRunning() then return true end
+return false, "acknet is not running"
+end
+
+
+
+
+function controller.checkIn(packet)
+local body = packet and packet.body
+if type(body) ~= "table" or body.kind ~= "checkin" then return false end
+local name = packet.from or body.node
+if type(name) ~= "string" or name == "" then return false end
+require("mfg.controller.configs").observe(name, body, {verified = packet.from ~= nil})
+return true
+end
+
+
+
+
+function controller.observeSelf(report)
+return require("mfg.controller.configs").observe(report.node, report, {verified = true})
+end
+
+
+
+
+
+function controller.onRebind(path, event)
+local alarms = require("mfg.controller.alarms")
+local key = "storage.rebound." .. path
+if event.ambiguous then
+alarms.raise(key, ("%s: %s is missing, and %s all hold its marker -- not "
+.. "rebound; take the marker out of the wrong one"):format(path, event.from,
+table.concat(event.ambiguous, ", ")), {source = "storage"})
+return
+end
+alarms.raise(key, ("%s: %s is now %s, found by %s (its modem was probably "
+.. "replaced) -- rebound"):format(path, event.from, event.to, event.how),
+{severity = "warn", source = "storage"})
+alarms.clear(key)
+end
+
+
+
+
+function controller.onStrayPage(path, device, strays)
+local alarms = require("mfg.controller.alarms")
+for _, stray in ipairs(strays) do
+local key = "binder.stray." .. stray.path
+alarms.raise(key, ("the page for %s is in a chest that is already %s -- take it "
+.. "out, and put it in the chest it is for"):format(stray.path, path),
+{severity = "warn", source = "binder"})
+alarms.clear(key)
+end
+end
+
+
+
+function controller.onBufferStuck(path, buffer)
+local alarms = require("mfg.controller.alarms")
+alarms.raise("player.buffer." .. path, ("%s: its buffer chest %s holds items a move "
+.. "couldn't put back -- they go back to the player, or the pool, within seconds")
+:format(path, buffer), {severity = "warn", source = "storage"})
+end
+
+
+
+function controller.onBinderEvent(event)
+local alarms = require("mfg.controller.alarms")
+local key = "binder." .. tostring(event.path)
+if event.kind == "bound" or event.kind == "moved" then
+alarms.raise(key, event.text, {severity = "warn", source = "binder"})
+alarms.clear(key)
+elseif event.kind == "refused" or event.kind == "ambiguous" or event.kind == "stuck" then
+alarms.raise(key, event.text, {severity = "warn", source = "binder"})
+end
+end
+
+function controller.declare(manager, ctx)
+
+
+
+local pool = require("mfg.common.config").setting("source")
+local moved = require("mfg.storage.mount").migrateGroup(pool)
+if moved then print(("storage: %s is now %s (its general chests)"):format(pool, moved)) end
+
+for _, path in ipairs(require("mfg.storage.mount").relayStores()) do
+print(("storage: %s is read afresh now (a store)"):format(path))
+end
+
+
+require("mfg.storage").onRebind = controller.onRebind
+require("mfg.storage").onStrayPage = controller.onStrayPage
+
+require("mfg.common.actions").gate = require("mfg.controller.pockets").gate
+require("mfg.storage").onBufferStuck = controller.onBufferStuck
+
+services.declare(manager, {
+name = "enrolld",
+requires = {"netstack"},
+ready = acknetReady,
+start = function()
+ctx.shell.run("/mfg/controller/enrolld")
+end,
+})
+
+
+
+
+
+
+
+
+services.declare(manager, {
+name = "reports",
+requires = {"netstack"},
+ready = netReady,
+start = function()
+local net = require("net")
+
+
+ctx.bind({"mfg-control", "mfg-report", "mfg-scada", "mfg-order"})
+while true do
+local packet = net.receive("mfg-report", 5)
+if packet then
+local ok, err = pcall(controller.checkIn, packet)
+if not ok then printError("check-in not recorded: " .. tostring(err)) end
+end
+end
+end,
+})
+
+
+
+
+
+
+
+
+
+
+
+services.declare(manager, {
+name = "scada",
+requires = {"reports"},
+start = function()
+local actions = require("mfg.common.actions")
+local status, fields = actions.invoke("serve_operator", {},
+{by = "controller"})
+
+
+error(("operator surface stopped: %s"):format(
+tostring(fields and fields.reason or status)), 0)
+end,
+})
+
+
+
+
+services.declare(manager, {
+name = "alarms",
+requires = {"reports"},
+start = function()
+local scada = require("mfg.controller.scada")
+scada.tick({timeout = 2, attempts = 1})
+while true do
+sleep(1)
+if scada.refreshDue() then
+scada.tick({timeout = 2, attempts = 1})
+end
+end
+end,
+})
+
+
+
+services.declare(manager, {
+name = "orders",
+requires = {"reports"},
+start = function()
+local net = require("net")
+local rpc = require("mfg.common.rpc")
+local orders = require("mfg.controller.orders")
+while true do
+local packet = net.receive("mfg-order", 2)
+if packet and type(packet.body) == "table" then
+local status, fields = orders.handle(packet.body, packet)
+net.send(packet.src, "mfg-order",
+rpc.reply(packet.body.rpc, status, fields))
+end
+end
+end,
+})
+
+
+
+
+services.declare(manager, {
+name = "fulfil",
+requires = {"reports"},
+start = function()
+local orders = require("mfg.controller.orders")
+local custody = require("mfg.storage.custody")
+while true do
+sleep(15)
+local open = false
+for _, order in pairs(custody.orders()) do
+if order.state ~= custody.SETTLED
+and order.state ~= custody.RETURNED
+and order.state ~= custody.FULFILLED then
+open = true
+end
+end
+if open then orders.fulfil() end
+end
+end,
+})
+
+
+
+
+
+services.declare(manager, {
+name = "jobs",
+requires = {"reports"},
+start = function()
+require("mfg.controller.runner").run()
+end,
+})
+
+
+
+services.declare(manager, {
+name = "scheduler",
+start = function()
+require("mfg.controller.schedules").run()
+end,
+})
+
+
+
+services.declare(manager, {
+name = "intake",
+start = function()
+require("mfg.controller.ports").run()
+end,
+})
+
+
+
+
+services.declare(manager, {
+name = "binder",
+start = function()
+local binder = require("mfg.controller.binder")
+while true do
+local ok, events = pcall(binder.tick)
+if not ok then
+print("binder: " .. tostring(events))
+else
+for _, event in ipairs(events) do
+pcall(controller.onBinderEvent, event)
+end
+end
+sleep(1)
+end
+end,
+})
+
+
+
+services.declare(manager, {
+name = "players",
+start = function()
+local rules = require("mfg.controller.playerrules")
+local alarms = require("mfg.controller.alarms")
+local raised = {}
+while true do
+local ok, why = pcall(rules.run)
+if not ok then print("players: " .. tostring(why)) end
+
+
+local swept, stuck = pcall(rules.sweepBuffers)
+if swept then
+local now = {}
+for _, path in ipairs(stuck) do now[path] = true end
+for path in pairs(raised) do
+if not now[path] then alarms.clear("player.buffer." .. path) end
+end
+raised = now
+end
+sleep(rules.EVERY)
+end
+end,
+})
+
+
+
+
+services.declare(manager, {
+name = "scripts",
+start = function()
+require("mfg.controller.scripts").run()
+end,
+})
+end
+
+return controller

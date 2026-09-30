@@ -1,0 +1,127 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+local backend = {}
+
+backend.name = "real"
+
+local TYPE = "inventoryManager"
+local SIDES = {"up", "down", "north", "south", "east", "west"}
+
+function backend.isPresent(name)
+return type(name) == "string" and peripheral.isPresent(name)
+and peripheral.hasType(name, TYPE) == true
+end
+
+function backend.names()
+local out = {}
+for _, name in ipairs(peripheral.getNames()) do
+if backend.isPresent(name) then out[#out + 1] = name end
+end
+table.sort(out)
+return out
+end
+
+local function wrap(name)
+if not backend.isPresent(name) then
+return nil, "no inventory manager named " .. tostring(name)
+end
+return peripheral.wrap(name)
+end
+
+
+function backend.owner(name)
+local manager, why = wrap(name)
+if not manager then return nil, why end
+local ok, owner = pcall(manager.getOwner)
+if not ok or type(owner) ~= "string" or owner == "" then
+return nil, "no memory card bound to a player in it"
+end
+return owner
+end
+
+
+
+
+function backend.list(name)
+local manager, why = wrap(name)
+if not manager then return nil, why end
+local ok, items = pcall(manager.getItems)
+if not ok then return nil, tostring(items) end
+if type(items) ~= "table" then return nil, "the manager gave no inventory" end
+local out = {}
+for _, item in ipairs(items) do
+local nbt = item.nbt
+
+if type(nbt) ~= "table" or next(nbt) == nil then nbt = nil end
+local tags = {}
+for k, v in pairs(item.tags or {}) do
+if type(k) == "number" then tags[v] = true else tags[k] = true end
+end
+out[item.slot] = {name = item.name, count = item.count, nbt = nbt, tags = tags,
+displayName = item.displayName, maxCount = item.maxStackSize}
+end
+return out
+end
+
+
+function backend.sides(name)
+local manager = wrap(name)
+if not manager then return {} end
+local out = {}
+for _, side in ipairs(SIDES) do
+local ok, items = pcall(manager.getItemsChest, side)
+if ok and type(items) == "table" then out[#out + 1] = side end
+end
+return out
+end
+
+
+
+function backend.chest(name, side)
+local manager = wrap(name)
+if not manager then return nil end
+local ok, items = pcall(manager.getItemsChest, side)
+if not ok or type(items) ~= "table" then return nil end
+local out = {}
+for _, item in pairs(items) do
+if type(item) == "table" and item.name then
+out[item.name] = (out[item.name] or 0) + (item.count or 0)
+end
+end
+return out
+end
+
+local function moved(ok, n, err)
+if not ok then return nil, tostring(n) end
+if type(n) ~= "number" then return nil, tostring(err or "the manager moved nothing") end
+if n == 0 and err then return 0, tostring(err) end
+return n
+end
+
+
+function backend.give(name, side, count, slot, item)
+local manager, why = wrap(name)
+if not manager then return nil, why end
+return moved(pcall(manager.addItemToPlayerNBT, side, count, slot, {name = item}))
+end
+
+
+function backend.take(name, side, count, slot, item)
+local manager, why = wrap(name)
+if not manager then return nil, why end
+return moved(pcall(manager.removeItemFromPlayerNBT, side, count, nil,
+{name = item, fromSlot = slot}))
+end
+
+return backend

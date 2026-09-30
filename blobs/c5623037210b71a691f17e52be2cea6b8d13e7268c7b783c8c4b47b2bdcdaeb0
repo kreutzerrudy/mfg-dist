@@ -1,0 +1,42 @@
+local rpc = require("mfg.common.rpc")
+local pockets = require("mfg.controller.pockets")
+
+
+
+
+return {
+name        = "player_rule",
+label       = "Set or remove an inventory rule",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "item", label = "Item", type = "text", required = true,
+help = "An id, like minecraft:cobblestone, or a #tag."},
+{name = "keep", label = "Keep", type = "number", integer = true, min = 0,
+required = false},
+{name = "over", label = "Over", type = "choice", choices = {"deposit", "trash", "vault"},
+required = false},
+{name = "min", label = "Top up to", type = "number", integer = true, min = 0,
+required = false},
+{name = "remove", label = "Remove", type = "flag", required = false},
+},
+
+returns = {rules = "table"},
+
+run = function(params, ctx)
+local owner, why = pockets.caller(ctx)
+if not owner then return rpc.REJECTED, {reason = tostring(why)} end
+local rules = require("mfg.controller.playerrules")
+if params.remove then
+if not rules.remove(owner, params.item) then
+return rpc.REJECTED, {reason = "no rule for " .. tostring(params.item)}
+end
+else
+local rule, err = rules.set(owner, {item = params.item, keep = params.keep,
+over = params.over, min = params.min})
+if not rule then return rpc.REJECTED, {reason = tostring(err)} end
+end
+return rpc.COMPLETED, {rules = rules.of(owner)}
+end,
+}

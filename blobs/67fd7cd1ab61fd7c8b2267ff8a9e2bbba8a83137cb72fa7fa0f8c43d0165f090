@@ -1,0 +1,42 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+local pockets = require("mfg.controller.pockets")
+
+
+
+
+return {
+name        = "vault_move",
+label       = "Put into, or take from, my vault",
+tier        = "orchestrated",
+uses        = {},
+policy      = true,
+destructive = false,
+
+parameters = {
+{name = "item", label = "Item", type = "item", required = true},
+{name = "count", label = "Count", type = "number", integer = true, min = 1,
+max = 3456, required = true},
+{name = "direction", label = "Direction", type = "choice", choices = {"in", "out"},
+required = true},
+},
+
+returns = {moved = "number"},
+
+run = function(params, ctx)
+local owner, why = pockets.caller(ctx)
+if not owner then return rpc.REJECTED, {reason = tostring(why)} end
+local inventory = pockets.inventoryPath(owner)
+local vault = ("/players/%s/vault"):format(pockets.segment(owner))
+if not store.isBound(vault) then
+return rpc.REJECTED, {reason = "you have no vault yet: bind one from the Player app"}
+end
+local from, to = inventory, vault
+if params.direction == "out" then from, to = vault, inventory end
+local moved, err = store.move(from, to, params.item, params.count)
+moved = moved or 0
+if moved == 0 then return rpc.REJECTED, {moved = 0, reason = tostring(err or "nothing moved")} end
+return rpc.COMPLETED, {moved = moved, item = params.item,
+reason = moved < params.count and err or nil}
+end,
+}

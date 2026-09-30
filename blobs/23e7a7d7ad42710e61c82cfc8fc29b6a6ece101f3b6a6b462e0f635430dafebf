@@ -1,0 +1,73 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "move",
+label       = "Move items between volumes",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "from", label = "From", type = "path", required = true,
+choices = {source = "volumes"},
+help = "The volume to take from."},
+
+{name = "to", label = "To", type = "path", required = true,
+choices = {source = "volumes"},
+help = "The volume to put into."},
+
+{name = "item", label = "Item", type = "item", required = true,
+choices = {source = "items"},
+help = "An item id, an id#nbt, or a #tag."},
+
+{name = "count", label = "Count", type = "number", integer = true,
+min = 1, required = true,
+help = "How many to move. Fewer may move; the result says how many."},
+},
+
+returns = {moved = "number", short = "number"},
+
+run = function(params)
+
+
+for _, path in ipairs({params.from, params.to}) do
+if type(path) == "string" and path:match("^/players/[^/]+/vault") then
+return rpc.REJECTED, {moved = 0, reason = path .. " is a player's vault: "
+.. "only their own pocket moves items in or out"}
+end
+end
+local moved, why = store.move(params.from, params.to, params.item,
+params.count)
+moved = moved or 0
+
+if moved == 0 then
+return rpc.REJECTED, {reason = tostring(why or "nothing moved"),
+moved = 0}
+end
+
+local fields = {moved = moved}
+if moved < params.count then
+fields.short = params.count - moved
+fields.reason = why
+end
+return rpc.COMPLETED, fields
+end,
+}

@@ -1,0 +1,147 @@
+
+
+
+
+
+
+local enrollment = require("mfg.common.enrollment")
+local leases = require("mfg.controller.leases")
+
+local acknet = require("acknet")
+local netkeys = require("netkeys")
+
+local enroll = {}
+
+local running = false
+
+
+
+
+
+
+
+
+
+
+
+local function delegated()
+if not netkeys.isServer() then return true end
+
+
+
+
+
+
+if not netkeys.isClient() then return true end
+
+return #netkeys.chain() > 0
+end
+
+local function refuse(reason)
+return {ok = false, reason = reason}
+end
+
+
+function enroll.handle(request)
+if type(request) ~= "table" or request.kind ~= "enroll" then
+return nil
+end
+
+local instance = tostring(request.instance or "")
+local pk = tostring(request.pk or "")
+local tag = tostring(request.mac or "")
+
+if instance == "" or pk == "" or tag == "" then
+return refuse("malformed enrollment request")
+end
+if not enrollment.fromHex(pk) or #pk ~= 64 then
+return refuse("public key is not 32 bytes of hex")
+end
+
+if not delegated() then
+
+
+
+return refuse("controller is not yet delegated -- try again shortly")
+end
+
+local lease, why = leases.claimable(instance)
+if not lease then return refuse(why) end
+
+local secret = enrollment.fromHex(lease.secret)
+if not secret then return refuse("lease secret is corrupt") end
+
+local expected, macErr = enrollment.mac(secret, instance, pk)
+if not expected then return refuse(tostring(macErr)) end
+
+if not enrollment.macEquals(expected, tag) then
+
+
+
+
+return refuse("authenticator did not verify")
+end
+
+
+
+
+if lease.owner then
+local computer = tonumber(request.computer)
+if not computer then return refuse("a player's pocket must say which computer it is") end
+local held, heldWhy = require("mfg.controller.pockets").held(lease.owner, computer)
+if not held then
+return refuse(("the pocket must be in %s's inventory to join: %s"):format(
+lease.owner, tostring(heldWhy)))
+end
+end
+
+
+
+
+netkeys.allow(pk)
+if lease.name then netkeys.setName(pk, lease.name) end
+if lease.address then netkeys.setAddress(pk, lease.address) end
+
+leases.consume(instance, pk, tonumber(request.computer))
+
+return {
+ok = true,
+name = lease.name,
+address = lease.address,
+instance = instance,
+}
+end
+
+function enroll.runtime()
+if running then error("mfg enroll: already running", 0) end
+running = true
+
+local ok, err = pcall(function()
+while true do
+local packet = acknet.receive(enrollment.PROTOCOL, 5)
+if packet then
+local reply = enroll.handle(packet.body)
+if reply then
+acknet.send(packet.sender_id, reply, enrollment.PROTOCOL)
+if reply.ok then
+print(("enrolled instance %s as %s"):format(
+tostring(reply.instance), tostring(reply.name)))
+else
+print(("refused enrollment: %s"):format(
+tostring(reply.reason)))
+end
+end
+else
+
+
+
+leases.reclaim()
+end
+end
+end)
+
+running = false
+if not ok then error(err, 0) end
+end
+
+return enroll

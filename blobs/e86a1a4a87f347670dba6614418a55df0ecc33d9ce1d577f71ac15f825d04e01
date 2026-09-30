@@ -1,0 +1,91 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local store = require("mfg.storage")
+local ports = require("mfg.controller.ports")
+local supervisor = require("mfg.controller.supervisor")
+local holds = require("mfg.controller.holds")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "withdraw",
+label       = "Withdraw from the pool",
+tier        = "orchestrated",
+uses        = {"move"},
+policy      = true,
+destructive = false,
+
+parameters = {
+{name = "item", label = "Item", type = "item", required = true,
+choices = {source = "items"}},
+{name = "count", label = "Count", type = "number", integer = true,
+min = 1, max = 3456, required = true,
+help = "How many. At most what no queued job has been promised."},
+{name = "held", label = "From my holds", type = "flag", required = false,
+help = "Take what is held for the caller's cart too (storage-ui-draft U7)."},
+},
+
+returns = {moved = "number", short = "number"},
+
+run = function(params, ctx)
+
+
+
+local pockets = require("mfg.controller.pockets")
+local dest = ports.OUT
+if pockets.check(ctx and ctx.by) then
+local owner, why = pockets.caller(ctx)
+if not owner then
+return rpc.REJECTED, {reason = tostring(why) .. " -- keep your pocket in your "
+.. "inventory"}
+end
+dest = pockets.inventoryPath(owner)
+if not store.isBound(dest) then
+return rpc.REJECTED, {reason = dest .. " is not bound"}
+end
+elseif not store.isBound(ports.OUT) then
+return rpc.REJECTED, {reason = ("%s is not bound -- mfgctl bind %s "
+.. "<chest>"):format(ports.OUT, ports.OUT)}
+end
+
+local pool = require("mfg.common.config").setting("source")
+local holder = params.held and ctx and ctx.by or nil
+local available, breakdown = supervisor.available(pool, holder)
+if not available then return rpc.REJECTED, {reason = tostring(breakdown)} end
+
+local free = available[params.item] or 0
+if params.count > free then
+return rpc.REJECTED, {free = free, reason = ("only %d %s free: the pool "
+.. "holds %d%s"):format(free, params.item,
+breakdown.stock[params.item] or 0,
+supervisor.spoken(params.item, breakdown, holder))}
+end
+
+local status, fields = actions.invoke("move", {from = pool, to = dest,
+item = params.item, count = params.count}, ctx)
+if status ~= rpc.COMPLETED then
+return rpc.REJECTED, {reason = tostring(fields.reason)}
+end
+
+
+
+local moved = fields.moved or 0
+if holder then holds.take(holder, params.item, moved) end
+local short = params.count - moved
+return rpc.COMPLETED, {moved = moved, item = params.item, to = dest,
+short = short > 0 and short or nil,
+reason = short > 0 and ("%s -- %d of %d moved"):format(
+tostring(fields.reason or "stopped short"), moved, params.count) or nil}
+end,
+}

@@ -1,0 +1,78 @@
+
+
+
+
+
+
+
+
+local lock = {}
+
+lock.EVERY = 5
+lock.RETRY = 3
+
+
+function lock.owner()
+local cfg = require("mfg.common.join").config({spent = true})
+return cfg and cfg.owner or nil
+end
+
+
+function lock.held(transport)
+local reply = transport.request({command = "pocket_held"}, {timeout = 3, attempts = 1})
+if type(reply) ~= "table" or reply.status ~= "completed" then
+return false, "the controller didn't answer" .. (reply and reply.reason
+and (": " .. tostring(reply.reason)) or "")
+end
+return reply.held == true, reply.reason
+end
+
+
+function lock.draw(owner, why, out)
+out = out or term
+out.setBackgroundColor(colors.black)
+out.setTextColor(colors.white)
+out.clear()
+out.setCursorPos(1, 1)
+local width = select(1, out.getSize())
+local function say(text, colour)
+if colour and out.isColour and out.isColour() then out.setTextColor(colour) end
+for _, line in ipairs(require("cc.strings").wrap(text, width)) do
+local _, y = out.getCursorPos()
+out.write(line)
+out.setCursorPos(1, y + 1)
+end
+out.setTextColor(colors.white)
+end
+say("This pocket belongs to " .. owner .. ".")
+say("")
+say("It runs only in their inventory.")
+if why then
+say("")
+say(tostring(why), colors.red)
+end
+end
+
+
+
+function lock.run(transport, owner, start, opts)
+opts = opts or {}
+local wait = opts.sleep or sleep
+local draw = opts.draw or lock.draw
+while true do
+local held, why = lock.held(transport)
+if held then
+parallel.waitForAny(start, function()
+repeat
+wait(lock.EVERY)
+held, why = lock.held(transport)
+until not held
+end)
+end
+draw(owner, why)
+if opts.once then return held, why end
+wait(lock.RETRY)
+end
+end
+
+return lock

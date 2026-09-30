@@ -1,0 +1,622 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local firmware = require("mfg.common.firmware")
+local config = require("mfg.common.config")
+local signed = require("mfg.common.signed")
+local equipment = require("mfg.common.equipment")
+local services = require("mfg.common.services")
+
+local boot = {}
+
+boot.COMMIT_WINDOW = 60
+
+
+
+local CHECKIN_TRIES, CHECKIN_GAP = 6, 10
+
+local function P(root, path) return fs.combine(root or "/", path) end
+
+
+
+
+
+
+function boot.commit(root)
+local path = P(root, "boot/record")
+local record = state.readFile(path)
+if type(record) ~= "table" or record.state ~= "trial" then return false end
+record.state = "committed"
+record.tries = 0
+record.committed_at = os.epoch("utc")
+state.writeFile(path, record)
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+boot.FETCH_WAIT, boot.FETCH_WAIT_MAX = 5, 300
+
+function boot.stageFetch(ctx)
+local root = ctx.root
+local recordPath = P(root, "boot/record")
+local record = state.readFile(recordPath)
+if type(record) ~= "table" or record.state ~= "fetching" then return end
+
+local m, why = firmware.read(P(root, "boot/firmware"))
+if not m then error("firmware: " .. tostring(why), 0) end
+local anchor, anchorWhy = signed.anchor(P(root, "boot/signer"))
+if not anchor then error("cannot fetch: " .. tostring(anchorWhy), 0) end
+local ok, bad = firmware.verify(m, {anchor})
+if not ok then error("cannot fetch: the manifest " .. tostring(bad), 0) end
+local where = state.readFile(P(root, "boot/source"))
+if type(where) ~= "table" or type(where.dist) ~= "string" then
+error("cannot fetch: no /boot/source says where from", 0)
+end
+
+local apply = require("mfg.boot.apply")
+local source = ctx.source or apply.httpSource(where.dist)
+local wait = boot.FETCH_WAIT
+local sleepFor = ctx.sleep or sleep
+local say = ctx.say or print
+say(("fetching this node's %s files from %s"):format(m.role, where.dist))
+while true do
+local wrote, failed = apply.complete(root, m, source)
+if wrote then
+say(("fetched %d files"):format(wrote))
+break
+end
+say(("could not fetch: %s -- trying again in %ds"):format(tostring(failed), wait))
+sleepFor(wait)
+wait = math.min(wait * 2, boot.FETCH_WAIT_MAX)
+end
+
+
+record.state, record.tries = "trial", 1
+state.writeFile(recordPath, record)
+end
+
+
+
+
+
+
+
+
+
+
+
+local function resolveIntent(root, m, record)
+local path = P(root, "boot/intent")
+local text = state.readText(path) or ""
+local role = text:match("role%s+(%S+)")
+if not role then error("boot/intent names no role", 0) end
+local roles = require("mfg.common.roles")
+if not roles[role] then error("boot/intent names a role this firmware does not know: " .. role, 0) end
+
+local overrides = {}
+for line in text:gmatch("[^\n]+") do
+local name, value = line:match("^%s*set%s+(%S+)%s+(.-)%s*$")
+if name then overrides[name] = value end
+end
+
+local node = text:match("node%s+(%S+)") or os.getComputerLabel()
+or ("computer-" .. os.getComputerID())
+local doc, why = config.resolve({
+roles = roles, node = node, role = role, rev = (record.rev or 0) + 1,
+overrides = overrides, firmware = m.id,
+})
+if not doc then error("could not resolve this node's config: " .. tostring(why), 0) end
+
+require("mfg.boot.apply").loader().writeTable(P(root, "boot/config"), config.unsealed(doc))
+record.rev = doc.rev
+record.role = role
+state.writeFile(P(root, "boot/record"), record)
+fs.delete(path)
+end
+
+function boot.stageConfig(ctx)
+local root = ctx.root
+local record = state.readFile(P(root, "boot/record"))
+if type(record) ~= "table" then error("no boot record", 0) end
+
+local m, why = firmware.read(P(root, "boot/firmware"))
+if not m then error("firmware: " .. tostring(why), 0) end
+
+if fs.exists(P(root, "boot/intent")) then resolveIntent(root, m, record) end
+
+local envelope = state.readFile(P(root, "boot/config"))
+local doc, docWhy = config.decode(envelope)
+if not doc then error("config: " .. tostring(docWhy), 0) end
+
+
+
+if envelope.sig then
+local anchor, anchorWhy = signed.anchor(P(root, "boot/signer"))
+if not anchor then error("config is signed but " .. tostring(anchorWhy), 0) end
+local ok, bad = config.verify(envelope, {anchor})
+if not ok then error("config: " .. tostring(bad), 0) end
+if m.sig then
+local fok, fbad = firmware.verify(m, {anchor})
+if not fok then error("firmware: " .. tostring(fbad), 0) end
+end
+elseif envelope.origin ~= "disk" then
+error("config is neither signed nor written to this disk", 0)
+end
+
+
+
+if doc.firmware ~= m.id then
+error(("config requires firmware %s but %s is installed"):format(
+tostring(doc.firmware):sub(1, 16), m.id:sub(1, 16)), 0)
+end
+if doc.role ~= m.role then
+error(("config says %s but the firmware is %s's"):format(doc.role, m.role), 0)
+end
+if record.active ~= m.id then
+error(("boot record names firmware %s but %s is installed"):format(
+tostring(record.active):sub(1, 16), m.id:sub(1, 16)), 0)
+end
+
+
+
+
+
+local profile = require("mfg.common.roles")[doc.role]
+if not profile then error("this firmware has no profile for " .. tostring(doc.role), 0) end
+
+ctx.record, ctx.manifest, ctx.doc, ctx.profile = record, m, doc, profile
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function boot.stageAliases(ctx)
+local aliases = ctx.doc.aliases
+if type(aliases) ~= "table" or next(aliases) == nil then return end
+local sh = ctx.shell or shell
+if not sh or not sh.setAlias then error("no shell to set aliases in", 0) end
+
+local carried = {}
+for _, f in ipairs(ctx.manifest.files or {}) do carried[f.path] = true end
+
+local names, skipped = {}, {}
+for name in pairs(aliases) do names[#names + 1] = name end
+table.sort(names)
+ctx.aliases = {}
+for _, name in ipairs(names) do
+local target = aliases[name]
+local path = target:sub(2)
+if not path:match("%.lua$") then path = path .. ".lua" end
+if carried[path] then
+sh.setAlias(name, target)
+ctx.aliases[name] = target
+else
+skipped[#skipped + 1] = ("%s (%s is not in this firmware)"):format(name, target)
+end
+end
+if #skipped > 0 then error("aliases not set: " .. table.concat(skipped, ", "), 0) end
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function onTurtle(ctx)
+return ctx.doc ~= nil and ctx.doc.platform == "turtle"
+end
+
+function boot.stageEquipment(ctx)
+local record = ctx.record
+local hw = ctx.hal or require("mfg.common.hal").turtle()
+local fitted, why = equipment.read(hw)
+local missing = fitted and equipment.missing(ctx.doc.equipment, fitted) or nil
+
+local before = record.equipment_missing
+record.equipment_missing = (missing and #missing > 0) and missing or nil
+if textutils.serialize(before) ~= textutils.serialize(record.equipment_missing) then
+state.writeFile(P(ctx.root, "boot/record"), record)
+end
+
+if not fitted then error("cannot read equipment: " .. tostring(why), 0) end
+ctx.fitted, ctx.missing = fitted, missing
+if #missing > 0 then
+printError("unequipped: missing " .. table.concat(missing, ", "))
+end
+end
+
+
+
+
+local function isPorted(ctx)
+return ctx.profile ~= nil and ctx.profile.services ~= nil
+end
+
+local function isLegacy(ctx)
+return ctx.profile ~= nil and ctx.profile.startup ~= nil and ctx.profile.services == nil
+end
+
+
+
+
+
+
+
+
+
+function boot.stageIdentity(ctx)
+if ctx.profile.authority then
+ctx.enrollment = {admitted = true, why = "the authority enrolls others, not itself"}
+return
+end
+local join = require("mfg.common.join")
+local cfg, why = join.config({spent = true})
+if not cfg and fs.exists(join.CONFIG) then
+error(("%s is unreadable: %s"):format(join.CONFIG, tostring(why)), 0)
+end
+ctx.identity = cfg
+end
+
+
+
+
+
+
+
+
+
+
+function boot.stageActions(ctx)
+local actions = require("mfg.common.actions")
+actions.reset()
+local loaded, failed, withheld = actions.load(ctx.doc.actions or {}, {fitted = ctx.fitted})
+if not loaded then error("actions: " .. tostring(failed), 0) end
+for _, why in ipairs(withheld or {}) do printError("withheld: " .. why) end
+if #failed > 0 then
+error("actions failed to load: " .. table.concat(failed, "; "), 0)
+end
+ctx.actions = loaded
+end
+
+
+
+
+
+
+
+function boot.bind(names)
+local net = require("net")
+local bound, failed = {}, {}
+for _, name in ipairs(names) do
+local ok, why = net.serve(name)
+if ok or tostring(why):find("already bound") then
+bound[#bound + 1] = ("%s %d"):format(name, net.port(name) or -1)
+else
+failed[#failed + 1] = ("%s (%s)"):format(name, tostring(why))
+end
+end
+if #failed > 0 then error("could not bind: " .. table.concat(failed, ", "), 0) end
+print("bound: " .. table.concat(bound, ", "))
+end
+
+
+
+function boot.report(ctx)
+local record = state.readFile(P(ctx.root, "boot/record")) or {}
+local lastError = state.readFile(P(ctx.root, "boot/last_error"))
+local missing = record.equipment_missing
+local degraded = {}
+for _, entry in ipairs(ctx.degraded or {}) do
+degraded[#degraded + 1] = ("%s: %s"):format(entry.stage, entry.why)
+end
+return {
+kind = "checkin",
+node = ctx.doc.node,
+role = ctx.doc.role,
+firmware = record.active,
+config_rev = record.rev,
+boot_state = (type(missing) == "table" and #missing > 0) and "unequipped" or record.state,
+committed = record.state == "committed",
+equipment_missing = missing,
+degraded = degraded,
+last_error = type(lastError) == "table" and lastError.error or nil,
+}
+end
+
+
+
+
+
+function boot.checkIn(ctx)
+local body = boot.report(ctx)
+if ctx.sendReport then return ctx.sendReport(body) end
+if ctx.profile.authority then
+require(ctx.profile.services).observeSelf(body)
+return true
+end
+local host = (ctx.doc.settings or {}).controller or "mfg"
+local lastWhy
+for attempt = 1, CHECKIN_TRIES do
+local ok, why = require("net").send(host, "mfg-report", body)
+if ok then return true end
+lastWhy = why
+if attempt < CHECKIN_TRIES then sleep(CHECKIN_GAP) end
+end
+return false, ("could not check in with %s: %s"):format(host, tostring(lastWhy))
+end
+
+
+
+
+local function fingerprint(manager)
+local out = {}
+for _, name in ipairs(manager.order) do
+if name ~= "commit" and name ~= "console" then
+local r = manager.list[name]
+out[#out + 1] = ("%s:%d:%d:%s"):format(name, r.restarts, r.failures,
+r.state == services.HALTED and "halted" or "")
+end
+end
+return table.concat(out, " ")
+end
+
+
+
+
+local function declareBase(manager, ctx)
+local profile = ctx.profile
+
+
+
+
+local peer = ""
+if profile.authority then
+peer = tostring((ctx.doc.settings or {}).parent or "")
+else
+peer = require("mfg.common.join").bootstrapPeer()
+end
+services.declare(manager, {
+name = "netstack",
+critical = true,
+start = function() ctx.shell.run("/netstart", peer) end,
+})
+
+
+
+
+
+
+if not profile.authority then
+services.declare(manager, {
+name = "enroll",
+requires = {"netstack"},
+restart = false,
+ready = function()
+if require("acknet").isRunning() then return true end
+return false, "waiting for acknet, which enrollment rides"
+end,
+start = function()
+local join = require("mfg.common.join")
+local ok, admitted, why = pcall(join.bootstrap)
+if not ok then admitted, why = false, tostring(admitted) end
+ctx.enrollment = {admitted = admitted, why = why}
+print(("enrollment: %s"):format(tostring(why)))
+if not admitted then printError("not admitted -- this node cannot reach the controller") end
+end,
+})
+end
+
+services.declare(manager, {
+name = "checkin",
+requires = profile.authority and {} or {"netstack"},
+restart = false,
+ready = (not profile.authority) and ctx.admitted or nil,
+start = function()
+local ok, why = boot.checkIn(ctx)
+print(ok and "checked in" or ("check-in: " .. tostring(why)))
+end,
+})
+end
+
+
+
+
+
+
+local function declareCommit(manager, ctx)
+services.declare(manager, {
+name = "commit",
+restart = false,
+start = function()
+local record = state.readFile(P(ctx.root, "boot/record"))
+if type(record) ~= "table" or record.state ~= "trial" then return end
+local window = (ctx.commitWindow or boot.COMMIT_WINDOW) * 1000
+local since, seen = os.epoch("utc"), fingerprint(manager)
+while not manager.halted do
+sleep(math.min(1, window / 4000))
+local now = fingerprint(manager)
+if now ~= seen then
+since, seen = os.epoch("utc"), now
+elseif os.epoch("utc") - since >= window then
+if boot.commit(ctx.root) then
+print("boot set committed")
+boot.checkIn(ctx)
+end
+return
+end
+end
+end,
+})
+end
+
+
+
+
+
+
+function boot.stageServices(ctx)
+ctx.shell = ctx.shell or shell
+if not ctx.shell then error("no shell to run the netstack in", 0) end
+
+
+ctx.admitted = ctx.admitted or function()
+if not ctx.enrollment then return false, "enrollment has not finished" end
+if not require("net").ready() then return false, "the netstack has not come up" end
+return true
+end
+ctx.bind = ctx.bind or boot.bind
+
+local manager = services.new({name = ctx.doc.role})
+ctx.manager = manager
+if ctx.declareBase ~= false then declareBase(manager, ctx) end
+require(ctx.profile.services).declare(manager, ctx)
+declareCommit(manager, ctx)
+
+
+
+
+
+local identity = fs.exists(P(ctx.root, "mfg/enroll.cfg")) and fs.open(P(ctx.root, "mfg/enroll.cfg"), "r")
+local owned = false
+if identity then
+owned = (identity.readAll() or ""):match("owner%s+%S+") ~= nil
+identity.close()
+end
+if ctx.console ~= false and not services.terminalOwner(manager) and not owned then
+require("mfg.common.console").declare(manager, {prompt = ctx.doc.role})
+end
+
+if ctx.onRun then ctx.onRun(manager, ctx) end
+local halted = services.run(manager)
+error(halted or "every service stopped", 0)
+end
+
+
+
+
+
+
+function boot.stageLegacy(ctx)
+local program = ctx.profile.startup
+local sh = ctx.shell or shell
+if not sh then error("no shell to run " .. program .. " in", 0) end
+parallel.waitForAny(
+function()
+sh.run(program)
+error(program .. " exited", 0)
+end,
+function()
+sleep(ctx.commitWindow or boot.COMMIT_WINDOW)
+if boot.commit(ctx.root) then print("boot set committed") end
+while true do os.pullEvent("boot_idle_forever") end
+end
+)
+end
+
+
+
+boot.stages = {
+{name = "fetch", run = boot.stageFetch, onFail = "halt"},
+{name = "config", run = boot.stageConfig, onFail = "rollback"},
+{name = "aliases", run = boot.stageAliases, onFail = "degrade"},
+{name = "equipment", run = boot.stageEquipment, onFail = "degrade", when = onTurtle},
+{name = "identity", run = boot.stageIdentity, onFail = "halt", when = isPorted},
+{name = "actions", run = boot.stageActions, onFail = "rollback", when = isPorted},
+{name = "services", run = boot.stageServices, onFail = "rollback", when = isPorted},
+{name = "legacy", run = boot.stageLegacy, onFail = "rollback", when = isLegacy},
+}
+
+
+
+
+
+
+
+function boot.run(root, opts)
+opts = opts or {}
+local ctx = {root = root or "/", shell = opts.shell, commitWindow = opts.commitWindow,
+hal = opts.hal, console = opts.console, declareBase = opts.declareBase,
+sendReport = opts.sendReport, onRun = opts.onRun, degraded = {},
+source = opts.source, sleep = opts.sleep, say = opts.say}
+for _, stage in ipairs(opts.stages or boot.stages) do
+if not stage.when or stage.when(ctx) then
+local ok, err = pcall(stage.run, ctx)
+if not ok then
+if stage.onFail == "degrade" then
+ctx.degraded[#ctx.degraded + 1] = {stage = stage.name, why = tostring(err)}
+else
+error(("stage %s: %s"):format(stage.name, tostring(err)), 0)
+end
+end
+end
+if opts.stopAfter == stage.name then return ctx end
+end
+if not isPorted(ctx) and not isLegacy(ctx) then
+
+error(("the %s profile names neither services nor a startup program"):format(
+tostring(ctx.doc and ctx.doc.role)), 0)
+end
+return ctx
+end
+
+return boot

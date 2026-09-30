@@ -1,0 +1,188 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+local enrollment = require("mfg.common.enrollment")
+
+local acknet = require("acknet")
+local netkeys = require("netkeys")
+local ip = require("ip")
+local random = require("ccryptolib.random")
+local state = require("mfg.common.state")
+
+local join = {}
+
+local CONFIG = "/mfg/enroll.cfg"
+
+
+
+join.CONFIG = CONFIG
+
+
+
+
+
+
+function join.config(opts)
+opts = opts or {}
+local text, why = state.readText(CONFIG)
+if not text then return nil, why or ("no enrollment config at " .. CONFIG) end
+
+local cfg = {
+instance = text:match("instance%s+(%S+)"),
+secret = text:match("secret%s+(%x+)"),
+controller = tonumber(text:match("controller%s+(%d+)")),
+name = text:match("name%s+(%S+)"),
+role = text:match("role%s+(%S+)"),
+
+owner = text:match("owner%s+(%S+)"),
+}
+if not cfg.instance then return nil, "config has no instance id" end
+if not cfg.secret then
+if opts.spent and text:match("secret%s+%(spent%)") then
+cfg.spent = true
+else
+return nil, "config has no secret"
+end
+end
+
+
+
+
+
+if not cfg.controller then return nil, "config has no controller computer id" end
+return cfg
+end
+
+
+
+
+
+
+function join.clearSecret()
+local text = state.readText(CONFIG)
+if not text then return end
+state.writeText(CONFIG, (text:gsub("secret%s+%x+", "secret (spent)")))
+end
+
+
+
+
+function join.enroll(cfg, attempts, gap)
+attempts = attempts or 20
+gap = gap or 3
+
+if not netkeys.publicKey() then
+return nil, "this computer has no keypair"
+end
+
+local pk = netkeys.toHex(netkeys.publicKey())
+local secret = enrollment.fromHex(cfg.secret)
+if not secret or #secret ~= enrollment.SECRET_BYTES then
+return nil, "secret is not 32 bytes of hex"
+end
+
+local tag, macErr = enrollment.mac(secret, cfg.instance, pk)
+if not tag then return nil, tostring(macErr) end
+
+local target = ip.linkLocal(cfg.controller)
+
+
+local request = {kind = "enroll", instance = cfg.instance, pk = pk, mac = tag,
+computer = os.getComputerID()}
+
+local lastReason = "no reply from the controller"
+for _ = 1, attempts do
+acknet.send(target, request, enrollment.PROTOCOL)
+
+local deadline = os.epoch("utc") + gap * 1000
+while os.epoch("utc") < deadline do
+local packet = acknet.receive(enrollment.PROTOCOL, 1)
+if packet and type(packet.body) == "table" then
+local reply = packet.body
+
+if reply.kind ~= "enroll" then
+if reply.ok then
+join.clearSecret()
+return reply
+end
+lastReason = tostring(reply.reason)
+
+
+if lastReason:find("consumed") or lastReason:find("verify")
+or lastReason:find("no lease") then
+return nil, lastReason
+end
+end
+end
+end
+end
+
+return nil, lastReason
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function join.bootstrap(opts)
+opts = opts or {}
+local waitFor = opts.wait or 60
+
+local cfg, cfgErr = join.config({spent = true})
+if not cfg then
+
+
+return true, "no enrollment config -- not a minted node (" .. tostring(cfgErr) .. ")"
+end
+
+if not (cfg.secret and cfg.secret ~= "(spent)") then
+return true, "lease already spent -- already admitted"
+end
+
+local acknet = require("acknet")
+for _ = 1, waitFor do
+if acknet.isRunning() then break end
+sleep(1)
+end
+if not acknet.isRunning() then
+return false, "the acknet daemon did not come up, so enrollment cannot be sent"
+end
+
+require("netkeys").init()
+local reply, why = join.enroll(cfg, opts.attempts or 30, opts.gap or 2)
+if not reply then
+return false, "enrollment refused: " .. tostring(why)
+end
+return true, "admitted as " .. tostring(reply.name)
+end
+
+
+
+
+function join.bootstrapPeer()
+local cfg = join.config()
+if cfg and cfg.controller then return tostring(cfg.controller) end
+return ""
+end
+
+return join

@@ -1,0 +1,31 @@
+local rpc = require("mfg.common.rpc")
+local pockets = require("mfg.controller.pockets")
+
+
+
+
+
+
+return {
+name        = "loadout_swap",
+label       = "Swap to a loadout",
+tier        = "orchestrated",
+uses        = {},
+policy      = true,
+destructive = false,
+
+parameters = {
+{name = "name", label = "Loadout", type = "text", required = true},
+},
+
+returns = {out = "number", into = "number"},
+
+run = function(params, ctx)
+local owner, why = pockets.caller(ctx)
+if not owner then return rpc.REJECTED, {reason = tostring(why)} end
+local result, err = require("mfg.controller.loadouts").swap(owner, params.name)
+if not result then return rpc.REJECTED, {reason = tostring(err)} end
+return rpc.COMPLETED, {out = result.out, into = result.into, worn = params.name,
+reason = result.note}
+end,
+}

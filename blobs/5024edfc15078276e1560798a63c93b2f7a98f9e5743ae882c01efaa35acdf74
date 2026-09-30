@@ -1,0 +1,154 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local store = require("mfg.storage")
+local mount = require("mfg.storage.mount")
+local pockets = require("mfg.controller.pockets")
+
+local rules = {}
+
+rules.STATE = "player_rules"
+rules.EVERY = 5
+rules.OVER = {deposit = true, trash = true, vault = true}
+rules.TRASH = "/trash"
+
+local function all() return state.read(rules.STATE, {}) end
+
+function rules.of(owner)
+return all()[pockets.segment(owner)] or {}
+end
+
+local function whole(n) return n == nil or (type(n) == "number" and n >= 0 and n == math.floor(n)) end
+
+
+function rules.set(owner, rule)
+if type(rule) ~= "table" or not store.selector(rule.item) then
+return nil, "a rule names an item, like minecraft:cobblestone, or a tag"
+end
+if not whole(rule.keep) or not whole(rule.min) then
+return nil, "keep and min are whole numbers"
+end
+if rule.over and not rules.OVER[rule.over] then
+return nil, "over is deposit, trash or vault"
+end
+if (rule.keep == nil) ~= (rule.over == nil) then
+return nil, "keep and over go together: keep 64 over trash"
+end
+if rule.keep == nil and rule.min == nil then
+return nil, "a rule needs keep and over, or min"
+end
+if rule.min and rule.item:sub(1, 1) == "#" then
+return nil, "min tops up one item, not a tag"
+end
+if rule.min and rule.keep and rule.min > rule.keep then
+return nil, "min can't be above keep"
+end
+local clean = {item = rule.item, keep = rule.keep, over = rule.over, min = rule.min}
+local book = all()
+local seg = pockets.segment(owner)
+local list = book[seg] or {}
+local replaced = false
+for i, existing in ipairs(list) do
+if existing.item == clean.item then list[i], replaced = clean, true end
+end
+if not replaced then list[#list + 1] = clean end
+book[seg] = list
+state.write(rules.STATE, book)
+return clean
+end
+
+function rules.remove(owner, item)
+local book = all()
+local seg = pockets.segment(owner)
+local list, kept, gone = book[seg] or {}, {}, false
+for _, existing in ipairs(list) do
+if existing.item == item then gone = true else kept[#kept + 1] = existing end
+end
+book[seg] = #kept > 0 and kept or nil
+state.write(rules.STATE, book)
+return gone
+end
+
+
+local function destination(owner, over)
+if over == "trash" then return rules.TRASH end
+if over == "vault" then return ("/players/%s/vault"):format(pockets.segment(owner)) end
+return require("mfg.common.config").setting("source")
+end
+
+
+
+function rules.apply(owner)
+local inventory = pockets.inventoryPath(owner)
+local out = {}
+for _, rule in ipairs(rules.of(owner)) do
+local selector = {}
+for k, v in pairs(store.selector(rule.item)) do selector[k] = v end
+local count = store.count(inventory, selector) or 0
+if rule.keep and count > rule.keep then
+local to = destination(owner, rule.over)
+if rule.over == "trash" and not selector.hash and not selector.fingerprint then
+selector.plain = true
+end
+if store.isBound(to) then
+local moved, why = store.move(inventory, to, selector, count - rule.keep)
+out[#out + 1] = {item = rule.item, moved = moved or 0, to = to, why = why}
+else
+out[#out + 1] = {item = rule.item, moved = 0, to = to, why = to .. " is not bound"}
+end
+elseif rule.min and count < rule.min then
+
+local pool = require("mfg.common.config").setting("source")
+local available = require("mfg.controller.supervisor").available(pool) or {}
+local want = math.min(rule.min - count, available[rule.item] or 0)
+if want > 0 then
+local moved, why = store.move(pool, inventory, rule.item, want)
+out[#out + 1] = {item = rule.item, moved = moved or 0, to = inventory, why = why}
+end
+end
+end
+return out
+end
+
+
+
+
+function rules.sweepBuffers()
+local hal = require("mfg.common.hal")
+local pool = require("mfg.common.config").setting("source")
+local stuck = {}
+for path, record in pairs(mount.all()) do
+if record.system == "player" and record.buffer
+and next(hal.inventory().list(record.buffer) or {}) then
+store.returnBuffer(path)
+if next(hal.inventory().list(record.buffer) or {}) then store.flushBuffer(path, pool) end
+if next(hal.inventory().list(record.buffer) or {}) then stuck[#stuck + 1] = path end
+end
+end
+return stuck
+end
+
+
+function rules.run()
+local done = {}
+for seg in pairs(all()) do
+local record = mount.get(("/players/%s/inv"):format(seg))
+if record and record.owner and pockets.anyHeld(record.owner) then
+local ok, result = pcall(rules.apply, record.owner)
+done[record.owner] = ok and result or {{why = tostring(result)}}
+end
+end
+return done
+end
+
+return rules

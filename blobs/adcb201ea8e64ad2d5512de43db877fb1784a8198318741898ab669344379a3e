@@ -1,0 +1,46 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+local mount = require("mfg.storage.mount")
+local pockets = require("mfg.controller.pockets")
+
+
+
+
+return {
+name        = "player_status",
+label       = "My inventory, loadouts, vault and rules",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {},
+
+returns = {owner = "text", loadouts = "table", vault = "table", rules = "table"},
+
+run = function(_, ctx)
+local owner, why = pockets.caller(ctx)
+if not owner then return rpc.REJECTED, {reason = tostring(why)} end
+local loadouts = require("mfg.controller.loadouts")
+local inventory = pockets.inventoryPath(owner)
+local vaultPath = ("/players/%s/vault"):format(pockets.segment(owner))
+local out = {owner = owner, inventory = inventory, worn = loadouts.worn(owner),
+loadouts = loadouts.list(owner), rules = require("mfg.controller.playerrules").of(owner),
+vault = {path = vaultPath, bound = mount.get(vaultPath) ~= nil, items = {}},
+carried = {}}
+
+local function listed(path)
+local items = {}
+local names = store.describe(path) or {}
+for item, count in pairs(store.stock(path) or {}) do
+local known = names[item]
+items[#items + 1] = {item = item, count = count,
+name = known and known.name or item}
+end
+table.sort(items, function(a, b) return a.name:lower() < b.name:lower() end)
+return items
+end
+if out.vault.bound then out.vault.items = listed(vaultPath) end
+if mount.get(inventory) then out.carried = listed(inventory) end
+return rpc.COMPLETED, out
+end,
+}
