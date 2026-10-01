@@ -1,0 +1,171 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not package.path:find("^/%?") then
+package.path = "/?.lua;/?/init.lua;" .. package.path
+end
+
+local store = require("mfg.storage")
+local mount = require("mfg.storage.mount")
+local cli = require("mfg.storage.cli")
+
+local from, to = nil, nil
+local dry, yes = false, false
+for _, word in ipairs({...}) do
+if word == "--dry" or word == "-n" then dry = true
+elseif word == "--yes" or word == "-y" then yes = true
+elseif not from then from = word
+elseif not to then to = word
+else
+printError("usage: migrate [<from> <to>] [--dry] [--yes]")
+return
+end
+end
+from, to = from or "/pool/cluster", to or "/pool/rs"
+
+
+
+local source, target = mount.get(from), mount.get(to)
+if not source or not store.isBound(from) then
+printError(from .. " is not bound: nothing to migrate from")
+return
+end
+if source.system then
+printError(("%s is a %s, not chests"):format(from, source.system == "player"
+and "player's inventory" or "storage network"))
+return
+end
+if not target or not store.isBound(to) then
+printError(to .. " is not bound")
+print("bind the bridge first: mfgctl bind /pool --new, then turn its modem on")
+return
+end
+if target.system ~= "rs" and target.system ~= "me" then
+printError(to .. " is not a storage network (an RS or ME bridge)")
+return
+end
+
+local manifest, missing = store.manifest(from)
+if not manifest then
+printError(tostring(missing))
+return
+end
+if missing then
+print(("%d of %s's chests can't be seen: what they hold stays there"):format(
+#missing, from))
+end
+
+
+local keys, total, nbtItems, nbtKinds = {}, 0, 0, 0
+for key, count in pairs(manifest) do
+keys[#keys + 1] = key
+total = total + count
+local _, hash = store.parse(key)
+if hash then nbtItems, nbtKinds = nbtItems + count, nbtKinds + 1 end
+end
+table.sort(keys, function(a, b)
+if manifest[a] ~= manifest[b] then return manifest[a] > manifest[b] end
+return a < b
+end)
+
+if #keys == 0 then
+print(from .. " is empty: nothing to migrate")
+return
+end
+
+
+local room = store.room(to, keys[1]) or 0
+print(("%s holds %d items of %d kinds"):format(from, total, #keys))
+print(("%s has room for about %d"):format(to, room))
+local stays = 0
+if target.system == "me" and nbtKinds > 0 then
+stays = nbtItems
+print(("%d items of %d kinds carry NBT: the ME Bridge would strip it, so they "
+.. "stay in the chests"):format(nbtItems, nbtKinds))
+end
+if total - stays > room then
+print(("about %d won't fit: they stay in the chests"):format(total - stays - room))
+end
+
+if dry then return end
+if not yes and not cli.confirm(("move them into %s?"):format(to)) then
+print("nothing moved")
+return
+end
+
+
+
+local movedAll, left = 0, {}
+local full = false
+for i, key in ipairs(keys) do
+local want = manifest[key]
+local moved, why = 0, nil
+if full then
+why = to .. " is full"
+else
+
+
+local name, hash = store.parse(key)
+moved, why = store.move(from, to, {name = name, hash = hash, plain = not hash},
+want)
+moved = moved or 0
+end
+movedAll = movedAll + moved
+if moved < want then
+left[#left + 1] = {key = key, count = want - moved, why = why}
+
+if not full and (store.room(to, key) or 0) <= 0 then full = true end
+end
+if not full or moved > 0 then
+print(("[%d/%d] %s %d/%d"):format(i, #keys, key, moved, want))
+end
+end
+
+
+
+print(("moved %d of %d items into %s"):format(movedAll, total, to))
+if #left > 0 then
+
+local byWhy, order = {}, {}
+for _, entry in ipairs(left) do
+local why = tostring(entry.why or "not moved")
+if not byWhy[why] then byWhy[why] = {items = 0, kinds = 0} order[#order + 1] = why end
+byWhy[why].items = byWhy[why].items + entry.count
+byWhy[why].kinds = byWhy[why].kinds + 1
+end
+print("still in " .. from .. ":")
+for _, why in ipairs(order) do
+print(("  %d items of %d kinds: %s"):format(byWhy[why].items, byWhy[why].kinds,
+why))
+end
+else
+print(from .. " is empty. Keep its chests as the network's overflow, or retire "
+.. "them: mfgctl unbind " .. from)
+end
+
+if movedAll > 0 then
+print("the controller still believes the chests hold what moved, until it "
+.. "restarts")
+if not yes and cli.confirm("reboot the controller now?") then os.reboot() end
+end
