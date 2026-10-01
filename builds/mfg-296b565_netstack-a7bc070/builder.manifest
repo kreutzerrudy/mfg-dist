@@ -1,7 +1,7 @@
 manifest 2
 role builder
 source mfg-296b565 netstack-a7bc070
-built 2026-10-01T06:17:53Z
+built 2026-10-01T18:10:58Z
 id 87cf7773689ce5bb0d3a06e83deec1737e69c42e88acd7e1adf908448ceb06e8
 file ackdebug.lua 574 c64245a16e07d7acf7abc7ea66e8a4e6a331986b3d0adbef0b415d6411aba008
 file acknet.lua 6918 5f85d8cbebb9df94758a5b6ce40cc13ca815a0027129de86bc801d8bee6ec75e
