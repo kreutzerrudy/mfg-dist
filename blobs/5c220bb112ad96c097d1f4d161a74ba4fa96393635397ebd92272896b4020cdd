@@ -1,0 +1,134 @@
+
+
+
+
+
+
+
+
+
+
+
+local store = require("mfg.storage")
+local actions = require("mfg.common.actions")
+local rpc = require("mfg.common.rpc")
+
+local ports = {}
+
+ports.IN = "/io/in"
+ports.OUT = "/io/out"
+ports.POLL = 5
+ports.TIDY = 30
+
+
+function ports.contents(path)
+if not store.isBound(path) then return {} end
+return store.stock(path) or {}
+end
+
+
+
+
+
+
+function ports.intake(opts)
+opts = opts or {}
+if not store.isBound(ports.IN) then return nil end
+if next(ports.contents(ports.IN)) == nil then return nil end
+local invoke = opts.invoke or actions.invoke
+return invoke("take_in", {}, {by = "intake"})
+end
+
+
+
+
+function ports.fullText(pool, left, from)
+local byStore = {}
+for item, count in pairs(left) do
+local where = pool
+if store.isGroup(pool) then
+local _, storePath = store.allowedFor(pool, item)
+where = storePath or pool
+end
+byStore[where] = byStore[where] or {}
+table.insert(byStore[where], ("%d %s"):format(count, item))
+end
+local parts = {}
+for where, items in pairs(byStore) do
+table.sort(items)
+parts[#parts + 1] = ("%s is full: %s"):format(where, table.concat(items, ", "))
+end
+table.sort(parts)
+return ("%s -- still waiting in %s"):format(table.concat(parts, "; "), from)
+end
+
+
+
+
+
+
+
+
+
+
+function ports.tidy(pool)
+pool = pool or require("mfg.common.config").setting("source")
+if not store.isGroup(pool) then return 0 end
+local mounts = store.mounts()
+local anyStore = false
+for _, member in ipairs(store.members(pool)) do
+if mounts[member] and mounts[member].holds then anyStore = true break end
+end
+if not anyStore then return 0 end
+
+local general, keys, seen = {}, {}, {}
+for _, member in ipairs(store.members(pool)) do
+local record = mounts[member]
+
+
+if record and not record.holds and not record.system
+and #(record.devices or {}) > 0 then
+local items = store.manifest(member) or {}
+general[#general + 1] = {path = member, items = items}
+for item in pairs(items) do
+if not seen[item] then seen[item] = true keys[#keys + 1] = item end
+end
+end
+end
+if #keys == 0 then return 0 end
+
+local storeOf = store.storesFor(pool, keys)
+local moved = 0
+for _, member in ipairs(general) do
+for item in pairs(member.items) do
+local storePath = storeOf[item]
+if storePath and (store.room(storePath, item) or 0) > 0 then
+moved = moved + (store.move(member.path, storePath, item, 64) or 0)
+end
+end
+end
+return moved
+end
+
+
+function ports.run(opts)
+local lastTidy = 0
+while true do
+local ok, status, fields = pcall(ports.intake, opts)
+if not ok then
+print("intake: " .. tostring(status))
+elseif status and status ~= rpc.COMPLETED then
+print("intake: " .. tostring(fields and fields.reason))
+end
+
+
+if os.epoch("utc") - lastTidy >= ports.TIDY * 1000 then
+local tidied, why = pcall(ports.tidy)
+if not tidied then print("tidy: " .. tostring(why)) end
+lastTidy = os.epoch("utc")
+end
+sleep(ports.POLL)
+end
+end
+
+return ports
