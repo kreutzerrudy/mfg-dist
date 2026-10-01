@@ -1,0 +1,314 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local actions = require("mfg.common.actions")
+local rpc = require("mfg.common.rpc")
+local recipes = require("mfg.controller.recipes")
+local dispatch = require("mfg.controller.dispatch")
+local alarms = require("mfg.controller.alarms")
+
+local stockrules = {}
+
+local STORE = "stock"
+
+stockrules.LOW = 0.75
+stockrules.MAX = 65536
+stockrules.MAKE_MAX = 4096
+stockrules.ADVISE_AFTER = 2
+
+stockrules.OFF, stockrules.MET, stockrules.FILLING = "off", "met", "filling"
+stockrules.WATCH, stockrules.ADVICE, stockrules.LOWSTATE = "watch", "advice", "low"
+
+local strikes = {}
+local said = {}
+
+
+
+local function load()
+local data = state.read(STORE, {rules = {}, nextId = 1})
+if type(data) ~= "table" or type(data.rules) ~= "table" then
+data = {rules = {}, nextId = 1}
+end
+return data
+end
+
+local function save(data) state.write(STORE, data) end
+
+
+function stockrules.all()
+local out = {}
+for _, rule in pairs(load().rules) do out[#out + 1] = rule end
+table.sort(out, function(a, b) return a.id < b.id end)
+return out
+end
+
+function stockrules.get(id)
+return load().rules[id]
+end
+
+function stockrules.forItem(item)
+for _, rule in pairs(load().rules) do
+if rule.item == item then return rule end
+end
+return nil
+end
+
+local function defaultLow(target) return math.floor(target * stockrules.LOW + 0.5) end
+
+
+
+function stockrules.routes(item)
+local out = {}
+for _, def in ipairs(recipes.all()) do
+if def.output.item == item then
+out[#out + 1] = {id = def.id, label = def.label,
+kind = def.process and "machine" or "turtle", process = def.process,
+machines = def.machines, inputs = def.inputs, output = def.output}
+end
+end
+table.sort(out, function(a, b)
+if a.kind ~= b.kind then return a.kind == "machine" end
+return a.id < b.id
+end)
+return out
+end
+
+
+
+
+function stockrules.route(rule)
+if rule.via then
+local def = recipes.get(rule.via)
+if def and def.output.item == rule.item then return def end
+end
+return recipes.producing(rule.item)
+end
+
+
+
+function stockrules.set(fields, by)
+local data = load()
+local rule
+if fields.id then
+rule = data.rules[fields.id]
+if not rule then return nil, "no stock rule " .. tostring(fields.id) end
+else
+if type(fields.item) ~= "string" then return nil, "a rule needs an item" end
+for _, other in pairs(data.rules) do
+if other.item == fields.item then
+return nil, ("%s already has rule %d -- change that one"):format(
+fields.item, other.id)
+end
+end
+rule = {id = data.nextId, item = fields.item, enabled = true}
+data.nextId = data.nextId + 1
+end
+
+local target = fields.target or rule.target
+if type(target) ~= "number" or target < 1 or target > stockrules.MAX then
+return nil, ("a target is 1 to %d"):format(stockrules.MAX)
+end
+local low = fields.low
+if low == nil then
+
+low = (rule.low == nil or rule.low == defaultLow(rule.target or target))
+and defaultLow(target) or rule.low
+end
+if low < 0 or low > target then
+return nil, ("the low mark is 0 to the target (%d)"):format(target)
+end
+if fields.via ~= nil then
+if fields.via == false or fields.via == "" or fields.via == "auto" then
+rule.via = nil
+else
+local def = recipes.get(fields.via)
+if not def or def.output.item ~= rule.item then
+return nil, ("%s does not make %s"):format(tostring(fields.via), rule.item)
+end
+rule.via = fields.via
+end
+end
+rule.target, rule.low = target, low
+if fields.enabled ~= nil then rule.enabled = fields.enabled and true or false end
+rule.by, rule.at = by, os.epoch("utc")
+data.rules[rule.id] = rule
+save(data)
+return rule
+end
+
+function stockrules.forget(id)
+local data = load()
+local rule = data.rules[id]
+if not rule then return nil, "no stock rule " .. tostring(id) end
+data.rules[id] = nil
+save(data)
+alarms.clear("stock." .. rule.item)
+strikes[id], said[id] = nil, nil
+return rule
+end
+
+function stockrules.clear()
+state.clear(STORE)
+strikes, said = {}, {}
+end
+
+
+
+local function policy(rule) return "stock:" .. rule.id end
+
+
+local function openJob(rule)
+local found = nil
+for _, job in ipairs(dispatch.jobs()) do
+if job.by == policy(rule) and dispatch.isOpen(job) then found = job end
+end
+return found
+end
+
+
+function stockrules.history(rule, limit)
+local out = {}
+local jobs = dispatch.jobs()
+for index = #jobs, 1, -1 do
+local job = jobs[index]
+if job.by == policy(rule) then
+out[#out + 1] = {id = job.id, state = job.state, requested = job.requested,
+yield = job.yield, reason = job.lastError, committed = job.committed,
+finished = job.finished}
+if #out >= (limit or 5) then break end
+end
+end
+return out
+end
+
+local function shortName(item) return (tostring(item):match("[^:]+$") or item):gsub("_", " ") end
+
+
+
+local function limitBelow(rule, def)
+if not def or not def.process then return nil end
+for _, m in ipairs(require("mfg.controller.scripts").machines(def.process)) do
+if m.limit and m.limit.item == rule.item and m.limit.at < rule.target then
+return ("%s: %s pauses at %d, below the target %d"):format(shortName(rule.item),
+m.name, m.limit.at, rule.target)
+end
+end
+return nil
+end
+
+
+
+function stockrules.status(rule, available)
+local free = math.floor((available or {})[rule.item] or 0)
+local def = stockrules.route(rule)
+local job = openJob(rule)
+local status = {free = free, route = def and def.id or nil,
+routeLabel = def and def.label or nil, process = def and def.process or nil,
+advice = said[rule.id]}
+if job then
+local step = job.steps[job.position]
+status.request = {job = job.id, state = job.state, reason = job.lastError,
+position = job.position, steps = #job.steps, made = job.made,
+step = step and step.label or nil}
+end
+if not rule.enabled then status.state = stockrules.OFF
+elseif said[rule.id] then status.state = stockrules.ADVICE
+elseif job then status.state = stockrules.FILLING
+elseif not def then status.state = stockrules.WATCH
+elseif free >= rule.low then status.state = stockrules.MET
+else status.state = stockrules.LOWSTATE end
+return status
+end
+
+
+
+local function advise(rule, text)
+strikes[rule.id] = (strikes[rule.id] or 0) + 1
+if strikes[rule.id] >= stockrules.ADVISE_AFTER then
+said[rule.id] = text
+alarms.raise("stock." .. rule.item, text, {source = "stock", severity = "advice"})
+end
+end
+
+local function fine(rule)
+strikes[rule.id] = 0
+if said[rule.id] then
+said[rule.id] = nil
+alarms.clear("stock." .. rule.item)
+end
+end
+
+
+local function turn(rule, available)
+local free = math.floor(available[rule.item] or 0)
+local def = stockrules.route(rule)
+
+local limited = limitBelow(rule, def)
+if free >= rule.low then
+if limited then advise(rule, limited) else fine(rule) end
+return "met"
+end
+if not def then
+advise(rule, ("%s: %d free, low %d -- nothing makes it"):format(
+shortName(rule.item), free, rule.low))
+return "watch"
+end
+if openJob(rule) then
+if limited then advise(rule, limited) else fine(rule) end
+return "waiting"
+end
+
+local quantity = math.min(stockrules.MAKE_MAX, rule.target - free)
+local status, fields = actions.invoke("make", {recipe = def.id, quantity = quantity},
+{by = policy(rule), policy = policy(rule)})
+if status == rpc.COMPLETED then
+if limited then advise(rule, limited) else fine(rule) end
+return "queued", fields.job
+end
+
+advise(rule, ("%s: %s"):format(shortName(rule.item), tostring(fields and fields.reason)))
+return "short"
+end
+
+
+function stockrules.cycle(now, opts)
+opts = opts or {}
+local rules = stockrules.all()
+if #rules == 0 then return {} end
+local out = {}
+for _, rule in ipairs(rules) do
+if rule.enabled then
+
+local available = opts.available
+or require("mfg.controller.supervisor").available() or {}
+local ok, what, job = pcall(turn, rule, available)
+out[rule.id] = ok and {did = what, job = job} or {did = "error", why = what}
+if not ok then printError(("stock rule %d: %s"):format(rule.id, tostring(what))) end
+elseif said[rule.id] then
+fine(rule)
+end
+end
+return out
+end
+
+return stockrules

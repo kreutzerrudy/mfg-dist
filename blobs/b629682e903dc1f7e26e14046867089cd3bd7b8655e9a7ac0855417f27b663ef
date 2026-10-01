@@ -1,0 +1,704 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+
+local stock = {}
+
+stock.EVERY = 5
+stock.BACKGROUND = 30
+stock.READ = {timeout = 3, attempts = 2}
+stock.ACT = {timeout = 10, attempts = 1}
+stock.DIGITS = 5
+stock.STACK = 64
+
+
+local ORDER = {advice = 1, low = 2, filling = 3, watch = 4, met = 5, off = 6}
+local CHIP = {advice = "red", low = "orange", filling = "yellow", watch = "cyan",
+met = "lime", off = "gray"}
+local MARK = {advice = "!", low = "v", filling = "^", watch = "o", met = "=", off = "."}
+
+function stock.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+names = opts.names or {},
+
+rules = nil,
+readAt = nil, readWhy = nil,
+offer = nil,
+
+screen = "list",
+list = app.newList(),
+
+chosen = nil,
+detail = nil, detailAt = nil, detailWhy = nil,
+edit = nil,
+preview = nil, previewFor = nil,
+
+choices = nil,
+choiceList = app.newList(),
+pendingFor = nil,
+
+namesAt = nil,
+jump = nil,
+sending = nil,
+result = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+function stock.nameOf(view, item)
+local known = view.names and view.names[item]
+return (known and known.name) or app.shortName(item)
+end
+
+local function amount(n)
+n = math.floor(tonumber(n) or 0)
+if n >= 10000 then return ("%dk"):format(math.floor(n / 1000)) end
+if n >= 1000 then return ("%.1fk"):format(n / 1000) end
+return tostring(n)
+end
+
+local function ruleById(view, id)
+for _, rule in ipairs(view.rules or {}) do
+if rule.id == id then return rule end
+end
+return nil
+end
+
+local function ruleForItem(view, item)
+for _, rule in ipairs(view.rules or {}) do
+if rule.item == item then return rule end
+end
+return nil
+end
+
+
+
+function stock.refresh(view)
+view.readAt, view.detailAt = nil, nil
+end
+
+function stock.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+if not view.namesAt then return {kind = "names"} end
+local every = ((view.onScreen == false) and stock.BACKGROUND or stock.EVERY) * 1000
+local now = app.clock(view)
+if view.chosen and (view.screen == "rule" or view.screen == "confirm")
+and (not view.detailAt or now - view.detailAt >= every) then
+return {kind = "detail", id = view.chosen}
+end
+if view.screen == "rule" and view.detail and view.previewFor ~= view.detail.id then
+local d = view.detail
+view.previewFor = d.id
+if d.route then
+return {kind = "preview", item = d.item,
+quantity = math.max(1, math.min(4096, d.target - (d.free or 0)))}
+end
+view.preview = nil
+end
+if view.screen == "new" and not view.choices then return {kind = "choices"} end
+if not view.readAt or now - view.readAt >= every then return {kind = "read"} end
+return nil
+end
+
+function stock.exchange(view, job)
+local body, opts = nil, stock.READ
+if job.kind == "read" then
+view.readAt = app.clock(view)
+body = {command = "stock_rules"}
+elseif job.kind == "detail" then
+view.detailAt = app.clock(view)
+body = {command = "stock_rules", id = job.id}
+elseif job.kind == "choices" then
+body = {command = "stock_rules", choices = true}
+elseif job.kind == "names" then
+view.namesAt = app.clock(view)
+body = {command = "available"}
+elseif job.kind == "preview" then
+body = {command = "stock_preview", item = job.item, quantity = job.quantity}
+elseif job.kind == "act" then
+body = {command = job.command, operator = true}
+for k, v in pairs(job.params) do body[k] = v end
+opts = stock.ACT
+view.sending = job
+view.result = nil
+else
+return false
+end
+stock.apply(view, job, view.transport.request(body, opts) or {})
+return true
+end
+
+
+local function resolvePending(view)
+local pending = view.pendingFor
+if not pending or not view.rules then return end
+view.pendingFor = nil
+local rule = ruleForItem(view, pending.item)
+if rule then
+view.chosen, view.screen, view.detail, view.detailAt = rule.id, "rule", nil, nil
+view.edit = nil
+return
+end
+app.ask(view, {kind = "act", command = "set_stock_rule", open = true,
+params = {item = pending.item, target = pending.target or stock.STACK}})
+end
+
+function stock.apply(view, job, answer)
+app.noteLink(view, answer)
+local ok = answer.status == app.COMPLETED
+if job.kind == "read" then
+if ok and type(answer.rules) == "table" then
+view.rules, view.readWhy = answer.rules, nil
+view.offer = view.offer or {name = "stock_rules"}
+resolvePending(view)
+else
+view.readWhy = tostring(answer.reason or answer.status or "no answer")
+end
+elseif job.kind == "detail" then
+if ok and type(answer.rules) == "table" and answer.rules[1] then
+local fresh = answer.rules[1]
+
+if view.detail and (view.detail.target ~= fresh.target
+or view.detail.route ~= fresh.route) then
+view.previewFor = nil
+end
+view.detail, view.detailWhy = fresh, nil
+if not view.edit then
+view.edit = {target = tostring(fresh.target), low = tostring(fresh.low),
+field = "target"}
+end
+elseif answer.status == app.REJECTED and view.chosen == job.id then
+
+view.screen, view.chosen, view.detail = "list", nil, nil
+view.result = {text = tostring(answer.reason), colour = "warn"}
+else
+view.detailWhy = tostring(answer.reason or answer.status or "no answer")
+end
+elseif job.kind == "choices" then
+if ok then view.choices = answer.choices or {} end
+elseif job.kind == "names" then
+if ok then
+for item, known in pairs(answer.names or {}) do view.names[item] = known end
+end
+elseif job.kind == "preview" then
+view.preview = ok and {steps = answer.steps or {}, short = answer.short or {},
+yield = answer.yield} or {why = tostring(answer.reason or answer.status)}
+elseif job.kind == "act" then
+view.sending = nil
+view.readAt, view.detailAt = nil, nil
+if ok then
+local rule = answer.rule or {}
+local name = stock.nameOf(view, rule.item)
+local text
+if job.command == "forget_stock_rule" then
+text = ("%s is no longer kept stocked"):format(name)
+view.screen, view.chosen, view.detail = "list", nil, nil
+elseif job.params.enabled == false then
+text = ("%s: off"):format(name)
+else
+text = ("keep %d %s, refilled below %d"):format(rule.target or 0, name,
+rule.low or 0)
+end
+if job.open and rule.id then
+view.chosen, view.screen, view.detail, view.edit = rule.id, "rule", nil, nil
+end
+view.previewFor = nil
+view.result = {text = text, colour = "good"}
+app.sound(view, "done")
+elseif answer.status == app.TIMED_OUT then
+view.result = {text = ("no answer from %s -- look again before asking again")
+:format(view.host), colour = "warn"}
+app.sound(view, "refused")
+else
+view.result = {text = "refused: " .. tostring(answer.reason), colour = "bad"}
+app.sound(view, "refused")
+end
+end
+end
+
+
+
+local function statusRow(view)
+local text, colour = "", "text"
+if view.sending then
+text, colour = ("asking %s.."):format(view.host), "warn"
+elseif view.result then
+text, colour = view.result.text, view.result.colour or "text"
+end
+return doc.text(" " .. text, {colour = colour, wrap = true, keep = app.KEEP_STATUS,
+name = "status"})
+end
+
+local function button(label, key, colour, action, keep, name)
+return doc.button(label, {key = action and key or nil,
+colour = action and colour or "dim", action = action, keep = keep, name = name})
+end
+
+
+function stock.doing(view, rule)
+if rule.state == "advice" and rule.advice then
+return (rule.advice:gsub("^[^:]+: ", ""))
+end
+local request = rule.request
+if request then
+
+
+local machine, made, of = tostring(request.reason or "")
+:match("^waiting for ([^:]+): (%d+) of (%d+)")
+if request.state == "waiting" and machine then
+return ("%s %s/%s"):format(machine, made, of)
+end
+return ("job %d %s"):format(request.job, tostring(request.state))
+end
+if rule.state == "watch" then return "watch" end
+if rule.state == "off" then return "off" end
+if rule.state == "low" then return "refill next minute" end
+return ""
+end
+
+local function ruleEntries(view)
+local sorted = {}
+for _, rule in ipairs(view.rules or {}) do sorted[#sorted + 1] = rule end
+table.sort(sorted, function(a, b)
+local oa, ob = ORDER[a.state] or 9, ORDER[b.state] or 9
+if oa ~= ob then return oa < ob end
+return a.id < b.id
+end)
+local entries = {}
+for _, rule in ipairs(sorted) do
+local name = stock.nameOf(view, rule.item)
+entries[#entries + 1] = {value = rule.id,
+label = ("%s %-14s %5s/%-5s %s"):format(MARK[rule.state] or "?",
+name:sub(1, 14), amount(rule.free), amount(rule.target),
+stock.doing(view, rule)),
+chip = CHIP[rule.state] or "gray"}
+end
+return entries
+end
+
+local function listDocument(view, height)
+local add = doc.button("+ rule", {key = "+", colour = "selected",
+action = {kind = "show", screen = "new"}, keep = doc.REQUIRED, name = "new-rule"})
+local rows = {app.header(view, "STOCK", add), doc.rule({keep = 2})}
+if not view.rules then
+rows[#rows + 1] = doc.text(view.readWhy and ("the controller refused: "
+.. view.readWhy) or "reading the rules..", {colour = view.readWhy and "bad"
+or "dim", wrap = true, keep = doc.REQUIRED, name = "read-state"})
+else
+local entries = ruleEntries(view)
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" nothing is kept stocked yet -- + rule to keep an "
+.. "item at a target", {colour = "dim", wrap = true, keep = 20,
+name = "empty"})
+end
+for _, row in ipairs(app.listRows(view.list, entries, "rule",
+function(entry) return {kind = "open", id = entry.value} end,
+{limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+
+local function amountField(view, field, label, width)
+local edit = view.edit
+local focused = edit.field == field
+return {
+doc.text(label, {colour = "label", keep = doc.REQUIRED, name = field .. "-label"}),
+doc.gap(1),
+doc.text(" " .. edit[field] .. (focused and "_" or ""), {width = width or 7,
+colour = focused and "title" or "text", bg = "field",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+action = {kind = "focus", field = field}, name = field}),
+}
+end
+
+
+function stock.saveBlocked(view)
+local edit, d = view.edit, view.detail
+if view.sending then return "asking the controller.." end
+if not edit or not d then return "reading the rule.." end
+local target, low = tonumber(edit.target), tonumber(edit.low)
+if not target or target < 1 then return "type how many to keep" end
+if not low then return "type when to refill" end
+if low > target then return "refill below at most the target" end
+if target == d.target and low == d.low then return "nothing changed" end
+return nil
+end
+
+local function routeRows(view, d, rows)
+rows[#rows + 1] = doc.text(" made by", {colour = "label", keep = 30, name = "routes-label"})
+if #(d.routes or {}) == 0 then
+rows[#rows + 1] = doc.row({doc.gap(1), doc.text("nothing -- a watch only",
+{colour = "dim", keep = doc.REQUIRED, name = "no-route"}), doc.spacer({min = 1}),
+button("Register", nil, "action", {kind = "goto", app = "register"}, 5,
+"goto-register"),
+doc.gap(1),
+button("Machines", nil, "action", {kind = "goto", app = "machines"}, 4,
+"goto-machines"), doc.gap(1)},
+{keep = 29, name = "route-none"})
+return
+end
+for index, route in ipairs(d.routes) do
+local using = d.route == route.id
+local how
+if route.kind == "machine" then
+how = ("%s, %d on%s"):format(route.process, route.machines or 0,
+route.rate and (", %.1f/min"):format(route.rate) or "")
+else
+local parts = {}
+for item, n in pairs(route.inputs or {}) do
+parts[#parts + 1] = ("%d %s"):format(n, stock.nameOf(view, item))
+end
+table.sort(parts)
+how = "turtle: " .. table.concat(parts, ", ")
+end
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.button((using and "* " or "  ") .. how, {width = "fill", align = "left",
+colour = using and "selected" or "action",
+action = {kind = "via", via = route.id}, name = "route:" .. index}),
+}, {keep = 29 - index, name = "route-row:" .. index})
+end
+if d.via then
+rows[#rows + 1] = doc.row({doc.gap(1), button("auto: the book's choice", nil,
+"dim", {kind = "via", via = "auto"}, 6, "via-auto")},
+{keep = 6, name = "via-auto-row"})
+end
+end
+
+local function previewRows(view, d, rows)
+local p = view.preview
+if not p or not d.route then return end
+rows[#rows + 1] = doc.text((" one request: %d more"):format(math.max(0,
+d.target - (d.free or 0))), {colour = "label", keep = 16, name = "chain-label"})
+if p.why then
+rows[#rows + 1] = doc.text(" " .. p.why, {colour = "bad", wrap = true, keep = 15,
+name = "chain-why"})
+return
+end
+for index, step in ipairs(p.steps or {}) do
+rows[#rows + 1] = doc.text(("  %s x%d  %s"):format(stock.nameOf(view, step.produces),
+step.count, step.process or "turtle"), {colour = "text",
+truncate = doc.TRUNCATED, keep = 15, name = "chain:" .. index})
+end
+local short = {}
+for item, n in pairs(p.short or {}) do
+short[#short + 1] = ("%d %s"):format(n, stock.nameOf(view, item))
+end
+table.sort(short)
+rows[#rows + 1] = doc.text(#short > 0 and (" short: " .. table.concat(short, ", "))
+or " everything it needs is free", {colour = #short > 0 and "bad" or "dim",
+truncate = doc.TRUNCATED, keep = 14, name = "chain-short"})
+end
+
+local function historyRows(view, d, rows)
+if #(d.history or {}) == 0 then return end
+rows[#rows + 1] = doc.text(" last requests", {colour = "label", keep = 10,
+name = "history-label"})
+for index, job in ipairs(d.history) do
+rows[#rows + 1] = doc.text(("  job %d: %s %s"):format(job.id, tostring(job.requested),
+tostring(job.state)), {colour = job.state == "failed" and "bad" or "dim",
+truncate = doc.TRUNCATED, keep = 10, name = "history:" .. index})
+end
+end
+
+local function ruleDocument(view, height)
+local back = doc.button("Back", {key = "<", action = {kind = "show", screen = "list"},
+keep = doc.REQUIRED, name = "back"})
+local d = view.detail
+local title = d and ("KEEP " .. stock.nameOf(view, d.item):upper()) or "RULE"
+local rows = {app.header(view, title, back), doc.rule({keep = 2})}
+if not d or d.id ~= view.chosen then
+rows[#rows + 1] = doc.text(view.detailWhy and ("the controller refused: "
+.. view.detailWhy) or "reading the rule..", {colour = view.detailWhy and "bad"
+or "dim", wrap = true, keep = doc.REQUIRED, name = "read-state"})
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+rows[#rows + 1] = doc.text((" %s free, %s  %s"):format(amount(d.free), d.state,
+stock.doing(view, d)), {colour = d.state == "advice" and "bad" or "text",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "summary"})
+if d.advice then
+rows[#rows + 1] = doc.text(" " .. d.advice, {colour = "warn", wrap = true, keep = 40,
+name = "advice"})
+end
+
+local busy = view.sending ~= nil
+local fields = {doc.gap(1)}
+for _, child in ipairs(amountField(view, "target", "keep")) do fields[#fields + 1] = child end
+fields[#fields + 1] = doc.gap(1)
+for _, step in ipairs({{"-64", -64}, {"-8", -8}, {"+8", 8}, {"+64", 64}}) do
+fields[#fields + 1] = doc.button(step[1], {colour = "action",
+action = {kind = "nudge", by = step[2]}, keep = 7, name = "nudge" .. step[1]})
+end
+rows[#rows + 1] = doc.row(fields, {keep = doc.REQUIRED, name = "amounts"})
+local lows = {doc.gap(1)}
+for _, child in ipairs(amountField(view, "low", "refill below")) do lows[#lows + 1] = child end
+rows[#rows + 1] = doc.row(lows, {keep = doc.REQUIRED, name = "low-row"})
+
+routeRows(view, d, rows)
+previewRows(view, d, rows)
+historyRows(view, d, rows)
+rows[#rows + 1] = doc.spacer()
+
+local why = stock.saveBlocked(view)
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+button("Save", "enter", "selected", (not why) and {kind = "save"} or nil,
+doc.REQUIRED, "save"),
+doc.gap(1),
+d.enabled
+and button("Off", "o", "bad", (not busy) and {kind = "toggle"} or nil,
+doc.REQUIRED, "toggle")
+or button("On", "o", "good", (not busy) and {kind = "toggle"} or nil,
+doc.REQUIRED, "toggle"),
+doc.gap(1),
+button("Forget", "f", "bad", (not busy) and {kind = "forget"} or nil, 5, "forget"),
+}, {keep = doc.REQUIRED, name = "actions"})
+if why and why ~= "nothing changed" then
+rows[#rows + 1] = doc.text(" " .. why, {colour = "dim", wrap = true,
+keep = app.KEEP_STATUS - 1, name = "why-blocked"})
+end
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function choiceEntries(view)
+local entries = {}
+for _, choice in ipairs(view.choices or {}) do
+local name = stock.nameOf(view, choice.item)
+local rule = ruleForItem(view, choice.item)
+entries[#entries + 1] = {value = choice.item, label = name,
+note = rule and "kept" or (choice.made and "made" or amount(choice.free)),
+chip = app.chipFor(choice.item), made = choice.made}
+end
+table.sort(entries, function(a, b)
+if (a.made and 1 or 0) ~= (b.made and 1 or 0) then return a.made == true end
+if a.label:lower() ~= b.label:lower() then return a.label:lower() < b.label:lower() end
+return a.value < b.value
+end)
+return entries
+end
+
+local function newDocument(view, height)
+local back = doc.button("Back", {key = "<", action = {kind = "show", screen = "list"},
+keep = doc.REQUIRED, name = "back"})
+local rows = {app.header(view, "KEEP WHAT?", back), doc.rule({keep = 2})}
+if not view.choices then
+rows[#rows + 1] = doc.text(" reading what can be kept..", {colour = "dim",
+keep = doc.REQUIRED, name = "read-state"})
+else
+rows[#rows + 1] = doc.text(" what the plant makes first, then what the pool holds",
+{colour = "dim", truncate = doc.TRUNCATED, keep = 8, name = "hint"})
+for _, row in ipairs(app.listRows(view.choiceList, choiceEntries(view), "choice",
+function(entry) return {kind = "pick", item = entry.value} end,
+{pickKeys = false, arrows = true, limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function confirmDocument(view)
+local d = view.detail or {}
+local name = stock.nameOf(view, d.item)
+local rows = {app.header(view, "FORGET RULE"), doc.rule({keep = 2})}
+rows[#rows + 1] = doc.text((" Stop keeping %s stocked?"):format(name),
+{colour = "title", keep = doc.REQUIRED, truncate = doc.TRUNCATED, name = "confirm"})
+rows[#rows + 1] = doc.text(" A job it already queued still runs.", {colour = "dim",
+wrap = true, keep = 6, name = "note"})
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.button("yes", {key = "y", colour = "bad", action = {kind = "yes"},
+keep = doc.REQUIRED, name = "yes"}),
+doc.gap(1),
+doc.button("no", {key = "n", colour = "good", action = {kind = "no"},
+keep = doc.REQUIRED, name = "no"}),
+}, {keep = doc.REQUIRED, name = "confirm-actions"})
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+function stock.document(view, width, height)
+local rows
+if view.screen == "rule" then rows = ruleDocument(view, height)
+elseif view.screen == "new" then rows = newDocument(view, height)
+elseif view.screen == "confirm" then rows = confirmDocument(view)
+else rows = listDocument(view, height) end
+return doc.stack(rows, {name = "stock"})
+end
+
+function stock.settle(view, report)
+if view.screen == "list" then return app.settle(view.list, report, "rule") end
+if view.screen == "new" then return app.settle(view.choiceList, report, "choice") end
+return false
+end
+
+
+
+local function ask(view, command, params, extra)
+local job = {kind = "act", command = command, params = params}
+for k, v in pairs(extra or {}) do job[k] = v end
+app.ask(view, job)
+end
+
+function stock.act(view, action)
+local kind = action and action.kind
+local lists = {list = view.list, new = view.choiceList}
+local list = lists[view.screen]
+if list and app.page(list, kind, action) then return true end
+
+if kind == "show" then
+view.screen = action.screen
+if action.screen == "new" then
+view.choices, view.choiceList = nil, app.newList()
+end
+return true
+elseif kind == "open" then
+if view.chosen ~= action.id then view.detail, view.preview = nil, nil end
+view.chosen, view.screen, view.detailAt, view.edit = action.id, "rule", nil, nil
+view.previewFor = nil
+return true
+elseif kind == "for-item" then
+
+view.pendingFor = {item = action.item, target = action.target}
+view.readAt = nil
+resolvePending(view)
+return true
+elseif kind == "pick" then
+local rule = ruleForItem(view, action.item)
+if rule then return stock.act(view, {kind = "open", id = rule.id}) end
+ask(view, "set_stock_rule", {item = action.item, target = stock.STACK}, {open = true})
+return true
+elseif kind == "goto" then
+view.jump = {app = action.app}
+return true
+elseif kind == "focus" then
+if view.edit then view.edit.field = action.field end
+return true
+elseif kind == "nudge" then
+if not view.edit then return false end
+local target = math.max(1, (tonumber(view.edit.target) or 0) + action.by)
+
+local d = view.detail
+if d and tonumber(view.edit.low) == math.floor(d.target * 0.75 + 0.5) then
+view.edit.low = tostring(math.floor(target * 0.75 + 0.5))
+end
+view.edit.target = tostring(target)
+return true
+elseif kind == "save" then
+if stock.saveBlocked(view) then return false end
+ask(view, "set_stock_rule", {id = view.chosen, target = tonumber(view.edit.target),
+low = tonumber(view.edit.low)})
+view.edit = nil
+return true
+elseif kind == "via" then
+ask(view, "set_stock_rule", {id = view.chosen, via = action.via})
+return true
+elseif kind == "toggle" then
+local d = view.detail
+if not d then return false end
+ask(view, "set_stock_rule", {id = view.chosen, enabled = not d.enabled})
+return true
+elseif kind == "forget" then
+view.screen = "confirm"
+return true
+elseif kind == "yes" then
+view.screen = "rule"
+ask(view, "forget_stock_rule", {id = view.chosen})
+return true
+elseif kind == "no" then
+view.screen = "rule"
+return true
+end
+return false
+end
+
+function stock.searching(view)
+if view.screen == "list" and view.rules then return view.list end
+if view.screen == "new" and view.choices then return view.choiceList end
+return nil
+end
+
+
+
+local function ruleKeyboard(view, event)
+local edit = view.edit
+if not edit then return false end
+if event.kind == "char" and type(event.char) == "string" and event.char:match("^%d$") then
+local value = edit[edit.field]
+if #value < stock.DIGITS then
+edit[edit.field] = ((value .. event.char):gsub("^0+(%d)", "%1"))
+end
+return true
+end
+if event.kind == "key" and keys then
+if event.key == keys.backspace or event.key == keys.delete then
+local value = edit[edit.field]
+edit[edit.field] = event.key == keys.delete and "" or value:sub(1, -2)
+return true
+elseif event.key == keys.tab then
+edit.field = edit.field == "target" and "low" or "target"
+return true
+end
+end
+return false
+end
+
+function stock.keyboard(view, event)
+if not event then return false end
+if view.screen == "rule" then return ruleKeyboard(view, event) end
+local list = stock.searching(view)
+if list then return app.type(list, event) end
+return false
+end
+
+function stock.handle(view, event, grid)
+local took, chose = stock.keyboard(view, event)
+if took then
+if chose then stock.act(view, chose) end
+return true
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return stock.act(view, action)
+end
+
+return stock

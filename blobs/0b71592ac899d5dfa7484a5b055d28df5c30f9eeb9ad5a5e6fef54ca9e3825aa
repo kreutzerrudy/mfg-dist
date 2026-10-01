@@ -1,0 +1,61 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local store = require("mfg.storage")
+local machines = require("mfg.controller.machines")
+local alarms = require("mfg.controller.alarms")
+local flows = require("mfg.controller.flows")
+
+
+
+
+
+
+
+
+
+return {
+name        = "collect",
+label       = "Collect from a machine",
+tier        = "orchestrated",
+uses        = {"drain"},
+policy      = true,
+destructive = false,
+
+parameters = {
+{name = "port", label = "Port", type = "path", required = true,
+choices = {source = "ports"}, help = "A machine's output volume."},
+},
+
+returns = {collected = "items", left = "items"},
+
+run = function(params, ctx)
+local _, bad = machines.volume(params.port, "output")
+if bad then return rpc.REJECTED, {reason = bad} end
+
+local held = store.stock(params.port) or {}
+if not next(held) then return rpc.COMPLETED, {collected = {}, left = {}} end
+
+local pool = require("mfg.common.config").setting("source")
+local status, fields = actions.invoke("drain", {from = params.port, to = pool},
+ctx)
+if status ~= rpc.COMPLETED then
+return rpc.REJECTED, {reason = tostring(fields.reason)}
+end
+
+
+flows.addAll(fields.drained, "in", flows.source(ctx, "operator"))
+require("mfg.controller.throughput").collected(ctx and ctx.by, params.port,
+fields.drained)
+
+local left = store.stock(params.port) or {}
+local key = "collect.full:" .. params.port
+if next(left) then
+
+alarms.raise(key, require("mfg.controller.ports").fullText(pool, left,
+params.port), {source = params.port, severity = "hold"})
+else
+alarms.clear(key)
+end
+return rpc.COMPLETED, {collected = fields.drained or {}, left = left}
+end,
+}

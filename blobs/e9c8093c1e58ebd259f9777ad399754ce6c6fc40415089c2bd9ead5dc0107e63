@@ -1,0 +1,28 @@
+local rpc = require("mfg.common.rpc")
+local flows = require("mfg.controller.flows")
+
+
+
+
+
+
+return {
+name        = "flows",
+label       = "Pool flows",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "item", label = "Item", type = "item", required = false},
+},
+
+returns = {items = "table", now = "number"},
+
+run = function(params)
+local items
+if params.item then items = {flows.report(params.item)}
+else items = flows.items() end
+return rpc.COMPLETED, {items = items, now = os.epoch("utc")}
+end,
+}

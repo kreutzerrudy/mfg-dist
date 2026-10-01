@@ -1,0 +1,349 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local pattern = require("mfg.common.pattern")
+local handoff = require("mfg.storage.handoff")
+local turtles = require("mfg.controller.turtles")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local CONTROL = "mfg-control"
+
+
+local function sortedItems(counts)
+local names = {}
+for item in pairs(counts) do names[#names + 1] = item end
+table.sort(names)
+return names
+end
+
+local decl = {
+name        = "run_batch",
+label       = "Run a batch",
+role        = "turtle",
+tier        = "orchestrated",
+
+
+uses        = {"count", "move", "fill", "pattern_fill", "craft", "deposit",
+"return_unused", "drain"},
+manual      = true,
+
+destructive = true,
+requires    = {state = "idle"},
+
+parameters = {
+{name = "target", label = "Node", type = "node", required = true,
+choices = {source = "nodes"},
+help = "The worker's label -- never its input chest. Its points resolve "
+.. "from the node record."},
+
+{name = "pattern_id", label = "Pattern", type = "text", required = true,
+help = "Names the arrangement -- usually the recipe id. Sent to the node "
+.. "every time; the node refuses if it does not match what it has "
+.. "cached."},
+
+{name = "pattern", label = "Slots", type = "pattern", required = false,
+help = "Slot to item. Omit when the node already has this pattern; the "
+.. "first batch of a pattern must carry it."},
+
+{name = "amount", label = "Sets", type = "number", integer = true,
+min = 1, max = 64, required = true,
+help = "How many sets to craft. One set is the pattern filled once. 64 is "
+.. "the deepest a slot can be filled, so 65 is two batches."},
+
+{name = "source", label = "Source", type = "path", required = false,
+choices = {source = "volumes"},
+help = "The volume to draw from and return to. Defaults to the node "
+.. "record's source, then /pool."},
+},
+
+returns = {
+delivered = "items", depth = "number",
+produced = "items", consumed = "items", deposited = "items",
+collected = "items", returned = "items", unloaded = "items",
+},
+}
+
+local function batch(params, ctx)
+
+
+local node = turtles.get(params.target)
+if not node then
+return rpc.REJECTED, {reason = "no such node: " .. params.target}
+end
+local stale = handoff.legacyPath(node)
+if stale then return rpc.REJECTED, {reason = stale} end
+if type(node.host) ~= "string" or node.host == "" then
+return rpc.REJECTED, {reason = ("%s has no host to reach it at")
+:format(params.target)}
+end
+
+
+
+local source = params.source or handoff.sourceOf(node)
+local input = handoff.inputOf(node)
+local output = handoff.outputOf(node)
+
+
+
+
+
+
+
+
+local slots = params.pattern
+if not slots then
+if node.pattern_id ~= params.pattern_id
+or type(node.pattern) ~= "table" then
+return rpc.REJECTED, {reason = ("no pattern sent for %s and the "
+.. "last one arranged on %s was %s -- send the slots")
+:format(params.pattern_id, params.target,
+tostring(node.pattern_id or "nothing"))}
+end
+slots = node.pattern
+end
+
+local requirement = {}
+for item, perSet in pairs(pattern.occurrences(slots)) do
+requirement[item] = perSet * params.amount
+end
+local items = sortedItems(requirement)
+
+
+
+local short = {}
+for _, item in ipairs(items) do
+local status, fields = actions.invoke("count",
+{path = source, item = item}, ctx)
+if status ~= rpc.COMPLETED then
+return rpc.REJECTED, {reason = ("could not count %s in %s: %s")
+:format(item, source, tostring(fields.reason))}
+end
+if fields.count < requirement[item] then
+short[item] = {wanted = requirement[item], have = fields.count}
+end
+end
+
+if next(short) then
+local parts = {}
+for _, item in ipairs(sortedItems(short)) do
+parts[#parts + 1] = ("%s wants %d, holds %d"):format(
+item, short[item].wanted, short[item].have)
+end
+return rpc.REJECTED, {
+reason = ("%s is short for %d sets of %s: %s -- nothing moved")
+:format(source, params.amount, params.pattern_id,
+table.concat(parts, "; ")),
+short = short,
+}
+end
+
+
+
+
+
+
+
+
+
+local result = {
+target = params.target, pattern_id = params.pattern_id,
+amount = params.amount, source = source, delivered = {},
+}
+
+local function settle(status, fields)
+local outStatus, outFields = actions.invoke("drain",
+{from = output, to = source}, ctx)
+local inStatus, inFields = actions.invoke("drain",
+{from = input, to = source}, ctx)
+
+if outStatus == rpc.COMPLETED then fields.collected = outFields.drained end
+if inStatus == rpc.COMPLETED then fields.returned = inFields.drained end
+
+
+
+
+if source == require("mfg.common.config").setting("source") then
+local flows = require("mfg.controller.flows")
+local who = "turtle:" .. tostring(params.target)
+local returned = fields.returned or {}
+for item, n in pairs(result.delivered or {}) do
+flows.add(item, n - (returned[item] or 0), "out", who)
+end
+flows.addAll(fields.collected, "in", who)
+end
+
+
+
+
+if status == rpc.COMPLETED then
+if outStatus ~= rpc.COMPLETED then
+fields.step = "collect"
+fields.reason = ("collect %s: %s"):format(output,
+tostring(outFields.reason))
+return rpc.REJECTED, fields
+end
+if inStatus ~= rpc.COMPLETED then
+fields.step = "return"
+fields.reason = ("return %s: %s"):format(input,
+tostring(inFields.reason))
+return rpc.REJECTED, fields
+end
+end
+return status, fields
+end
+
+
+local function onNode(command, body)
+body = body or {}
+body.command = command
+body.operator = ctx.operator
+body.policy = ctx.policy
+local status, fields = actions.invoke("transmit", {
+target = node.host,
+protocol = CONTROL,
+content = textutils.serialize(body),
+}, ctx)
+return status, fields.reply or {}, fields.reason
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function failed(step, status, why, detail)
+result.step = step
+result.reason = ("%s: %s"):format(step, tostring(why))
+if detail then result.detail = detail end
+if status ~= rpc.TIMED_OUT then status = rpc.REJECTED end
+
+if step ~= "move" then
+local backStatus, back, backWhy = onNode("return_unused")
+if backStatus == rpc.COMPLETED then
+result.unloaded = back.returned
+else
+result.reason = ("%s -- and the node could not put back what it "
+.. "holds (%s), so it may still hold material"):format(
+result.reason, tostring(backWhy))
+end
+if status == rpc.TIMED_OUT then
+result.reason = result.reason .. " -- anything it crafted before "
+.. "timing out comes home as returned, not collected"
+end
+end
+return settle(status, result)
+end
+
+
+
+for _, item in ipairs(items) do
+local wanted = requirement[item]
+local status, fields = actions.invoke("move",
+{from = source, to = input, item = item, count = wanted}, ctx)
+local moved = (fields and fields.moved) or 0
+result.delivered[item] = moved
+if status ~= rpc.COMPLETED or moved < wanted then
+
+
+
+return failed("move", status, ("%d of %d %s reached %s (%s)")
+:format(moved, wanted, item, input,
+tostring(fields and fields.reason or "short")))
+end
+end
+
+
+
+local status, reply, why = onNode("fill")
+if status ~= rpc.COMPLETED then return failed("fill", status, why) end
+
+
+
+
+status, reply, why = onNode("pattern_fill",
+{pattern_id = params.pattern_id, pattern = params.pattern})
+if status ~= rpc.COMPLETED then
+return failed("pattern_fill", status, why, reply.detail)
+end
+result.depth = reply.depth
+turtles.setPattern(node.id, params.pattern_id, slots)
+
+status, reply, why = onNode("craft")
+if status ~= rpc.COMPLETED then return failed("craft", status, why) end
+result.produced = reply.produced
+result.consumed = reply.consumed
+
+status, reply, why = onNode("deposit")
+if status ~= rpc.COMPLETED then return failed("deposit", status, why) end
+result.deposited = reply.deposited
+
+
+
+return settle(rpc.COMPLETED, result)
+end
+
+
+
+
+
+decl.run = function(params, ctx)
+local claimed, holder = turtles.claim(params.target,
+ctx.policy or ctx.by or "a batch")
+if not claimed then
+return rpc.REJECTED, {reason = ("%s is busy with a batch for %s")
+:format(params.target, holder)}
+end
+local result = table.pack(pcall(batch, params, ctx))
+turtles.release(params.target)
+if not result[1] then error(result[2], 0) end
+return table.unpack(result, 2, result.n)
+end
+
+return decl

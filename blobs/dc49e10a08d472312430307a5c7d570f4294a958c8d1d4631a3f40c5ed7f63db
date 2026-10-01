@@ -1,0 +1,40 @@
+local rpc = require("mfg.common.rpc")
+local stockrules = require("mfg.controller.stockrules")
+
+
+
+
+
+
+
+
+return {
+name        = "set_stock_rule",
+label       = "Keep an item stocked",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "id", label = "Rule", type = "number", integer = true, min = 1,
+required = false, help = "The rule to change; omit for a new one."},
+{name = "item", label = "Item", type = "item", required = false},
+{name = "target", label = "Keep", type = "number", integer = true, min = 1,
+max = 65536, required = false},
+{name = "low", label = "Refill below", type = "number", integer = true, min = 0,
+max = 65536, required = false},
+{name = "via", label = "Recipe", type = "text", required = false,
+help = "A recipe id that makes the item, or auto."},
+{name = "enabled", label = "On", type = "flag", required = false},
+},
+
+returns = {rule = "table"},
+
+run = function(params, ctx)
+if not params.id and not params.target then
+return rpc.REJECTED, {reason = "a new rule needs a target"}
+end
+local rule, why = stockrules.set(params, ctx and ctx.by)
+if not rule then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {rule = rule}
+end,
+}

@@ -1,0 +1,24 @@
+local rpc = require("mfg.common.rpc")
+local stockrules = require("mfg.controller.stockrules")
+
+
+
+return {
+name        = "forget_stock_rule",
+label       = "Forget a stock rule",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "id", label = "Rule", type = "number", integer = true, min = 1,
+required = true},
+},
+
+returns = {rule = "table"},
+
+run = function(params)
+local rule, why = stockrules.forget(params.id)
+if not rule then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {rule = rule}
+end,
+}

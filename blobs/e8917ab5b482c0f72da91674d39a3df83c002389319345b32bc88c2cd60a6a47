@@ -1,0 +1,45 @@
+local rpc = require("mfg.common.rpc")
+local stockrules = require("mfg.controller.stockrules")
+local dispatch = require("mfg.controller.dispatch")
+
+
+
+
+
+
+return {
+name        = "stock_preview",
+label       = "What keeping it stocked would make",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "item", label = "Item", type = "item", required = true},
+{name = "quantity", label = "Quantity", type = "number", integer = true, min = 1,
+max = 4096, required = true},
+{name = "via", label = "Recipe", type = "text", required = false},
+},
+
+returns = {steps = "table", short = "table", draws = "table"},
+
+run = function(params)
+local rule = stockrules.forItem(params.item) or {item = params.item}
+if params.via then rule = {item = params.item, via = params.via} end
+local def = stockrules.route(rule)
+if not def then
+return rpc.REJECTED, {reason = ("nothing makes %s -- a rule for it only "
+.. "watches"):format(params.item)}
+end
+local available = require("mfg.controller.supervisor").available() or {}
+local plan, why = dispatch.plan(def, params.quantity, available)
+if not plan then return rpc.REJECTED, {reason = tostring(why)} end
+local steps = {}
+for _, step in ipairs(plan.steps) do
+steps[#steps + 1] = {label = step.label, sets = step.sets, count = step.count,
+produces = step.produces, process = step.process, inputs = step.inputs}
+end
+return rpc.COMPLETED, {steps = steps, short = plan.short, draws = plan.draws,
+yield = plan.yield}
+end,
+}

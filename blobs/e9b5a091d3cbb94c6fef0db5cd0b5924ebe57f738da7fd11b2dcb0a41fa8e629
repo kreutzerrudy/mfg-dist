@@ -1,0 +1,75 @@
+local rpc = require("mfg.common.rpc")
+local stockrules = require("mfg.controller.stockrules")
+local recipes = require("mfg.controller.recipes")
+
+
+
+
+
+
+
+
+
+return {
+name        = "stock_rules",
+label       = "Stock rules",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "id", label = "Rule", type = "number", integer = true, min = 1,
+required = false},
+{name = "choices", label = "Choices", type = "flag", required = false},
+},
+
+returns = {rules = "table", choices = "table", now = "number"},
+
+run = function(params)
+local supervisor = require("mfg.controller.supervisor")
+local available = supervisor.available() or {}
+local out = {}
+for _, rule in ipairs(stockrules.all()) do
+if not params.id or rule.id == params.id then
+local entry = {}
+for k, v in pairs(rule) do entry[k] = v end
+for k, v in pairs(stockrules.status(rule, available)) do entry[k] = v end
+if params.id then
+local throughput = require("mfg.controller.throughput")
+entry.routes = stockrules.routes(rule.item)
+for _, route in ipairs(entry.routes) do
+if route.process then
+route.rate, route.rateState = throughput.rate(route.id)
+end
+end
+entry.history = stockrules.history(rule)
+end
+out[#out + 1] = entry
+end
+end
+if params.id and #out == 0 then
+return rpc.REJECTED, {reason = "no stock rule " .. params.id}
+end
+
+local choices = nil
+if params.choices then
+
+local seen = {}
+choices = {}
+for _, def in ipairs(recipes.all()) do
+if not seen[def.output.item] then
+seen[def.output.item] = true
+choices[#choices + 1] = {item = def.output.item, made = true,
+free = math.floor(available[def.output.item] or 0)}
+end
+end
+for item, n in pairs(available) do
+if not seen[item] then
+seen[item] = true
+choices[#choices + 1] = {item = item, free = math.floor(n)}
+end
+end
+end
+return rpc.COMPLETED, {rules = out, choices = choices, now = os.epoch("utc")}
+end,
+}

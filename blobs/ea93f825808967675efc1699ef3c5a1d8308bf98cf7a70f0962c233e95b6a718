@@ -1,0 +1,189 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+
+local flows = {}
+
+local STORE = "flows"
+
+flows.MINUTES = 60
+flows.HOURS = 48
+flows.WINDOW = 15
+flows.SAVE = 60
+
+local MINUTE, HOUR = 60000, 3600000
+
+local data = nil
+
+local dirty, savedAt = false, 0
+
+local function clock(now) return now or os.epoch("utc") end
+
+local function loaded()
+if not data then
+local stored = state.read(STORE, {})
+data = type(stored) == "table" and stored or {}
+end
+return data
+end
+
+
+local function prune(all, now)
+local minute, hour = math.floor(now / MINUTE), math.floor(now / HOUR)
+for item, entry in pairs(all) do
+for at in pairs(entry.m or {}) do
+if at <= minute - flows.MINUTES then entry.m[at] = nil end
+end
+for at in pairs(entry.h or {}) do
+if at <= hour - flows.HOURS then entry.h[at] = nil end
+end
+if not next(entry.m or {}) and not next(entry.h or {}) then all[item] = nil end
+end
+end
+
+
+function flows.flush(now, force)
+now = clock(now)
+if not dirty then return false end
+if not force and now - savedAt < flows.SAVE * 1000 then return false end
+prune(loaded(), now)
+state.write(STORE, loaded())
+dirty, savedAt = false, now
+return true
+end
+
+
+
+
+function flows.source(ctx, default)
+local by = ctx and ctx.by
+if type(by) == "string" and by:match("^machine:") then return by end
+return default
+end
+
+
+function flows.add(item, n, direction, source, now)
+if type(item) ~= "string" or type(n) ~= "number" or n <= 0 then return end
+now = clock(now)
+local key = direction == "in" and "i" or "o"
+source = source or "?"
+local all = loaded()
+local entry = all[item] or {m = {}, h = {}}
+all[item] = entry
+local minute, hour = math.floor(now / MINUTE), math.floor(now / HOUR)
+local m = entry.m[minute] or {}
+entry.m[minute] = m
+m[key] = m[key] or {}
+m[key][source] = (m[key][source] or 0) + n
+local h = entry.h[hour] or {}
+entry.h[hour] = h
+h[key] = (h[key] or 0) + n
+dirty = true
+flows.flush(now)
+end
+
+
+function flows.addAll(map, direction, source, now)
+for item, n in pairs(map or {}) do flows.add(item, n, direction, source, now) end
+end
+
+
+
+local function totals(all, item, minutes, now)
+local entry = all[item]
+local inn, out, sources = 0, 0, {}
+if not entry then return inn, out, sources end
+local minute = math.floor(now / MINUTE)
+for at, m in pairs(entry.m or {}) do
+if at > minute - minutes then
+for source, n in pairs(m.i or {}) do
+inn = inn + n
+sources[source] = sources[source] or {i = 0, o = 0}
+sources[source].i = sources[source].i + n
+end
+for source, n in pairs(m.o or {}) do
+out = out + n
+sources[source] = sources[source] or {i = 0, o = 0}
+sources[source].o = sources[source].o + n
+end
+end
+end
+return inn, out, sources
+end
+
+
+function flows.inflow(item, now, minutes)
+minutes = minutes or flows.WINDOW
+local inn = totals(loaded(), item, minutes, clock(now))
+return inn / minutes
+end
+
+
+
+
+function flows.report(item, now, all)
+now = clock(now)
+all = all or loaded()
+local in15, out15 = totals(all, item, flows.WINDOW, now)
+local in60, out60, sources = totals(all, item, flows.MINUTES, now)
+local _, _, recent = totals(all, item, flows.WINDOW, now)
+local bySource = {}
+for source, hour in pairs(sources) do
+local last = recent[source] or {i = 0, o = 0}
+bySource[#bySource + 1] = {source = source,
+in15 = last.i / flows.WINDOW, out15 = last.o / flows.WINDOW,
+inHour = hour.i / flows.MINUTES, outHour = hour.o / flows.MINUTES}
+end
+table.sort(bySource, function(a, b) return a.source < b.source end)
+local hours = {}
+local hour = math.floor(now / HOUR)
+for at, h in pairs((all[item] or {}).h or {}) do
+hours[#hours + 1] = {ago = hour - at, i = h.i or 0, o = h.o or 0}
+end
+table.sort(hours, function(a, b) return a.ago < b.ago end)
+return {item = item, in15 = in15 / flows.WINDOW, out15 = out15 / flows.WINDOW,
+inHour = in60 / flows.MINUTES, outHour = out60 / flows.MINUTES,
+sources = bySource, hours = hours}
+end
+
+
+function flows.items(now, all)
+now = clock(now)
+all = all or loaded()
+local out = {}
+for item in pairs(all) do
+local report = flows.report(item, now, all)
+if report.inHour > 0 or report.outHour > 0 then out[#out + 1] = report end
+end
+table.sort(out, function(a, b) return a.item < b.item end)
+return out
+end
+
+
+function flows.snapshot()
+local stored = state.read(STORE, {})
+return type(stored) == "table" and stored or {}
+end
+
+function flows.clear()
+data, dirty, savedAt = {}, false, 0
+state.clear(STORE)
+end
+
+return flows

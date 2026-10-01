@@ -1,0 +1,40 @@
+local rpc = require("mfg.common.rpc")
+local throughput = require("mfg.controller.throughput")
+local scripts = require("mfg.controller.scripts")
+
+
+
+
+
+
+return {
+name        = "plan_type",
+label       = "Plan a machine type",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "type", label = "Type", type = "text", required = true},
+{name = "on", label = "Plan it", type = "flag", required = true},
+{name = "horizon", label = "Backlog horizon (minutes)", type = "number",
+integer = true, min = 1, max = 1440, required = false,
+help = "How soon the plan aims to clear what the pool holds (default 30)."},
+},
+
+returns = {type = "text", on = "flag", horizon = "number"},
+
+run = function(params)
+local record = scripts.get(params.type)
+if not record then
+return rpc.REJECTED, {reason = "no machine type called " .. params.type}
+end
+if params.on and not (record.makes and #record.makes > 0) then
+return rpc.REJECTED, {reason = ("%s declares nothing it makes -- add a `makes` "
+.. "line to its script first"):format(params.type)}
+end
+local setting = throughput.setPlanned(params.type, params.on, params.horizon)
+return rpc.COMPLETED, {type = params.type, on = params.on,
+horizon = setting and setting.horizon or nil}
+end,
+}

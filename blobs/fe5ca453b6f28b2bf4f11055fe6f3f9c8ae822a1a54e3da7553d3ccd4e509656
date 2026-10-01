@@ -1,0 +1,27 @@
+local rpc = require("mfg.common.rpc")
+local throughput = require("mfg.controller.throughput")
+
+
+
+
+
+
+return {
+name        = "plan",
+label       = "The machine plan",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {},
+
+returns = {types = "table", at = "number", now = "number"},
+
+run = function()
+local view = throughput.current()
+local out = {}
+for _, p in pairs(view.plan.types or {}) do out[#out + 1] = p end
+table.sort(out, function(a, b) return a.type < b.type end)
+return rpc.COMPLETED, {types = out, at = view.plan.at, now = os.epoch("utc")}
+end,
+}

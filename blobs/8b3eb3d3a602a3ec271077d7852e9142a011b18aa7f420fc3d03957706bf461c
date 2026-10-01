@@ -1,0 +1,28 @@
+local rpc = require("mfg.common.rpc")
+local throughput = require("mfg.controller.throughput")
+
+
+
+
+
+
+
+return {
+name        = "rates",
+label       = "Machine rates",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "type", label = "Type", type = "text", required = false,
+help = "One machine type; omit for all."},
+},
+
+returns = {types = "table", now = "number"},
+
+run = function(params)
+return rpc.COMPLETED, {types = throughput.rates(params.type),
+now = os.epoch("utc")}
+end,
+}

@@ -1,0 +1,204 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local pattern = require("mfg.common.pattern")
+
+local recipes = {}
+
+local STORE = "recipes"
+local OPTS = {schema = 1}
+
+local function load()
+local data, why = state.read(STORE, {recipes = {}, rev = 0, seq = 0}, OPTS)
+if why then error("the recipe book is unreadable: " .. why, 0) end
+if type(data) ~= "table" or type(data.recipes) ~= "table" then
+data = {recipes = {}, rev = 0, seq = 0}
+end
+return data
+end
+
+local function save(data)
+data.rev = (data.rev or 0) + 1
+return state.write(STORE, data, OPTS)
+end
+
+
+
+
+
+
+
+
+local function shortName(item) return (tostring(item):match("[^:]+$") or item) end
+
+function recipes.isProcess(id)
+return type(id) == "string" and id:match("^%d+=") == nil
+end
+
+
+local function processRecipes()
+local ok, scripts = pcall(require, "mfg.controller.scripts")
+if not ok then return {} end
+local out = {}
+for _, t in ipairs(scripts.all()) do
+if t.makes then
+local enabled = 0
+for _, m in ipairs(scripts.machines(t.name)) do
+if m.enabled then enabled = enabled + 1 end
+end
+for _, r in ipairs(t.makes) do
+local inputs = {}
+for _, input in ipairs(r.inputs) do
+inputs[input.item] = (inputs[input.item] or 0) + input.n
+end
+out[#out + 1] = {id = r.id, process = t.name, inputs = inputs,
+label = ("%s (%s)"):format(shortName(r.output.item), t.name),
+output = {item = r.output.item, count = r.output.n},
+machines = enabled}
+end
+end
+end
+return out
+end
+
+
+local function view(def)
+if not def then return nil end
+def.inputs = pattern.occurrences(def.pattern)
+return def
+end
+
+function recipes.get(id)
+if recipes.isProcess(id) then
+for _, def in ipairs(processRecipes()) do
+if def.id == id then return def end
+end
+return nil
+end
+return view(load().recipes[id])
+end
+
+
+function recipes.all()
+local out = {}
+for _, def in pairs(load().recipes) do out[#out + 1] = view(def) end
+for _, def in ipairs(processRecipes()) do out[#out + 1] = def end
+table.sort(out, function(a, b)
+if a.label ~= b.label then return a.label < b.label end
+return a.id < b.id
+end)
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+function recipes.producing(item)
+local idle = nil
+local processes = processRecipes()
+table.sort(processes, function(a, b) return a.id < b.id end)
+for _, def in ipairs(processes) do
+if def.output.item == item then
+if def.machines > 0 then return def end
+idle = idle or def
+end
+end
+local best = nil
+for _, def in pairs(load().recipes) do
+if def.output.item == item and (not best or def.seq < best.seq) then
+best = def
+end
+end
+return view(best) or idle
+end
+
+
+
+
+
+
+
+function recipes.add(def)
+if type(def) ~= "table" or type(def.pattern) ~= "table" or next(def.pattern) == nil then
+return nil, "a recipe needs a pattern"
+end
+local inGrid, why = pattern.inGrid(def.pattern)
+if not inGrid then return nil, why end
+local output = def.output
+if type(output) ~= "table" or type(output.item) ~= "string"
+or type(output.count) ~= "number" or output.count < 1 then
+return nil, "a recipe needs an output: an item and a count"
+end
+
+local id = pattern.id(def.pattern)
+local data = load()
+local existing = data.recipes[id]
+if existing then
+return nil, ("that pattern is already registered, as %s"):format(existing.label)
+end
+
+data.seq = (data.seq or 0) + 1
+data.recipes[id] = {
+id = id,
+label = def.label or output.item:match("[^:]+$") or output.item,
+pattern = def.pattern,
+output = {item = output.item, count = output.count},
+byproducts = def.byproducts,
+registered = def.registered,
+seq = data.seq,
+}
+save(data)
+return view(data.recipes[id])
+end
+
+
+
+function recipes.remove(id)
+if recipes.isProcess(id) then
+return nil, ("%s is a machine's recipe: remove the `makes` line from its "
+.. "script"):format(tostring(id))
+end
+local data = load()
+local existing = data.recipes[id]
+if not existing then return nil, "no such recipe: " .. tostring(id) end
+data.recipes[id] = nil
+save(data)
+return existing
+end
+
+
+
+
+function recipes.setsFor(def, quantity)
+local sets = math.ceil(quantity / def.output.count)
+return sets, sets * def.output.count
+end
+
+return recipes

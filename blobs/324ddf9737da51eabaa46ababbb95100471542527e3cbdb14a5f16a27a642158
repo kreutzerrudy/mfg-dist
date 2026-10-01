@@ -1,0 +1,240 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local dispatch = require("mfg.controller.dispatch")
+local recipes = require("mfg.controller.recipes")
+local turtles = require("mfg.controller.turtles")
+local configs = require("mfg.controller.configs")
+local alarms = require("mfg.controller.alarms")
+
+local runner = {}
+
+runner.MAX_SETS = 64
+runner.RETRY = 30
+runner.RETRY_TIMEOUT = 60
+runner.RETRY_DRIFT = 300
+runner.IDLE = 2
+runner.WAIT = 10
+runner.STALL = 300
+runner.STALL_CYCLES = 10
+
+local CRAFTING_TABLE = "minecraft:crafting_table"
+
+
+
+
+
+
+
+
+
+function runner.eligible(patternId)
+local holding, others = {}, {}
+for id, record in pairs(turtles.all()) do
+local fitted = true
+local seen = type(record.host) == "string" and configs.observed(record.host)
+for _, item in ipairs(seen and seen.equipment_missing or {}) do
+if item == CRAFTING_TABLE then fitted = false end
+end
+if fitted and type(record.host) == "string" and record.host ~= "" then
+local list = record.pattern_id == patternId and holding or others
+list[#list + 1] = id
+end
+end
+table.sort(holding)
+table.sort(others)
+for _, id in ipairs(others) do holding[#holding + 1] = id end
+return holding
+end
+
+local function copy(t)
+local out = {}
+for k, v in pairs(t) do out[k] = v end
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function runner.waitFor(job, step, def, now)
+local throughput = require("mfg.controller.throughput")
+local count, session = throughput.counter(def.process, def.output.item)
+local mark = {session = session, n = count}
+local item = def.output.item:match("[^:]+$") or def.output.item
+if not job.mark then
+dispatch.progress(job.id, job.made or 0, mark, now, ("waiting for %s: 0 of %d %s")
+:format(def.process, step.count, item), now + runner.WAIT * 1000)
+return {job = job.id, outcome = "waiting"}
+end
+
+
+local base = job.mark.session == session and job.mark.n or 0
+local arrived = math.max(0, count - base)
+local made = (job.made or 0) + arrived
+local since = arrived > 0 and now or (job.since or now)
+local reason = ("waiting for %s: %d of %d %s"):format(def.process, made, step.count,
+item)
+
+local rate = throughput.rate(def.id, now)
+local cycle = rate and rate > 0 and (60 * def.output.count / (rate * math.max(1,
+def.machines or 1))) or 0
+local stallAfter = math.max(runner.STALL, runner.STALL_CYCLES * cycle)
+local key = ("job.%d.stalled"):format(job.id)
+if made < step.count and now - since > stallAfter * 1000 then
+alarms.raise(key, ("job %d (%s): %s has collected no %s for %d min -- are its "
+.. "machines enabled and supplied?"):format(job.id, tostring(job.label),
+def.process, item, math.floor((now - since) / 60000)),
+{now = now, source = "jobs", severity = "advice"})
+reason = reason .. " -- stalled"
+else
+alarms.clear(key, now)
+end
+
+dispatch.progress(job.id, made, mark, since, reason, now + runner.WAIT * 1000)
+if made >= step.count then
+return {job = job.id, outcome = "ran", process = def.process, made = made}
+end
+return {job = job.id, outcome = "waiting", reason = reason}
+end
+
+
+
+
+
+
+
+function runner.pass(opts)
+opts = opts or {}
+local invoke = opts.invoke or actions.invoke
+local now = opts.now or os.epoch("utc")
+
+local job, step = dispatch.next(now)
+if not job then return nil end
+
+local function blocked(reason, retry, alarm)
+dispatch.fail(job.id, reason, false, now + retry * 1000)
+if alarm then
+alarms.raise(("job.%d.%s"):format(job.id, alarm),
+("job %d (%s): %s"):format(job.id, tostring(job.label), reason),
+{now = now, source = "jobs", severity = "hold"})
+end
+return {job = job.id, outcome = "blocked", reason = reason}
+end
+
+
+
+local def = recipes.get(step.recipe)
+if not def and step.process then
+return blocked(("step %d (%s): %s no longer makes it -- put the `makes` line "
+.. "back in its script"):format(job.position, tostring(step.label),
+step.process), runner.RETRY)
+end
+if not def then
+return blocked(("step %d (%s) needs a recipe no longer in the book -- "
+.. "register it again"):format(job.position, tostring(step.label)),
+runner.RETRY)
+end
+if def.process then return runner.waitFor(job, step, def, now) end
+
+local amount = math.min(runner.MAX_SETS, step.sets - (job.stepDone or 0))
+local nodes = runner.eligible(def.id)
+if #nodes == 0 then
+return blocked("no crafting node is registered and fitted", runner.RETRY)
+end
+
+
+local ctx = {by = "jobs", policy = ("jobs:%d"):format(job.id)}
+local refusals = {}
+
+for _, node in ipairs(nodes) do
+
+local current = dispatch.job(job.id)
+if not current or not dispatch.isOpen(current) then
+return {job = job.id, outcome = "cancelled"}
+end
+
+local status, fields = invoke("run_batch", {
+target = node, pattern_id = def.id, pattern = copy(def.pattern),
+amount = amount,
+}, ctx)
+fields = fields or {}
+
+if status == rpc.COMPLETED then
+local made = (fields.produced or {})[def.output.item] or 0
+local expected = amount * def.output.count
+dispatch.record(job.id, amount,
+{node = node, sets = amount, produced = fields.produced})
+alarms.clear(("job.%d.timeout"):format(job.id), now)
+if made < expected then
+
+
+return blocked(("%s made %d %s from %d sets, the book says %d -- "
+.. "recipe drift"):format(node, made, def.output.item, amount,
+expected), runner.RETRY_DRIFT, "drift")
+end
+return {job = job.id, outcome = "ran", node = node, sets = amount}
+end
+
+if status == rpc.TIMED_OUT then
+
+
+
+return blocked(("%s timed out: %s"):format(node, tostring(fields.reason)),
+runner.RETRY_TIMEOUT, "timeout")
+end
+
+if fields.short then
+
+return blocked(tostring(fields.reason), runner.RETRY)
+end
+
+
+refusals[#refusals + 1] = ("%s: %s"):format(node, tostring(fields.reason))
+end
+
+return blocked("no node could run it -- " .. table.concat(refusals, "; "),
+runner.RETRY)
+end
+
+
+function runner.run(opts)
+opts = opts or {}
+while true do
+local ok, result = pcall(runner.pass, opts)
+if not ok then
+print("jobs: " .. tostring(result))
+sleep(runner.RETRY)
+elseif result == nil then
+sleep(runner.IDLE)
+elseif result.outcome ~= "ran" and result.outcome ~= "waiting" then
+print(("jobs: job %d %s: %s"):format(result.job, result.outcome,
+tostring(result.reason or "")))
+
+sleep(0)
+end
+end
+end
+
+return runner
