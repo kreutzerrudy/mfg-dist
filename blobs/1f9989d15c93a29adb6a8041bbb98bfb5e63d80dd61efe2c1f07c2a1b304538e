@@ -1,0 +1,589 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local hal = require("mfg.common.hal")
+local state = require("mfg.common.state")
+local pattern = require("mfg.common.pattern")
+local journal = require("mfg.common.actions.journal")
+local pointlist = require("mfg.common.points")
+local bootinfo = require("mfg.common.bootinfo")
+local equipment = require("mfg.common.equipment")
+
+local node = {}
+
+local STATE_FILE = "turtle"
+
+
+
+
+
+
+
+node.IDLE = "idle"
+node.FAULTED = "faulted"
+
+local current = nil
+
+local function fresh()
+return {
+state = node.IDLE,
+
+
+
+
+pattern = nil,
+pattern_id = nil,
+fault = nil,
+heartbeat = os.epoch("utc"),
+}
+end
+
+
+
+
+
+
+
+
+
+
+
+local STATE_OPTS = {schema = 1, migrate = function(value) return value end}
+
+function node.load()
+local why
+current, why = state.read(STATE_FILE, nil, STATE_OPTS)
+if type(current) ~= "table" then
+current = fresh()
+if why then
+current.state = node.FAULTED
+current.fault = "persisted state refused: " .. why
+end
+end
+return current
+end
+
+
+
+
+
+
+
+
+
+
+
+node.POINTS_VERSION = pointlist.VERSION
+
+function node.points()
+if not current then node.load() end
+current.heartbeat = os.epoch("utc")
+local hw = hal.turtle()
+
+
+
+local boot = bootinfo.points()
+return {
+points_version = node.POINTS_VERSION,
+firmware = boot.firmware,
+config_rev = boot.config_rev,
+boot_state = boot.boot_state,
+equipment_missing = boot.equipment_missing,
+state = current.state,
+fault = current.fault,
+heartbeat = current.heartbeat,
+
+
+
+
+
+
+
+
+
+
+
+pattern_id = current.pattern_id,
+fuel = hw.fuelLevel(),
+
+
+
+
+
+held = hw.held and hw.held() or nil,
+feed = hw.feedMode and hw.feedMode() or nil,
+}
+end
+
+
+
+
+
+
+function node.observe()
+local hw = hal.turtle()
+return {
+held = hw.held and hw.held() or {},
+sides = hw.adjacent and hw.adjacent() or {},
+feed = hw.feedMode and hw.feedMode() or nil,
+}
+end
+
+
+
+
+
+
+
+function node.emitMarker(marker)
+if not marker then return false, "no marker item named" end
+if node.state() ~= node.IDLE then
+return false, "not idle: " .. tostring(node.state())
+end
+
+local hw = hal.turtle()
+
+
+
+
+if hw.hasOutput and not hw.hasOutput() then
+return false, "nothing to drop into BELOW -- refusing to drop into the world"
+end
+
+for slot, stack in pairs(hw.slots()) do
+if stack.name == marker then
+hw.select(slot)
+if hw.dropOutput(1) then return true end
+return false, "the inventory below would not take it"
+end
+end
+return false, ("not holding %s"):format(tostring(marker))
+end
+
+local function persist()
+state.write(STATE_FILE, current, STATE_OPTS)
+end
+
+local function setState(name, fault)
+current.state = name
+current.fault = fault
+persist()
+end
+
+function node.state()
+if not current then node.load() end
+return current.state
+end
+
+
+
+
+
+
+function node.selfCheck()
+local hw = hal.turtle()
+local problems = {}
+
+if hw.hasInput and not hw.hasInput() then
+problems[#problems + 1] =
+"nothing to pull from in FRONT -- the input chest goes there"
+end
+if hw.hasOutput and not hw.hasOutput() then
+problems[#problems + 1] =
+"nothing to drop into BELOW -- the output chest goes there"
+end
+
+local fuel = hw.fuelLevel()
+if fuel ~= "unlimited" and fuel == 0 then
+problems[#problems + 1] = "out of fuel"
+end
+
+
+
+
+
+local seen = hw.surroundings and hw.surroundings() or {}
+local fitted, unread = equipment.read(hw)
+if fitted then
+local doc = require("mfg.common.config").current()
+local required = doc and doc.equipment or require("mfg.common.roles").turtle.equipment
+seen.equipment = fitted
+seen.missing = equipment.missing(required, fitted)
+for _, id in ipairs(seen.missing) do
+problems[#problems + 1] = "not fitted: " .. id
+end
+else
+problems[#problems + 1] = "cannot read equipment: " .. tostring(unread)
+end
+
+return #problems == 0, problems, seen
+end
+
+
+
+function node.clearFault()
+if not current then node.load() end
+if current.state ~= node.FAULTED then return false, "not faulted" end
+setState(node.IDLE, nil)
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function node.reconcile()
+if not current then node.load() end
+
+local last = journal.recent(1)[1]
+if not last then return true end
+
+local hw = hal.turtle()
+local held = 0
+for _, stack in pairs(hw.slots()) do held = held + stack.count end
+if held == 0 then return true end
+
+local exposed = false
+if last.action == "pattern_fill" or last.action == "craft" then
+exposed = last.status == "completed"
+elseif last.action == "deposit" then
+exposed = last.status ~= "completed"
+end
+if not exposed then return true end
+
+local discrepancy = ("restarted after %s %s, holding %d item(s) -- "
+.. "product or an arrangement, and nothing here can say which")
+:format(last.action, tostring(last.status), held)
+
+setState(node.FAULTED, discrepancy)
+return false, discrepancy
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function node.fill(opts)
+opts = opts or {}
+if not current then node.load() end
+
+local hw = hal.turtle()
+if hw.hasInput and not hw.hasInput() then
+return false, "nothing to pull from in FRONT -- the input chest goes there"
+end
+
+local pulled = 0
+for _ = 1, opts.maxCalls or 32 do
+if not hw.suckInput() then break end
+pulled = pulled + 1
+end
+
+return true, {held = pattern.totals(hw.slots()), pulled = pulled}
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function node.returnUnused(keep)
+if not current then node.load() end
+
+local hw = hal.turtle()
+if hw.hasInput and not hw.hasInput() then
+return false, "no inventory in front -- refusing to drop items into the world"
+end
+
+
+
+
+local allowance = {}
+for item, count in pairs(keep or {}) do allowance[item] = count end
+
+local returned = {}
+for slot, stack in pairs(hw.slots()) do
+local spare = stack.count
+local allowed = allowance[stack.name]
+if allowed then
+local held = math.min(allowed, stack.count)
+allowance[stack.name] = allowed - held
+spare = stack.count - held
+end
+
+if spare > 0 then
+hw.select(slot)
+if not hw.dropInput(spare) then
+return false, ("cannot return %s from slot %d"):format(
+stack.name, slot)
+end
+returned[stack.name] = (returned[stack.name] or 0) + spare
+end
+end
+
+return true, {returned = returned}
+end
+
+
+
+
+
+
+
+
+
+
+function node.patternFill(want, opts)
+opts = opts or {}
+if not current then node.load() end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local id = opts.id
+if type(id) ~= "string" or id == "" then
+return false, "a pattern id is required"
+end
+
+if type(want) ~= "table" or next(want) == nil then
+if current.pattern_id ~= id then
+return false, ("no pattern sent for %s and the cache holds %s"):format(
+id, tostring(current.pattern_id or "nothing"))
+end
+want = current.pattern
+if type(want) ~= "table" or next(want) == nil then
+return false, "no pattern sent and none cached -- the first arrangement "
+.. "to a node must carry one"
+end
+end
+
+
+
+
+local inGrid, outside = pattern.inGrid(want)
+if not inGrid then return false, outside end
+
+
+
+if current.pattern ~= want or current.pattern_id ~= id then
+current.pattern = want
+current.pattern_id = id
+persist()
+end
+
+local hw = hal.turtle()
+local before = hw.slots()
+local depth, short = pattern.depth(pattern.totals(before), want,
+{depth = opts.depth, stack = opts.stack})
+
+if depth < 1 then
+
+
+
+local why = "not enough material to fill the pattern once"
+if short and short.item then
+why = ("%s: holding %d, one set needs %d"):format(
+short.item, short.have, short.needed)
+end
+return false, why, {depth = 0, short = short}
+end
+
+local target = pattern.target(want, depth)
+
+local staging = {}
+for slot = 1, 16 do
+if not want[slot] then staging[#staging + 1] = slot end
+end
+
+local plan = pattern.plan(before, target, {staging = staging})
+
+
+
+local function evict(early)
+for _, chunk in ipairs(plan.evict) do
+if (chunk.early or false) == early then
+hw.select(chunk.slot)
+if not hw.dropInput(chunk.count) then
+return false, ("cannot return leftovers from slot %d"):format(
+chunk.slot)
+end
+end
+end
+return true
+end
+if #plan.evict > 0 and hw.hasInput and not hw.hasInput() then
+return false, "no inventory in front -- refusing to drop leftovers into the world"
+end
+local evicted, evictWhy = evict(true)
+if not evicted then return false, evictWhy end
+
+for _, move in ipairs(plan.moves) do
+hw.select(move.from)
+if not hw.transferTo(move.to, move.count) then
+return false, ("could not move %d %s from slot %d to slot %d"):format(
+move.count, move.name, move.from, move.to)
+end
+end
+
+
+
+evicted, evictWhy = evict(false)
+if not evicted then return false, evictWhy end
+
+
+
+
+local after = hw.slots()
+local ok, mismatch = pattern.matches(after, target)
+if not ok then
+return false, ("the arrangement did not take: %s"):format(tostring(mismatch))
+end
+
+return true, {depth = depth, placed = target, moves = #plan.moves,
+returned = #plan.evict, pattern_id = id}
+end
+
+
+
+
+
+
+
+
+
+
+
+function node.craft()
+if not current then node.load() end
+
+local hw = hal.turtle()
+local before = pattern.totals(hw.slots())
+if next(before) == nil then return false, "holding nothing to craft" end
+
+local valid, validErr = hw.craft(0)
+if not valid then
+
+
+return false, "rejected: " .. tostring(validErr)
+end
+
+local crafted, craftErr = hw.craft()
+if not crafted then
+return false, tostring(craftErr)
+end
+
+local after = pattern.totals(hw.slots())
+
+local produced, consumed = {}, {}
+for item, count in pairs(after) do
+local had = before[item] or 0
+if count > had then produced[item] = count - had end
+end
+for item, count in pairs(before) do
+local left = after[item] or 0
+if left < count then consumed[item] = count - left end
+end
+
+return true, {produced = produced, consumed = consumed}
+end
+
+
+
+
+
+
+
+
+
+
+function node.deposit()
+if not current then node.load() end
+
+local hw = hal.turtle()
+if hw.hasOutput and not hw.hasOutput() then
+return false, "no inventory below -- cannot deposit output"
+end
+
+local deposited = {}
+for slot, stack in pairs(hw.slots()) do
+hw.select(slot)
+if not hw.dropOutput() then
+return false, "output blocked -- cannot deposit"
+end
+deposited[stack.name] = (deposited[stack.name] or 0) + stack.count
+end
+
+return true, {deposited = deposited}
+end
+
+return node
