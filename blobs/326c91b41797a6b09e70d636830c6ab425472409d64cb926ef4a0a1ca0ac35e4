@@ -1,0 +1,24 @@
+local rpc = require("mfg.common.rpc")
+local resources = require("mfg.controller.resources")
+
+
+
+return {
+name        = "forget_resource",
+label       = "Forget a resource group",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "id", label = "Group", type = "number", integer = true, min = 1,
+required = true},
+},
+
+returns = {group = "table"},
+
+run = function(params)
+local group, why = resources.forget(params.id)
+if not group then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {group = group}
+end,
+}

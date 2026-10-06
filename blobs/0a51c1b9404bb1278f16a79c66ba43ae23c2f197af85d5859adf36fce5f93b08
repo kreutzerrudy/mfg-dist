@@ -1,0 +1,855 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+
+local res = {}
+
+res.EVERY = 5
+res.BACKGROUND = 30
+res.READ = {timeout = 3, attempts = 2}
+res.ACT = {timeout = 10, attempts = 1}
+res.DIGITS = 7
+res.STACK = 64
+
+
+res.ORDER = {advice = 1, low = 2, gathering = 3, packing = 4, unpacking = 4, met = 5, off = 6}
+res.CHIP = {advice = "red", low = "orange", gathering = "yellow", packing = "cyan",
+unpacking = "cyan", met = "lime", off = "gray"}
+res.MARK = {advice = "!", low = "v", gathering = "^", packing = "#", unpacking = "#",
+met = "=", off = "."}
+
+local FIELDS = {"target", "gather", "keep", "low"}
+
+function res.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+names = opts.names or {},
+
+groups = nil,
+readAt = nil, readWhy = nil,
+offer = nil,
+
+screen = "list",
+list = app.newList(),
+
+chosen = nil,
+channel = nil,
+detail = nil, detailAt = nil, detailWhy = nil,
+edit = nil,
+reserve = nil,
+confirming = nil,
+
+choices = nil,
+choiceList = app.newList(),
+addList = app.newList(),
+pendingFor = nil,
+
+namesAt = nil,
+jump = nil,
+sending = nil,
+result = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+function res.nameOf(view, item)
+local known = view.names and view.names[item]
+return (known and known.name) or app.shortName(item)
+end
+
+function res.amount(n)
+n = math.floor(tonumber(n) or 0)
+if n >= 10000 then return ("%dk"):format(math.floor(n / 1000)) end
+if n >= 1000 then return ("%.1fk"):format(n / 1000) end
+return tostring(n)
+end
+local amount = res.amount
+
+local function rate(r)
+if not r then return "" end
+if r >= 10 then return ("%d/m"):format(math.floor(r + 0.5)) end
+return ("%.1f/m"):format(r)
+end
+
+
+local function groupHolding(view, item)
+for _, group in ipairs(view.groups or {}) do
+for _, form in ipairs(group.forms or {}) do
+if form.item == item then return group end
+end
+end
+return nil
+end
+
+local function channelOf(d, id)
+for index, ch in ipairs(d and d.channels or {}) do
+if ch.id == id then return ch, index end
+end
+return nil
+end
+
+
+
+function res.refresh(view)
+view.readAt, view.detailAt = nil, nil
+end
+
+function res.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+if not view.namesAt then return {kind = "names"} end
+local every = ((view.onScreen == false) and res.BACKGROUND or res.EVERY) * 1000
+local now = app.clock(view)
+if view.chosen and view.screen ~= "list" and view.screen ~= "new"
+and (not view.detailAt or now - view.detailAt >= every) then
+return {kind = "detail", id = view.chosen}
+end
+if view.screen == "new" and not view.choices then return {kind = "choices"} end
+if not view.readAt or now - view.readAt >= every then return {kind = "read"} end
+return nil
+end
+
+function res.exchange(view, job)
+local body, opts = nil, res.READ
+if job.kind == "read" then
+view.readAt = app.clock(view)
+body = {command = "resources"}
+elseif job.kind == "detail" then
+view.detailAt = app.clock(view)
+body = {command = "resources", id = job.id}
+elseif job.kind == "choices" then
+body = {command = "resources", choices = true}
+elseif job.kind == "names" then
+view.namesAt = app.clock(view)
+body = {command = "available"}
+elseif job.kind == "act" then
+body = {command = job.command, operator = true}
+for k, v in pairs(job.params) do body[k] = v end
+opts = res.ACT
+view.sending = job
+view.result = nil
+else
+return false
+end
+res.apply(view, job, view.transport.request(body, opts) or {})
+return true
+end
+
+local function openGroup(view, id)
+if view.chosen ~= id then view.detail = nil end
+view.chosen, view.screen, view.detailAt, view.edit = id, "group", nil, nil
+end
+
+
+local function resolvePending(view)
+local pending = view.pendingFor
+if not pending or not view.groups then return end
+view.pendingFor = nil
+local group = groupHolding(view, pending.item)
+if group then return openGroup(view, group.id) end
+app.ask(view, {kind = "act", command = "set_resource", open = true, oneForm = true,
+params = {unit = pending.item, target = pending.target or res.STACK}})
+end
+
+local function editFrom(d, field)
+return {target = d.goal and tostring(d.goal.target) or "",
+gather = d.goal and tostring(d.goal.low) or "",
+keep = d.band and tostring(d.band.keep) or "",
+low = d.band and tostring(d.band.low) or "",
+field = field or "target"}
+end
+
+function res.apply(view, job, answer)
+app.noteLink(view, answer)
+local ok = answer.status == app.COMPLETED
+if job.kind == "read" then
+if ok and type(answer.groups) == "table" then
+view.groups, view.readWhy = answer.groups, nil
+view.offer = view.offer or {name = "resources"}
+resolvePending(view)
+else
+view.readWhy = tostring(answer.reason or answer.status or "no answer")
+end
+elseif job.kind == "detail" then
+if ok and type(answer.groups) == "table" and answer.groups[1] then
+local fresh = answer.groups[1]
+view.detail, view.detailWhy = fresh, nil
+
+
+if not view.edit or view.edit.saved then
+view.edit = editFrom(fresh, view.edit and view.edit.field)
+end
+local ch = channelOf(fresh, view.channel)
+if ch and (not view.reserve or view.reserve.saved) then
+view.reserve = {value = tostring(ch.reserve or 0)}
+end
+elseif answer.status == app.REJECTED and view.chosen == job.id then
+
+view.screen, view.chosen, view.detail = "list", nil, nil
+view.result = {text = tostring(answer.reason), colour = "warn"}
+else
+view.detailWhy = tostring(answer.reason or answer.status or "no answer")
+end
+elseif job.kind == "choices" then
+if ok then view.choices = answer.choices or {} end
+elseif job.kind == "names" then
+if ok then
+for item, known in pairs(answer.names or {}) do view.names[item] = known end
+end
+elseif job.kind == "act" then
+view.sending = nil
+view.readAt, view.detailAt = nil, nil
+if ok then
+local text
+if job.command == "forget_resource" then
+text = ("%s is forgotten"):format(tostring((answer.group or {}).name))
+view.screen, view.chosen, view.detail = "list", nil, nil
+elseif job.command == "set_channel" then
+local ch = answer.channel or {}
+if job.params.remove then
+text = ("channel %s removed"):format(tostring(ch.id))
+view.screen, view.channel = "group", nil
+else
+text = ("channel %s: %s %s%s"):format(tostring(ch.id),
+tostring(ch.kind), tostring(ch.mode),
+ch.enabled == false and ", off" or "")
+if job.open then view.screen, view.channel = "channel", ch.id end
+end
+if view.reserve then view.reserve.saved = true end
+else
+local g = answer.group or {}
+text = ("%s: %s"):format(tostring(g.name), g.enabled == false and "off"
+or g.goal and ("target %d, gather below %d"):format(g.goal.target,
+g.goal.low) or "saved")
+if job.open and g.id then openGroup(view, g.id) end
+end
+view.result = {text = text, colour = "good"}
+app.sound(view, "done")
+elseif answer.status == app.TIMED_OUT then
+view.result = {text = ("no answer from %s -- look again before asking again")
+:format(view.host), colour = "warn"}
+app.sound(view, "refused")
+elseif job.oneForm and job.params.forms == nil
+and tostring(answer.reason):find("already in the group", 1, true) then
+
+local params = {}
+for k, v in pairs(job.params) do params[k] = v end
+params.forms = {}
+app.ask(view, {kind = "act", command = job.command, open = job.open,
+params = params})
+else
+view.result = {text = "refused: " .. tostring(answer.reason), colour = "bad"}
+app.sound(view, "refused")
+end
+end
+end
+
+
+
+local function statusRow(view)
+local text, colour = "", "text"
+if view.sending then
+text, colour = ("asking %s.."):format(view.host), "warn"
+elseif view.result then
+text, colour = view.result.text, view.result.colour or "text"
+end
+return doc.text(" " .. text, {colour = colour, wrap = true, keep = app.KEEP_STATUS,
+name = "status"})
+end
+
+local function button(label, key, colour, action, keep, name)
+return doc.button(label, {key = action and key or nil,
+colour = action and colour or "dim", action = action, keep = keep, name = name})
+end
+
+local function back(screen)
+return doc.button("Back", {key = "<", action = {kind = "show", screen = screen},
+keep = doc.REQUIRED, name = "back"})
+end
+
+
+function res.doing(view, g)
+if g.state == "advice" and g.advice then return (g.advice:gsub("^[^:]+: ", "")) end
+if g.state == "off" then return "off" end
+if g.state == "packing" or g.state == "unpacking" then return g.state end
+local on = {}
+for _, ch in ipairs(g.channels or {}) do
+if ch.engaged or ch.state == "engaged" then on[#on + 1] = ch.type or ch.label end
+end
+if #on > 0 then return table.concat(on, ", ") end
+if g.state == "low" then return "next minute" end
+return ""
+end
+
+local function groupEntries(view)
+local sorted = {}
+for _, g in ipairs(view.groups or {}) do sorted[#sorted + 1] = g end
+table.sort(sorted, function(a, b)
+local oa, ob = res.ORDER[a.state] or 9, res.ORDER[b.state] or 9
+if oa ~= ob then return oa < ob end
+return a.id < b.id
+end)
+local entries = {}
+for _, g in ipairs(sorted) do
+local of = g.goal and amount(g.goal.target) or "-"
+entries[#entries + 1] = {value = g.id,
+label = ("%s %-10s %5s/%-5s %s"):format(res.MARK[g.state] or "?",
+tostring(g.name):sub(1, 10), amount(g.held), of, res.doing(view, g)),
+chip = res.CHIP[g.state] or "gray"}
+end
+return entries
+end
+
+local function listDocument(view, height)
+local add = doc.button("+ group", {key = "+", colour = "selected",
+action = {kind = "show", screen = "new"}, keep = doc.REQUIRED, name = "new-group"})
+local rows = {app.header(view, "RESOURCES", add), doc.rule({keep = 2})}
+if not view.groups then
+rows[#rows + 1] = doc.text(view.readWhy and ("the controller refused: "
+.. view.readWhy) or "reading the groups..", {colour = view.readWhy and "bad"
+or "dim", wrap = true, keep = doc.REQUIRED, name = "read-state"})
+else
+local entries = groupEntries(view)
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" no groups yet -- + group to keep a resource, "
+.. "pack it, and gather it", {colour = "dim", wrap = true, keep = 20,
+name = "empty"})
+end
+for _, row in ipairs(app.listRows(view.list, entries, "group",
+function(entry) return {kind = "open", id = entry.value} end,
+{limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+
+local function amountField(view, field, label, width)
+local edit = view.edit
+local focused = edit.field == field
+return {
+doc.text(label, {colour = "label", keep = doc.REQUIRED, name = field .. "-label"}),
+doc.gap(1),
+doc.text(" " .. edit[field] .. (focused and "_" or ""), {width = width or 8,
+colour = focused and "title" or "text", bg = "field",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+action = {kind = "focus", field = field}, name = field}),
+}
+end
+
+local function fieldRow(view, specs, name)
+local children = {doc.gap(1)}
+for index, p in ipairs(specs) do
+if index > 1 then children[#children + 1] = doc.gap(2) end
+for _, child in ipairs(amountField(view, p[1], p[2])) do children[#children + 1] = child end
+end
+return doc.row(children, {keep = doc.REQUIRED, name = name})
+end
+
+
+local function fieldsOf(d)
+local packed = false
+for _, form in ipairs(d and d.forms or {}) do packed = packed or form.role == "store" end
+return packed and FIELDS or {"target", "gather"}
+end
+
+
+function res.saveParams(view)
+local edit, d = view.edit, view.detail
+if view.sending then return nil, "asking the controller.." end
+if not edit or not d then return nil, "reading the group.." end
+if edit.saved then return nil, "saving.." end
+local params, changed = {id = d.id}, false
+local target, gather = tonumber(edit.target), tonumber(edit.gather)
+if edit.target == "" then target = 0 end
+if target and target > 0 then
+if not gather then return nil, "type when to gather" end
+if gather > target then return nil, "gather below at most the target" end
+end
+if target and target ~= (d.goal and d.goal.target or 0) then
+params.target, changed = target, true
+end
+if target and target > 0 and gather and gather ~= (d.goal and d.goal.low) then
+params.gather, changed = gather, true
+end
+if #fieldsOf(d) == 4 and edit.keep ~= "" then
+local keep, low = tonumber(edit.keep), tonumber(edit.low)
+if not keep then return nil, "type how many to keep loose" end
+if not low then return nil, "type when to unpack" end
+if low > keep then return nil, "unpack below at most keep" end
+if keep ~= (d.band and d.band.keep) then params.keep, changed = keep, true end
+if low ~= (d.band and d.band.low) then params.low, changed = low, true end
+end
+if not changed then return nil, "nothing changed" end
+return params
+end
+
+local function channelLine(view, ch)
+local what = ch.kind == "source" and ch.type or tostring(ch.label)
+local state = ch.job and ("job " .. ch.job.id) or tostring(ch.state)
+return ("%s%d %-17s %-6s %6s %s"):format(ch.engaged and "*" or " ", ch.id,
+what:sub(1, 17), ch.mode == "sweep" and "sweep" or "demand", rate(ch.rate), state)
+end
+
+local function groupDocument(view, height)
+local d = view.detail
+local title = d and tostring(d.name):upper() or "GROUP"
+local rows = {app.header(view, title, back("list")), doc.rule({keep = 2})}
+if not d or d.id ~= view.chosen then
+rows[#rows + 1] = doc.text(view.detailWhy and ("the controller refused: "
+.. view.detailWhy) or "reading the group..", {colour = view.detailWhy and "bad"
+or "dim", wrap = true, keep = doc.REQUIRED, name = "read-state"})
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+rows[#rows + 1] = doc.text((" held %s  loose %s  packed %s  %s"):format(amount(d.held),
+amount(d.loose), amount(d.packed), d.state), {colour = d.state == "advice" and "bad"
+or "text", truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "summary"})
+if d.advice then
+rows[#rows + 1] = doc.text(" " .. d.advice, {colour = "warn", wrap = true, keep = 40,
+name = "advice"})
+end
+
+view.edit = view.edit or editFrom(d)
+rows[#rows + 1] = fieldRow(view, {{"target", "target"}, {"gather", "gather <"}}, "goal-row")
+if #fieldsOf(d) == 4 then
+rows[#rows + 1] = fieldRow(view, {{"keep", "keep  "}, {"low", "unpack <"}}, "band-row")
+end
+
+rows[#rows + 1] = doc.row({doc.text(" channels", {colour = "label", keep = 30,
+name = "channels-label"}), doc.spacer({min = 1}),
+button("+ channel", "+", "action", {kind = "show", screen = "add"}, 29, "add-channel"),
+doc.gap(1)}, {keep = 30, name = "channels-head"})
+if #(d.channels or {}) == 0 then
+rows[#rows + 1] = doc.text("  none: it only packs, or watches", {colour = "dim",
+keep = 28, name = "no-channel"})
+end
+for index, ch in ipairs(d.channels or {}) do
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.button(channelLine(view, ch), {width = "fill", align = "left",
+colour = ch.state == "off" and "dim" or (ch.engaged and "selected" or "action"),
+action = {kind = "channel", id = ch.id}, name = "channel:" .. index}),
+}, {keep = 28 - index, name = "channel-row:" .. index})
+end
+if (d.inflow or 0) > 0 or (d.outflow or 0) > 0 then
+rows[#rows + 1] = doc.text((" in %s  out %s  net %s%s"):format(rate(d.inflow),
+rate(d.outflow), rate(d.net), d.eta and ("  ~%d min to target"):format(
+math.ceil(d.eta)) or ""), {colour = "dim", truncate = doc.TRUNCATED, keep = 12,
+name = "flows"})
+end
+rows[#rows + 1] = doc.spacer()
+
+local params, why = res.saveParams(view)
+local busy = view.sending ~= nil
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+button("Save", "enter", "selected", params and {kind = "save"} or nil,
+doc.REQUIRED, "save"),
+doc.gap(1),
+d.enabled
+and button("Off", "o", "bad", (not busy) and {kind = "toggle"} or nil,
+doc.REQUIRED, "toggle")
+or button("On", "o", "good", (not busy) and {kind = "toggle"} or nil,
+doc.REQUIRED, "toggle"),
+doc.gap(1),
+button("Forget", "f", "bad", (not busy) and {kind = "forget"} or nil, 5, "forget"),
+}, {keep = doc.REQUIRED, name = "actions"})
+if why and why ~= "nothing changed" and why ~= "saving.." then
+rows[#rows + 1] = doc.text(" " .. why, {colour = "dim", wrap = true,
+keep = app.KEEP_STATUS - 1, name = "why-blocked"})
+end
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function channelDocument(view)
+local d = view.detail
+local ch, index = channelOf(d, view.channel)
+local rows = {app.header(view, ch and ("CHANNEL " .. ch.id) or "CHANNEL", back("group")),
+doc.rule({keep = 2})}
+if not ch then
+rows[#rows + 1] = doc.text(" reading the channel..", {colour = "dim",
+keep = doc.REQUIRED, name = "read-state"})
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+local what = ch.kind == "source" and (ch.type .. ", a source") or
+(tostring(ch.label) .. ", " .. ch.kind)
+rows[#rows + 1] = doc.text(" " .. what, {colour = "title", truncate = doc.TRUNCATED,
+keep = doc.REQUIRED, name = "what"})
+local facts = {tostring(ch.state)}
+if ch.engaged then facts[#facts + 1] = "engaged" end
+if ch.machines then facts[#facts + 1] = ("%d machine(s) on"):format(ch.machines) end
+if ch.rate then facts[#facts + 1] = rate(ch.rate) end
+if ch.deep then facts[#facts + 1] = "plans its inputs"
+elseif ch.units then facts[#facts + 1] = ("can make %s now"):format(amount(ch.units)) end
+if ch.job then facts[#facts + 1] = ("job %d %s"):format(ch.job.id, tostring(ch.job.state)) end
+rows[#rows + 1] = doc.text(" " .. table.concat(facts, ", "), {colour = "text", wrap = true,
+keep = 30, name = "facts"})
+
+local busy = view.sending ~= nil
+local function act(a) return (not busy) and a or nil end
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+button("demand", "d", ch.mode ~= "sweep" and "selected" or "action",
+act({kind = "mode", mode = "demand"}), doc.REQUIRED, "mode-demand"),
+doc.gap(1),
+button("sweep", "s", ch.mode == "sweep" and "selected" or "action",
+act({kind = "mode", mode = "sweep"}), doc.REQUIRED, "mode-sweep"),
+doc.spacer({min = 1}),
+doc.text(ch.mode == "sweep" and "whenever its input is in" or "while short",
+{colour = "dim", keep = 8, truncate = doc.TRUNCATED, name = "mode-note"}),
+doc.gap(1),
+}, {keep = doc.REQUIRED, name = "mode-row"})
+
+if ch.kind ~= "source" then
+view.reserve = view.reserve or {value = tostring(ch.reserve or 0)}
+local children = {doc.gap(1), doc.text("leave", {colour = "label",
+keep = doc.REQUIRED, name = "reserve-label"}), doc.gap(1),
+doc.text(" " .. view.reserve.value .. "_", {width = 8, colour = "title",
+bg = "field", truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "reserve"}),
+doc.gap(1)}
+for _, step in ipairs({{"-64", -64}, {"-8", -8}, {"+8", 8}, {"+64", 64}}) do
+children[#children + 1] = doc.button(step[1], {colour = "action",
+action = {kind = "nudge", by = step[2]}, keep = 7, name = "nudge" .. step[1]})
+end
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = button("Set", "enter", "selected",
+act(tonumber(view.reserve.value) and tonumber(view.reserve.value) ~= (ch.reserve or 0)
+and {kind = "reserve"} or nil), 9, "reserve-set")
+rows[#rows + 1] = doc.row(children, {keep = 20, name = "reserve-row"})
+rows[#rows + 1] = doc.text(" of its input, for other crafts", {colour = "dim",
+keep = 6, truncate = doc.TRUNCATED, name = "reserve-note"})
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+button("Up", "u", "action", act(index > 1 and {kind = "move", to = index - 1} or nil),
+doc.REQUIRED, "up"),
+doc.gap(1),
+button("Down", "j", "action", act(index < #d.channels and {kind = "move", to = index + 1}
+or nil), doc.REQUIRED, "down"),
+doc.gap(1),
+ch.enabled and button("Off", "o", "bad", act({kind = "channel-toggle"}), doc.REQUIRED,
+"channel-toggle")
+or button("On", "o", "good", act({kind = "channel-toggle"}), doc.REQUIRED,
+"channel-toggle"),
+doc.gap(1),
+button("Remove", "r", "bad", act({kind = "remove"}), 5, "remove"),
+}, {keep = doc.REQUIRED, name = "channel-actions"})
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function addEntries(view)
+local entries = {}
+for _, choice in ipairs(view.detail and view.detail.channelChoices or {}) do
+if not choice.have then
+local parts = {}
+for item, n in pairs(choice.inputs or {}) do
+parts[#parts + 1] = ("%d %s"):format(n, res.nameOf(view, item))
+end
+table.sort(parts)
+entries[#entries + 1] = {value = choice.recipe or choice.type,
+label = ("%-7s %s"):format(choice.kind, tostring(choice.label)),
+note = #parts > 0 and table.concat(parts, ", ") or nil,
+chip = choice.kind == "source" and "cyan" or "lime", choice = choice}
+end
+end
+return entries
+end
+
+local function addDocument(view, height)
+local rows = {app.header(view, "ADD A CHANNEL", back("group")), doc.rule({keep = 2})}
+local entries = addEntries(view)
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" nothing else makes it -- register a recipe, or give a "
+.. "machine a `makes` or `yields` line", {colour = "dim", wrap = true, keep = 20,
+name = "none"})
+end
+for _, row in ipairs(app.listRows(view.addList, entries, "add",
+function(entry) return {kind = "add", choice = entry.choice} end,
+{pickKeys = false, arrows = true, limit = height})) do
+rows[#rows + 1] = row
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function choiceEntries(view)
+local entries = {}
+for _, choice in ipairs(view.choices or {}) do
+local name = res.nameOf(view, choice.item)
+entries[#entries + 1] = {value = choice.item, label = name,
+note = choice.group and "grouped" or (choice.made and "made" or amount(choice.free)),
+chip = app.chipFor(choice.item), made = choice.made}
+end
+table.sort(entries, function(a, b)
+if (a.made and 1 or 0) ~= (b.made and 1 or 0) then return a.made == true end
+if a.label:lower() ~= b.label:lower() then return a.label:lower() < b.label:lower() end
+return a.value < b.value
+end)
+return entries
+end
+
+local function newDocument(view, height)
+local rows = {app.header(view, "A GROUP OF WHAT?", back("list")), doc.rule({keep = 2})}
+if not view.choices then
+rows[#rows + 1] = doc.text(" reading what can be grouped..", {colour = "dim",
+keep = doc.REQUIRED, name = "read-state"})
+else
+rows[#rows + 1] = doc.text(" the form you use: the ingot, not the block",
+{colour = "dim", truncate = doc.TRUNCATED, keep = 8, name = "hint"})
+for _, row in ipairs(app.listRows(view.choiceList, choiceEntries(view), "choice",
+function(entry) return {kind = "pick", item = entry.value} end,
+{pickKeys = false, arrows = true, limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function confirmDocument(view)
+local d = view.detail or {}
+local removing = view.confirming and view.confirming.kind == "remove"
+local rows = {app.header(view, removing and "REMOVE CHANNEL" or "FORGET GROUP"),
+doc.rule({keep = 2})}
+rows[#rows + 1] = doc.text(removing and (" Remove channel %s from %s?"):format(
+tostring(view.channel), tostring(d.name))
+or (" Forget the group %s?"):format(tostring(d.name)),
+{colour = "title", keep = doc.REQUIRED, truncate = doc.TRUNCATED, name = "confirm"})
+rows[#rows + 1] = doc.text(" A job it already queued still runs.", {colour = "dim",
+wrap = true, keep = 6, name = "note"})
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.button("yes", {key = "y", colour = "bad", action = {kind = "yes"},
+keep = doc.REQUIRED, name = "yes"}),
+doc.gap(1),
+doc.button("no", {key = "n", colour = "good", action = {kind = "no"},
+keep = doc.REQUIRED, name = "no"}),
+}, {keep = doc.REQUIRED, name = "confirm-actions"})
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+function res.document(view, width, height)
+local rows
+if view.screen == "group" then rows = groupDocument(view, height)
+elseif view.screen == "channel" then rows = channelDocument(view)
+elseif view.screen == "add" then rows = addDocument(view, height)
+elseif view.screen == "new" then rows = newDocument(view, height)
+elseif view.screen == "confirm" then rows = confirmDocument(view)
+else rows = listDocument(view, height) end
+return doc.stack(rows, {name = "resources"})
+end
+
+function res.settle(view, report)
+if view.screen == "list" then return app.settle(view.list, report, "group") end
+if view.screen == "new" then return app.settle(view.choiceList, report, "choice") end
+if view.screen == "add" then return app.settle(view.addList, report, "add") end
+return false
+end
+
+
+
+local function ask(view, command, params, extra)
+local job = {kind = "act", command = command, params = params}
+for k, v in pairs(extra or {}) do job[k] = v end
+app.ask(view, job)
+end
+
+function res.act(view, action)
+local kind = action and action.kind
+local lists = {list = view.list, new = view.choiceList, add = view.addList}
+local list = lists[view.screen]
+if list and app.page(list, kind, action) then return true end
+
+if kind == "show" then
+view.screen = action.screen
+if action.screen == "new" then view.choices, view.choiceList = nil, app.newList() end
+if action.screen == "add" then view.addList = app.newList() end
+if action.screen == "group" then view.channel = nil end
+return true
+elseif kind == "open" then
+openGroup(view, action.id)
+return true
+elseif kind == "for-item" then
+
+view.pendingFor = {item = action.item, target = action.target}
+view.readAt = nil
+resolvePending(view)
+return true
+elseif kind == "pick" then
+local group = groupHolding(view, action.item)
+if group then openGroup(view, group.id) return true end
+ask(view, "set_resource", {unit = action.item, target = res.STACK},
+{open = true, oneForm = true})
+return true
+elseif kind == "channel" then
+view.channel, view.screen, view.reserve = action.id, "channel", nil
+return true
+elseif kind == "add" then
+local c = action.choice or {}
+ask(view, "set_channel", {group = view.chosen, recipe = c.recipe, type = c.type},
+{open = true})
+return true
+elseif kind == "focus" then
+if view.edit then view.edit.field = action.field end
+return true
+elseif kind == "save" then
+local params = res.saveParams(view)
+if not params then return false end
+ask(view, "set_resource", params)
+
+
+view.edit.saved = true
+return true
+elseif kind == "toggle" then
+local d = view.detail
+if not d then return false end
+ask(view, "set_resource", {id = d.id, enabled = not d.enabled})
+return true
+elseif kind == "forget" then
+view.screen, view.confirming = "confirm", {kind = "forget"}
+return true
+elseif kind == "remove" then
+view.screen, view.confirming = "confirm", {kind = "remove"}
+return true
+elseif kind == "yes" then
+local c = view.confirming or {}
+view.confirming = nil
+if c.kind == "remove" then
+view.screen = "channel"
+ask(view, "set_channel", {group = view.chosen, id = view.channel, remove = true})
+else
+view.screen = "group"
+ask(view, "forget_resource", {id = view.chosen})
+end
+return true
+elseif kind == "no" then
+view.screen = (view.confirming and view.confirming.kind == "remove") and "channel"
+or "group"
+view.confirming = nil
+return true
+elseif kind == "mode" then
+ask(view, "set_channel", {group = view.chosen, id = view.channel, mode = action.mode})
+return true
+elseif kind == "move" then
+ask(view, "set_channel", {group = view.chosen, id = view.channel, position = action.to})
+return true
+elseif kind == "channel-toggle" then
+local ch = channelOf(view.detail, view.channel)
+if not ch then return false end
+ask(view, "set_channel", {group = view.chosen, id = view.channel,
+enabled = not ch.enabled})
+return true
+elseif kind == "nudge" then
+if not view.reserve then return false end
+view.reserve.value = tostring(math.max(0, (tonumber(view.reserve.value) or 0) + action.by))
+view.reserve.saved = nil
+return true
+elseif kind == "reserve" then
+local n = view.reserve and tonumber(view.reserve.value)
+if not n then return false end
+ask(view, "set_channel", {group = view.chosen, id = view.channel, reserve = n})
+return true
+end
+return false
+end
+
+function res.searching(view)
+if view.screen == "list" and view.groups then return view.list end
+if view.screen == "new" and view.choices then return view.choiceList end
+if view.screen == "add" then return view.addList end
+return nil
+end
+
+
+local function typing(view, event)
+local target, field
+if view.screen == "group" and view.edit then
+target, field = view.edit, view.edit.field
+elseif view.screen == "channel" and view.reserve then
+target, field = view.reserve, "value"
+else
+return false
+end
+if event.kind == "char" or event.kind == "key" then target.saved = nil end
+if event.kind == "char" and type(event.char) == "string" and event.char:match("^%d$") then
+local value = target[field]
+if #value < res.DIGITS then
+target[field] = ((value .. event.char):gsub("^0+(%d)", "%1"))
+end
+return true
+end
+if event.kind == "key" and keys then
+if event.key == keys.backspace or event.key == keys.delete then
+local value = target[field]
+target[field] = event.key == keys.delete and "" or value:sub(1, -2)
+return true
+end
+end
+return false
+end
+
+function res.keyboard(view, event)
+if not event then return false end
+if view.screen == "group" or view.screen == "channel" then return typing(view, event) end
+local list = res.searching(view)
+if list then return app.type(list, event) end
+return false
+end
+
+function res.handle(view, event, grid)
+local took, chose = res.keyboard(view, event)
+if took then
+if chose then res.act(view, chose) end
+return true
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return res.act(view, action)
+end
+
+return res

@@ -1,0 +1,41 @@
+local rpc = require("mfg.common.rpc")
+local resources = require("mfg.controller.resources")
+
+
+
+
+
+
+
+return {
+name        = "set_channel",
+label       = "Set a resource channel",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "group", label = "Group", type = "number", integer = true, min = 1,
+required = true},
+{name = "id", label = "Channel", type = "number", integer = true, min = 1,
+required = false, help = "The channel to change; omit for a new one."},
+{name = "recipe", label = "Recipe", type = "text", required = false},
+{name = "type", label = "Source", type = "text", required = false,
+help = "A machine type that yields one of the group's forms."},
+{name = "mode", label = "Mode", type = "choice", required = false,
+choices = {"demand", "sweep"}},
+{name = "reserve", label = "Leave", type = "number", integer = true, min = 0,
+max = 1000000, required = false, help = "How much of its input it leaves."},
+{name = "position", label = "Position", type = "number", integer = true, min = 1,
+required = false},
+{name = "enabled", label = "On", type = "flag", required = false},
+{name = "remove", label = "Remove", type = "flag", required = false},
+},
+
+returns = {channel = "table"},
+
+run = function(params, ctx)
+local ch, why = resources.setChannel(params, ctx and ctx.by)
+if not ch then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {channel = ch}
+end,
+}

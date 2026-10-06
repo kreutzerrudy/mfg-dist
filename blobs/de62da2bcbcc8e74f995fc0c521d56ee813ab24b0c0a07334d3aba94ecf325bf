@@ -1,0 +1,1017 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+local editor = require("mfg.hmi.editor")
+
+local machines = {}
+
+machines.EVERY = 5
+machines.BACKGROUND = 30
+machines.READ = {timeout = 3, attempts = 2}
+
+machines.ACT = {timeout = 10, attempts = 1}
+machines.AMOUNT_DIGITS = 6
+
+
+local ORDER = {faulted = 1, paused = 2, running = 3, stopped = 4}
+local STATE_COLOUR = {faulted = "bad", paused = "warn", running = "good", stopped = "dim"}
+local STATE_CHIP = {faulted = "red", paused = "yellow", running = "lime", stopped = "gray"}
+
+function machines.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+names = opts.names or {},
+
+machines = nil,
+types = nil,
+remoteNow = nil, readClock = nil,
+readWhy = nil,
+readAt = nil,
+offer = nil,
+
+screen = "list",
+list = app.newList(),
+openGroups = {},
+typeList = app.newList(),
+
+chosen = nil,
+detail = nil,
+detailAt = nil,
+detailWhy = nil,
+runs = app.newList(),
+openRun = nil,
+
+limit = nil,
+items = nil,
+itemList = app.newList(),
+
+editor = nil,
+editFrom = nil,
+jump = nil,
+
+sending = nil,
+result = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+function machines.nameOf(view, item)
+local known = view.names and view.names[item]
+return (known and known.name) or app.shortName(item)
+end
+
+
+local function ageOf(view, at)
+if not at or not view.remoteNow then return nil end
+local since = view.readClock and (app.clock(view) - view.readClock) or 0
+return math.max(0, math.floor((view.remoteNow - at + since) / 1000))
+end
+
+local function ageText(seconds)
+if not seconds then return "never" end
+if seconds < 60 then return seconds .. "s ago" end
+if seconds < 3600 then return math.floor(seconds / 60) .. "m ago" end
+return math.floor(seconds / 3600) .. "h ago"
+end
+
+
+local function stateOf(m)
+return m.state or "stopped"
+end
+
+
+
+function machines.refresh(view)
+view.readAt = nil
+view.detailAt = nil
+end
+
+function machines.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+
+if view.editor then
+job = editor.nextJob(view.editor)
+if job then
+job.editor = true
+return job
+end
+end
+local every = ((view.onScreen == false) and machines.BACKGROUND or machines.EVERY) * 1000
+local now = app.clock(view)
+if view.chosen and (view.screen == "machine" or view.screen == "limit")
+and (not view.detailAt or now - view.detailAt >= every) then
+return {kind = "detail", machine = view.chosen}
+end
+if not view.readAt or now - view.readAt >= every then
+return {kind = "read"}
+end
+return nil
+end
+
+function machines.exchange(view, job)
+if job.editor then
+if not view.editor then return false end
+return editor.exchange(view.editor, job)
+end
+local body, opts = nil, machines.READ
+if job.kind == "read" then
+view.readAt = app.clock(view)
+body = {command = "scripts", brief = true}
+elseif job.kind == "detail" then
+view.detailAt = app.clock(view)
+body = {command = "scripts", machine = job.machine}
+elseif job.kind == "items" then
+body = {command = "available"}
+elseif job.kind == "group-act" then
+
+view.sending, view.result = job, nil
+local answer = {status = app.COMPLETED, done = 0, refused = {}}
+for _, name in ipairs(job.machines) do
+local one = view.transport.request({command = job.command, operator = true,
+machine = name}, machines.ACT) or {}
+app.noteLink(view, one)
+if one.status == app.COMPLETED then
+answer.done = answer.done + 1
+else
+answer.refused[#answer.refused + 1] = {machine = name,
+status = one.status, reason = one.reason}
+end
+end
+machines.apply(view, job, answer)
+return true
+elseif job.kind == "act" then
+body = {command = job.command, operator = true}
+for k, v in pairs(job.params) do body[k] = v end
+opts = machines.ACT
+view.sending = job
+view.result = nil
+else
+return false
+end
+machines.apply(view, job, view.transport.request(body, opts) or {})
+return true
+end
+
+
+local DONE = {
+pulse = "%s: pulsed",
+release_signal = "%s: given back, at its safe value",
+enable_machine = "started %s",
+disable_machine = "stopped %s",
+forget_machine = "forgot %s; its ports are unbound",
+}
+
+function machines.apply(view, job, answer)
+app.noteLink(view, answer)
+local ok = answer.status == app.COMPLETED
+if job.kind == "read" then
+if ok and type(answer.machines) == "table" then
+view.machines, view.types = answer.machines, answer.scripts or {}
+view.remoteNow, view.readClock = answer.now, app.clock(view)
+view.readWhy = nil
+view.offer = view.offer or {name = "scripts"}
+else
+view.readWhy = tostring(answer.reason or answer.status or "no answer")
+end
+elseif job.kind == "detail" then
+if ok and type(answer.machines) == "table" and answer.machines[1] then
+view.detail = answer.machines[1]
+view.remoteNow, view.readClock = answer.now or view.remoteNow, app.clock(view)
+view.detailWhy = nil
+elseif answer.status == app.REJECTED and view.chosen == job.machine then
+
+view.screen, view.chosen, view.detail = "list", nil, nil
+view.result = {text = tostring(answer.reason), colour = "warn"}
+else
+view.detailWhy = tostring(answer.reason or answer.status or "no answer")
+end
+elseif job.kind == "items" then
+if ok and type(answer.items) == "table" then
+view.items = answer.items
+for item, known in pairs(answer.names or {}) do view.names[item] = known end
+end
+elseif job.kind == "group-act" then
+view.sending = nil
+view.readAt, view.detailAt = nil, nil
+local verb = job.command == "enable_machine" and "started" or "stopped"
+local first = answer.refused and answer.refused[1]
+if not first then
+view.result = {text = ("%s all of %s/ (%d)"):format(verb, job.group,
+answer.done or 0), colour = "good"}
+app.sound(view, "done")
+else
+local why = first.status == app.TIMED_OUT and ("no answer from " .. view.host)
+or ("refused: " .. tostring(first.reason))
+view.result = {text = ("%s %d of %d in %s/; %s %s"):format(verb,
+answer.done or 0, #job.machines, job.group, first.machine, why),
+colour = (answer.done or 0) > 0 and "warn" or "bad"}
+app.sound(view, "refused")
+end
+elseif job.kind == "act" then
+view.sending = nil
+view.readAt, view.detailAt = nil, nil
+local machine = job.params.machine or job.params.signal
+if ok then
+local text
+if job.command == "set_signal" then
+text = ("%s is %s, by hand"):format(machine, job.params.level > 0 and "on" or "off")
+elseif job.command == "limit_machine" then
+local limit = answer.limit
+text = limit and ("%s pauses at %d %s, resumes below %d"):format(machine,
+limit.at, machines.nameOf(view, limit.item), limit.resume)
+or (machine .. " has no limit")
+else
+text = (DONE[job.command] or "%s done"):format(machine)
+end
+view.result = {text = text, colour = "good"}
+if job.command == "forget_machine" then
+view.screen, view.chosen, view.detail = "list", nil, nil
+end
+app.sound(view, "done")
+elseif answer.status == app.TIMED_OUT then
+view.result = {text = ("no answer from %s -- look again before asking again")
+:format(view.host), colour = "warn"}
+app.sound(view, "refused")
+else
+view.result = {text = "refused: " .. tostring(answer.reason), colour = "bad"}
+app.sound(view, "refused")
+end
+end
+end
+
+
+
+local function statusRow(view)
+local text, colour = "", "text"
+if view.sending then
+text, colour = ("asking %s.."):format(view.host), "warn"
+elseif view.result then
+text, colour = view.result.text, view.result.colour or "text"
+end
+return doc.text(" " .. text, {colour = colour, wrap = true, keep = app.KEEP_STATUS,
+name = "status"})
+end
+
+local function button(label, key, colour, action, keep, name)
+return doc.button(label, {key = action and key or nil,
+colour = action and colour or "dim", action = action, keep = keep, name = name})
+end
+
+
+
+function machines.measured(m)
+if not m.rate and not m.utilisation then return nil end
+local rate = m.rate and (m.rate >= 10 and ("%d/min"):format(math.floor(m.rate + 0.5))
+or ("%.1f/min"):format(m.rate)) or "?/min"
+if not m.utilisation then return rate end
+return ("%s %d%%"):format(rate, math.floor(m.utilisation * 100 + 0.5))
+end
+
+
+
+function machines.groupOf(name)
+local group, own = tostring(name):match("^([^/]+)/(.+)$")
+return group, own or name
+end
+
+local function machineEntry(view, m, label)
+local state = stateOf(m)
+local note = state
+if state == "running" or state == "paused" then
+note = note .. ", " .. ageText(ageOf(view, m.lastAt))
+elseif state == "stopped" and m.enabled then
+note = "starting"
+end
+
+local measured = machines.measured(m)
+if measured then note = note .. ", " .. measured end
+return {value = m.machine, label = label, note = note,
+chip = STATE_CHIP[state] or "gray"}
+end
+
+
+
+local function groupEntry(view, group, members)
+local open = view.openGroups[group]
+local script, counts, names, anyOn = members[1].script, {}, {}, false
+for _, m in ipairs(members) do
+if m.script ~= script then script = "mixed" end
+local state = stateOf(m)
+counts[state] = (counts[state] or 0) + 1
+names[#names + 1] = m.machine
+anyOn = anyOn or m.enabled
+end
+
+local note = "stopped"
+for _, state in ipairs({"faulted", "paused", "running"}) do
+if counts[state] then
+note = ("%d %s"):format(counts[state], state)
+break
+end
+end
+
+local extra = {label = anyOn and "stop all" or "start all",
+colour = anyOn and "bad" or "good",
+action = {kind = "group-switch", group = group, machines = names,
+command = anyOn and "disable_machine" or "enable_machine"}}
+return {value = group .. "/", group = group,
+label = ("%s %-8s %d %s"):format(open and "\31" or "\16", group .. "/", #members,
+script),
+note = note, chip = STATE_CHIP[stateOf(members[1])] or "gray", extra = extra}
+end
+
+
+
+
+local function machineEntries(view)
+local sorted = {}
+for _, m in ipairs(view.machines or {}) do sorted[#sorted + 1] = m end
+table.sort(sorted, function(a, b)
+local oa, ob = ORDER[stateOf(a)] or 9, ORDER[stateOf(b)] or 9
+if oa ~= ob then return oa < ob end
+return a.machine < b.machine
+end)
+local entries = {}
+if view.list.query ~= "" then
+for _, m in ipairs(sorted) do
+entries[#entries + 1] = machineEntry(view, m,
+("%-10s %s"):format(m.machine, m.script))
+end
+return entries
+end
+local groups = {}
+for _, m in ipairs(sorted) do
+local group = machines.groupOf(m.machine)
+if group then
+groups[group] = groups[group] or {}
+table.insert(groups[group], m)
+end
+end
+local placed = {}
+for _, m in ipairs(sorted) do
+local group = machines.groupOf(m.machine)
+if not group then
+entries[#entries + 1] = machineEntry(view, m,
+("%-10s %s"):format(m.machine, m.script))
+elseif not placed[group] then
+placed[group] = true
+entries[#entries + 1] = groupEntry(view, group, groups[group])
+if view.openGroups[group] then
+for _, member in ipairs(groups[group]) do
+local _, own = machines.groupOf(member.machine)
+entries[#entries + 1] = machineEntry(view, member,
+("  %-8s %s"):format(own, member.script))
+end
+end
+end
+end
+return entries
+end
+
+local function listDocument(view, height)
+local showingTypes = view.screen == "types"
+local control = showingTypes
+and doc.button("Machines", {key = "<", action = {kind = "show", screen = "list"},
+keep = doc.REQUIRED, name = "show-machines"})
+or doc.button("Types", {key = ">", action = {kind = "show", screen = "types"},
+keep = doc.REQUIRED, name = "show-types"})
+local rows = {app.header(view, showingTypes and "TYPES" or "MACHINES", control),
+doc.rule({keep = 2})}
+
+if not view.machines then
+rows[#rows + 1] = doc.text(view.readWhy and ("the controller refused: "
+.. view.readWhy) or "reading the machines..", {colour = view.readWhy and "bad"
+or "dim", wrap = true, keep = doc.REQUIRED, name = "read-state"})
+elseif showingTypes then
+local entries, known = {}, {}
+for _, t in ipairs(view.types or {}) do
+local n = #(t.machines or {})
+known[t.script] = true
+entries[#entries + 1] = {value = t.script, label = t.script,
+note = ("rev %d, %d machine%s"):format(t.rev or 0, n, n == 1 and "" or "s")}
+end
+
+
+for _, draft in ipairs(editor.drafts()) do
+if not (draft.name and known[draft.name]) then
+entries[#entries + 1] = {value = draft.name or "_new",
+label = draft.name or "(no name yet)", note = "draft, not saved",
+chip = "orange"}
+end
+end
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" no scripts yet -- write one with + new script",
+{colour = "dim", wrap = true, keep = 20, name = "empty"})
+end
+for _, row in ipairs(app.listRows(view.typeList, entries, "type",
+function(entry)
+return {kind = "edit", script = entry.value ~= "_new" and entry.value or nil}
+end,
+{limit = height})) do
+rows[#rows + 1] = row
+end
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("+ new script", {key = "+",
+colour = "selected", action = {kind = "edit"}, keep = doc.REQUIRED,
+name = "new-script"})}, {keep = doc.REQUIRED, name = "types-actions"})
+else
+local entries = machineEntries(view)
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" no machines yet -- make one from a type with "
+.. "+ make a machine", {colour = "dim", wrap = true, keep = 20,
+name = "empty"})
+end
+for _, row in ipairs(app.listRows(view.list, entries, "machine",
+function(entry)
+if entry.group then return {kind = "group", group = entry.group} end
+return {kind = "open", machine = entry.value}
+end,
+{limit = height})) do
+rows[#rows + 1] = row
+end
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("+ make a machine", {key = "+",
+colour = "selected", action = {kind = "goto-make"}, keep = doc.REQUIRED,
+name = "goto-make"})}, {keep = doc.REQUIRED, name = "list-actions"})
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+
+
+local function levelText(port)
+if port.level == nil then return "unread" end
+if port.kind == "flag" then return port.level > 0 and "on" or "off" end
+return "level " .. port.level
+end
+
+
+
+
+
+local function portRow(view, m, index, port)
+local how, colour
+local handFree = false
+if not port.bound then
+how, colour = "NOT BOUND", "bad"
+elseif port.kind ~= "volume" then
+how, colour = levelText(port), "text"
+if port.direction == "output" then
+if m.enabled then
+how = how .. ", by script"
+elseif port.owner == "operator" then
+how, colour = how .. ", by hand", "warn"
+handFree = true
+elseif port.owner == nil then
+handFree = true
+else
+how = how .. ", by " .. tostring(port.owner)
+end
+end
+elseif port.chest then
+how, colour = "chest", "text"
+else
+how, colour = port.slots and "slots" or "bound", "text"
+end
+local children = {
+doc.gap(1),
+doc.text(port.name, {width = 8, truncate = doc.TRUNCATED, colour = "title",
+name = "port-name:" .. index}),
+doc.gap(1),
+doc.text(("%s %s"):format(port.direction or "", port.kind or ""), {width = 13,
+truncate = doc.TRUNCATED, colour = "dim", name = "port-kind:" .. index}),
+doc.gap(1),
+doc.text(how, {colour = colour, truncate = doc.TRUNCATED, width = "fill",
+name = "port-how:" .. index}),
+}
+local out = {doc.row(children, {keep = 40 - index, name = "port:" .. index})}
+
+if not port.bound and port.methods and not view.sending then
+out[2] = doc.row({doc.gap(3), doc.button(port.pending and "page out: bind.."
+or "bind..", {colour = port.pending and "warn" or "action",
+action = {kind = "goto-bind", path = ("/%s/%s"):format(m.machine, port.name)},
+keep = doc.REQUIRED, name = "bind:" .. index})},
+{keep = 40 - index, name = "bind-row:" .. index})
+return out
+end
+
+
+if handFree and not view.sending then
+local hands = {doc.text("   by hand:", {colour = "label", keep = doc.REQUIRED,
+name = "signal-label:" .. index})}
+local function hand(label, op, colourName, keep)
+hands[#hands + 1] = doc.gap(1)
+hands[#hands + 1] = doc.button(label, {colour = colourName,
+action = {kind = "signal", port = port.name, op = op}, keep = keep,
+name = ("signal-%s:%d"):format(op, index)})
+end
+hand("on", "on", "good", doc.REQUIRED)
+hand("off", "off", "bad", doc.REQUIRED)
+hand("pulse", "pulse", "action", 6)
+if port.owner == "operator" then hand("release", "release", "dim", 5) end
+out[2] = doc.row(hands, {keep = 40 - index, name = "signal-hands:" .. index})
+end
+return out
+end
+
+
+local function stepText(view, step)
+local p = step.params or {}
+local parts = {step.action}
+for _, key in ipairs({"count", "item", "level", "port", "path", "upto"}) do
+local v = p[key]
+if v ~= nil then
+parts[#parts + 1] = key == "item" and machines.nameOf(view, v) or tostring(v)
+end
+end
+local text = table.concat(parts, " ")
+if step.status ~= app.COMPLETED then text = text .. " -- " .. tostring(step.status) end
+if step.reason then text = text .. ": " .. tostring(step.reason) end
+return text
+end
+
+local function runRows(view, rows, height)
+local runs = view.detail.runs or {}
+local list = view.runs
+list.total = #runs
+list.from = math.max(1, math.min(list.from, math.max(1, #runs - (list.shown or 0) + 1)))
+if #runs == 0 then
+rows[#rows + 1] = doc.text(" no runs that did anything yet", {colour = "dim",
+keep = 21, name = "no-runs"})
+list.listed = 0
+return
+end
+local upto = math.min(#runs, list.from + height - 1)
+list.listed = math.max(0, upto - list.from + 1)
+for index = list.from, upto do
+local run = runs[index]
+local open = view.openRun == index
+local faulted = run.status ~= app.COMPLETED
+local text = ("%s %-8s %s%s"):format(open and "v" or ">",
+ageText(ageOf(view, run.at)), run.handler or "",
+faulted and (" -- " .. tostring(run.reason or run.status)) or "")
+rows[#rows + 1] = doc.row({doc.button(text, {width = "fill", align = "left",
+colour = faulted and "bad" or (open and "selected" or "action"),
+action = {kind = "run", index = index}, style = "row",
+alt = index % 2 == 0, name = "run-button:" .. index})},
+{keep = 20 + (#runs - index), name = "run:" .. index,
+bg = open and "selected" or (index % 2 == 0 and "zebra" or nil)})
+if open then
+for i, step in ipairs(run.steps or {}) do
+rows[#rows + 1] = doc.text("    " .. stepText(view, step), {
+colour = step.status == app.COMPLETED and "text" or "bad",
+truncate = doc.TRUNCATED, keep = 20 + (#runs - index),
+name = ("step:%d:%d"):format(index, i)})
+end
+end
+end
+end
+
+local function machineDocument(view, height)
+local back = doc.button("Machines", {key = "<", action = {kind = "show", screen = "list"},
+keep = doc.REQUIRED, name = "back"})
+local rows = {app.header(view, "MACHINE " .. tostring(view.chosen), back),
+doc.rule({keep = 2})}
+local m = view.detail
+if not m or m.machine ~= view.chosen then
+rows[#rows + 1] = doc.text(view.detailWhy and ("the controller refused: "
+.. view.detailWhy) or ("reading " .. tostring(view.chosen) .. ".."),
+{colour = view.detailWhy and "bad" or "dim", wrap = true,
+keep = doc.REQUIRED, name = "read-state"})
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local state = stateOf(m)
+rows[#rows + 1] = doc.row({
+doc.text((" %s rev %s"):format(m.script, tostring(m.rev)), {colour = "text",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "type"}),
+doc.gap(2),
+doc.text(state, {colour = STATE_COLOUR[state] or "text", keep = doc.REQUIRED,
+name = "state"}),
+doc.gap(1),
+doc.text(m.enabled and "(enabled)" or "(disabled)", {colour = "dim", keep = 5,
+name = "enabled"}),
+}, {keep = doc.REQUIRED, name = "summary"})
+if state == "paused" and m.pausedBy then
+rows[#rows + 1] = doc.text(" paused: " .. m.pausedBy, {colour = "warn",
+wrap = true, keep = 60, name = "paused"})
+end
+local measured = machines.measured(m)
+if measured then
+rows[#rows + 1] = doc.text(" makes " .. measured .. " busy over the hour",
+{colour = "dim", truncate = doc.TRUNCATED, keep = 57, name = "rate"})
+end
+if m.lastError then
+rows[#rows + 1] = doc.text(" last error: " .. m.lastError, {colour = "bad",
+wrap = true, keep = 59, name = "error"})
+end
+if m.limit then
+rows[#rows + 1] = doc.text((" limit: pauses at %d %s, resumes below %d"):format(
+m.limit.at, machines.nameOf(view, m.limit.item), m.limit.resume),
+{colour = "dim", truncate = doc.TRUNCATED, keep = 58, name = "limit"})
+end
+
+local unbound = nil
+for index, port in ipairs(m.ports or {}) do
+for _, r in ipairs(portRow(view, m, index, port)) do rows[#rows + 1] = r end
+if not port.bound and not port.methods then unbound = unbound or port.name end
+end
+
+if unbound then
+rows[#rows + 1] = doc.text((" bind it: mfgctl bind /%s/%s <device> ..."):format(
+m.machine, unbound), {colour = "dim", truncate = doc.TRUNCATED, keep = 30,
+name = "bind-hint"})
+end
+
+rows[#rows + 1] = doc.text(" runs", {colour = "label", keep = 22, name = "runs-label"})
+runRows(view, rows, height)
+rows[#rows + 1] = doc.spacer()
+
+local busy = view.sending ~= nil
+local toggle = m.enabled
+and button("Disable", "d", "bad", (not busy) and {kind = "disable"} or nil,
+doc.REQUIRED, "toggle")
+or button("Enable", "e", "good", (not busy) and {kind = "enable"} or nil,
+doc.REQUIRED, "toggle")
+rows[#rows + 1] = doc.row({
+doc.gap(1), toggle,
+doc.gap(1), button("Limit", "l", "action", (not busy) and {kind = "open-limit"}
+or nil, doc.REQUIRED, "open-limit"),
+doc.gap(1), button("Edit script", "t", "action",
+{kind = "edit", script = m.script}, 5, "edit-script"),
+doc.gap(1), button("Forget", "f", "bad", (not busy) and {kind = "forget"} or nil,
+4, "forget"),
+
+m.makes and m.makes[1] and doc.gap(1) or nil,
+m.makes and m.makes[1] and button("Keep stocked", "k", "action",
+{kind = "keep", item = m.makes[1]}, 3, "keep") or nil,
+}, {keep = doc.REQUIRED, name = "actions"})
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+
+local function itemEntries(view)
+local entries = {}
+for item in pairs(view.items or {}) do
+entries[#entries + 1] = {value = item, label = machines.nameOf(view, item),
+note = tostring(view.items[item].held or view.items[item].free or ""),
+chip = app.chipFor(item), selected = view.limit and view.limit.item == item}
+end
+table.sort(entries, function(a, b)
+if a.label:lower() ~= b.label:lower() then return a.label:lower() < b.label:lower() end
+return a.value < b.value
+end)
+return entries
+end
+
+
+function machines.limitBlocked(view)
+local limit = view.limit
+if view.sending then return "asking the controller.." end
+if not limit.item then return "choose the item above" end
+local at, resume = tonumber(limit.at), tonumber(limit.resume)
+if not at or at < 1 then return "type how many pause it" end
+if resume and resume > at then return "resume must be at most the pause amount" end
+return nil
+end
+
+local function amountField(view, field, label)
+local limit = view.limit
+local focused = limit.field == field
+return {
+doc.text(label, {colour = "label", keep = doc.REQUIRED, name = field .. "-label"}),
+doc.gap(1),
+doc.text(" " .. limit[field] .. (focused and "_" or ""), {width = 8,
+colour = focused and "title" or "text", bg = "field",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+action = {kind = "focus", field = field}, name = field}),
+}
+end
+
+local function limitDocument(view, height)
+local back = doc.button("Back", {key = "<", action = {kind = "show", screen = "machine"},
+keep = doc.REQUIRED, name = "back"})
+local rows = {app.header(view, "LIMIT " .. tostring(view.chosen), back),
+doc.rule({keep = 2})}
+if not view.items then
+rows[#rows + 1] = doc.text(" reading the pool..", {colour = "dim",
+keep = doc.REQUIRED, name = "read-state"})
+else
+for _, row in ipairs(app.listRows(view.itemList, itemEntries(view), "item",
+function(entry) return {kind = "limit-item", item = entry.value} end,
+{pickKeys = false, arrows = true, limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+local limit = view.limit
+rows[#rows + 1] = doc.text((" pause while the pool holds %s"):format(
+limit.item and machines.nameOf(view, limit.item) or "..."), {colour = "title",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "limit-item"})
+local fields = {doc.gap(1)}
+for _, child in ipairs(amountField(view, "at", "at")) do fields[#fields + 1] = child end
+fields[#fields + 1] = doc.gap(2)
+for _, child in ipairs(amountField(view, "resume", "resume below")) do
+fields[#fields + 1] = child
+end
+rows[#rows + 1] = doc.row(fields, {keep = doc.REQUIRED, name = "amounts"})
+local why = machines.limitBlocked(view)
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+button("Set limit", "enter", "selected", (not why) and {kind = "set-limit"} or nil,
+doc.REQUIRED, "set-limit"),
+doc.gap(1),
+button("No limit", nil, "bad", (not view.sending) and {kind = "clear-limit"} or nil,
+5, "clear-limit"),
+}, {keep = doc.REQUIRED, name = "limit-actions"})
+if why then
+rows[#rows + 1] = doc.text(" " .. why, {colour = "dim", wrap = true,
+keep = app.KEEP_STATUS - 1, name = "why-blocked"})
+end
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function confirmDocument(view)
+local rows = {app.header(view, "FORGET " .. tostring(view.chosen)), doc.rule({keep = 2})}
+rows[#rows + 1] = doc.text((" Forget %s?"):format(tostring(view.chosen)),
+{colour = "title", keep = doc.REQUIRED, name = "confirm"})
+rows[#rows + 1] = doc.text(" It stops, its ports are unbound, and its inventory "
+.. "and relays are free again. Its script stays.", {colour = "dim", wrap = true,
+keep = 6, name = "note"})
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.button("yes", {key = "y", colour = "bad", action = {kind = "yes"},
+keep = doc.REQUIRED, name = "yes"}),
+doc.gap(1),
+doc.button("no", {key = "n", colour = "good", action = {kind = "no"},
+keep = doc.REQUIRED, name = "no"}),
+}, {keep = doc.REQUIRED, name = "confirm-actions"})
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+local function editDocument(view, height)
+local close = doc.button("close", {key = "x", action = {kind = "close-editor"},
+keep = doc.REQUIRED, name = "close-editor"})
+local rows = {app.header(view, editor.title(view.editor), close)}
+editor.document(view.editor, rows, height, view.width)
+return rows
+end
+
+function machines.document(view, width, height)
+view.width = width
+local rows
+if view.screen == "edit" and view.editor then
+rows = editDocument(view, height)
+elseif view.screen == "machine" then
+rows = machineDocument(view, height)
+elseif view.screen == "limit" and view.limit then
+rows = limitDocument(view, height)
+elseif view.screen == "confirm" then
+rows = confirmDocument(view)
+else
+rows = listDocument(view, height)
+end
+return doc.stack(rows, {name = "machines"})
+end
+
+function machines.settle(view, report)
+if view.screen == "list" then return app.settle(view.list, report, "machine") end
+if view.screen == "types" then return app.settle(view.typeList, report, "type") end
+if view.screen == "machine" then return app.settle(view.runs, report, "run") end
+if view.screen == "limit" then return app.settle(view.itemList, report, "item") end
+if view.screen == "edit" and view.editor then return editor.settle(view.editor, report) end
+return false
+end
+
+
+
+local function ask(view, command, params)
+app.ask(view, {kind = "act", command = command, params = params})
+end
+
+function machines.act(view, action)
+local kind = action and action.kind
+if view.screen == "edit" and view.editor then
+if kind == "close-editor" then
+local ed = view.editor
+if ed.state and ed.state.dirty then
+view.result = {text = ("your changes to %s are kept as a draft on this "
+.. "computer"):format(ed.state.tree.machine or "the new script"),
+colour = "warn"}
+end
+view.editor, view.screen = nil, view.editFrom or "types"
+view.readAt = nil
+return true
+end
+return editor.act(view.editor, action)
+end
+if kind == "edit" then
+view.editFrom = view.screen
+view.editor = editor.new(view, action.script)
+view.screen = "edit"
+return true
+end
+local lists = {list = view.list, types = view.typeList, limit = view.itemList,
+machine = view.runs}
+local list = lists[view.screen]
+if list and app.page(list, kind, action) then return true end
+
+if kind == "show" then
+view.screen = action.screen
+if action.screen ~= "machine" then view.openRun = nil end
+return true
+elseif kind == "open" then
+if view.chosen ~= action.machine then
+view.detail, view.openRun = nil, nil
+view.runs = app.newList()
+end
+view.chosen, view.screen, view.detailAt = action.machine, "machine", nil
+return true
+elseif kind == "group" then
+view.openGroups[action.group] = not view.openGroups[action.group] or nil
+return true
+elseif kind == "group-switch" then
+if view.sending then return false end
+app.ask(view, {kind = "group-act", command = action.command,
+group = action.group, machines = action.machines})
+return true
+elseif kind == "run" then
+view.openRun = (view.openRun ~= action.index) and action.index or nil
+return true
+elseif kind == "goto-bind" then
+view.jump = {app = "bind", action = {kind = "pick", path = action.path}}
+return true
+elseif kind == "keep" then
+view.jump = {app = "resources", action = {kind = "for-item", item = action.item}}
+return true
+elseif kind == "goto-make" then
+view.jump = {app = "bind", action = {kind = "open-make"}}
+return true
+elseif kind == "signal" then
+
+
+local path = ("/%s/%s"):format(view.chosen, action.port)
+if action.op == "on" or action.op == "off" then
+ask(view, "set_signal", {signal = path, level = action.op == "on" and 15 or 0})
+elseif action.op == "pulse" then
+ask(view, "pulse", {signal = path, level = 15, length = 20})
+elseif action.op == "release" then
+ask(view, "release_signal", {signal = path})
+end
+return true
+elseif kind == "enable" then
+ask(view, "enable_machine", {machine = view.chosen})
+return true
+elseif kind == "disable" then
+ask(view, "disable_machine", {machine = view.chosen})
+return true
+elseif kind == "forget" then
+view.screen = "confirm"
+return true
+elseif kind == "yes" then
+view.screen = "machine"
+ask(view, "forget_machine", {machine = view.chosen})
+return true
+elseif kind == "no" then
+view.screen = "machine"
+return true
+elseif kind == "open-limit" then
+local current = view.detail and view.detail.limit
+view.limit = {item = current and current.item,
+at = current and tostring(current.at) or "",
+resume = current and current.resume ~= current.at and tostring(current.resume)
+or "",
+field = "at"}
+view.itemList = app.newList()
+view.screen = "limit"
+app.ask(view, {kind = "items"})
+return true
+elseif kind == "limit-item" then
+view.limit.item = action.item
+return true
+elseif kind == "focus" then
+if view.limit then view.limit.field = action.field end
+return true
+elseif kind == "set-limit" then
+if machines.limitBlocked(view) then return false end
+local limit = view.limit
+ask(view, "limit_machine", {machine = view.chosen, item = limit.item,
+at = tonumber(limit.at), resume = tonumber(limit.resume)})
+view.screen = "machine"
+return true
+elseif kind == "clear-limit" then
+ask(view, "limit_machine", {machine = view.chosen})
+view.screen = "machine"
+return true
+end
+return false
+end
+
+
+
+function machines.searching(view)
+if not view.machines then return nil end
+if view.screen == "list" then return view.list end
+if view.screen == "types" then return view.typeList end
+return nil
+end
+
+
+
+local function limitKeyboard(view, event)
+local limit, list = view.limit, view.itemList
+if event.kind == "char" and type(event.char) == "string" and event.char:match("^%d$") then
+local value = limit[limit.field]
+if #value < machines.AMOUNT_DIGITS then
+limit[limit.field] = ((value .. event.char):gsub("^0+", ""))
+end
+return true
+end
+if event.kind == "key" and keys
+and (event.key == keys.backspace or event.key == keys.delete) then
+local value = limit[limit.field]
+if value ~= "" then
+limit[limit.field] = event.key == keys.delete and "" or value:sub(1, -2)
+return true
+end
+end
+if view.items then return app.type(list, event) end
+return false
+end
+
+
+
+
+function machines.keyboard(view, event)
+if not event then return false end
+if view.screen == "edit" and view.editor then return editor.keyboard(view.editor, event) end
+if view.screen == "limit" and view.limit then return limitKeyboard(view, event) end
+if view.screen == "machine" then
+if event.kind == "scroll" then
+app.scroll(view.runs, event.dir or 0)
+return true
+end
+if event.kind == "key" and keys and (event.key == keys.pageDown
+or event.key == keys.pageUp) then
+app.page(view.runs, event.key == keys.pageDown and "next" or "prev")
+return true
+end
+return false
+end
+local list = machines.searching(view)
+if list then return app.type(list, event) end
+return false
+end
+
+
+function machines.handle(view, event, grid)
+local took, chose = machines.keyboard(view, event)
+if took then
+if chose then machines.act(view, chose) end
+return true
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return machines.act(view, action)
+end
+
+return machines

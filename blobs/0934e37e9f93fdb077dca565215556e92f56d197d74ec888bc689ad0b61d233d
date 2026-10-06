@@ -1,0 +1,79 @@
+local rpc = require("mfg.common.rpc")
+local resources = require("mfg.controller.resources")
+
+
+
+
+
+
+
+
+
+return {
+name        = "resources",
+label       = "Resource groups",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "id", label = "Group", type = "number", integer = true, min = 1,
+required = false},
+{name = "unit", label = "Unit", type = "item", required = false,
+help = "List the forms the recipe book links to this item."},
+{name = "choices", label = "Choices", type = "flag", required = false,
+help = "List what a new group may be for: what the book makes, what the pool holds."},
+},
+
+returns = {groups = "table", links = "table", choices = "table", now = "number"},
+
+run = function(params)
+local links = nil
+if params.unit then
+local bad
+links, bad = resources.links(params.unit)
+for item, why in pairs(bad) do
+links[#links + 1] = {item = item, refused = why}
+end
+end
+local available = require("mfg.controller.supervisor").available() or {}
+local out = {}
+for _, group in ipairs(resources.all()) do
+if not params.id or group.id == params.id then
+local entry = {}
+for k, v in pairs(group) do entry[k] = v end
+for k, v in pairs(resources.status(group, available)) do entry[k] = v end
+entry.channels = resources.channels(group, available)
+
+if params.id then entry.channelChoices = resources.channelChoices(group) end
+out[#out + 1] = entry
+end
+end
+if params.id and #out == 0 then
+return rpc.REJECTED, {reason = "no resource group " .. params.id}
+end
+local choices = nil
+if params.choices then
+
+local seen = {}
+choices = {}
+for _, def in ipairs(require("mfg.controller.recipes").all()) do
+if not seen[def.output.item] then
+seen[def.output.item] = true
+choices[#choices + 1] = {item = def.output.item, made = true,
+free = math.floor(available[def.output.item] or 0),
+group = resources.groupFor(def.output.item) and true or nil}
+end
+end
+for item, n in pairs(available) do
+if not seen[item] then
+seen[item] = true
+choices[#choices + 1] = {item = item, free = math.floor(n),
+group = resources.groupFor(item) and true or nil}
+end
+end
+end
+return rpc.COMPLETED, {groups = out, links = links, choices = choices,
+now = os.epoch("utc")}
+end,
+}

@@ -1,0 +1,390 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local schema = require("mfg.common.script.schema")
+local parse = require("mfg.common.script.parse")
+
+local edit = {}
+
+edit.UNDO = 32
+
+local function copy(value)
+if type(value) ~= "table" then return value end
+local out = {}
+for k, v in pairs(value) do out[k] = copy(v) end
+return out
+end
+edit.copy = copy
+
+
+
+function edit.blank(name)
+local tree = {kind = "script", lang = parse.LANG, id = 0, span = {}, machine = name,
+ports = {}, handlers = {}}
+local state = edit.open(tree)
+state.tree.ports[1] = schema.new("port", edit.nextId(state))
+state.tree.handlers[1] = schema.new("every", edit.nextId(state))
+return state
+end
+
+
+function edit.open(tree)
+tree = copy(tree)
+return {tree = tree, top = schema.maxId(tree), undo = {}, dirty = false}
+end
+
+function edit.nextId(state)
+state.top = state.top + 1
+return state.top
+end
+
+function edit.rows(state)
+return schema.rows(state.tree)
+end
+
+
+local function snapshot(state)
+local undo = state.undo
+undo[#undo + 1] = {tree = copy(state.tree), top = state.top}
+while #undo > edit.UNDO do table.remove(undo, 1) end
+state.dirty = true
+end
+
+function edit.undo(state)
+local last = table.remove(state.undo)
+if not last then return false end
+state.tree, state.top = last.tree, last.top
+return true
+end
+
+
+
+
+
+
+function edit.find(state, target)
+local tree = state.tree
+for i, port in ipairs(tree.ports) do
+if port == target then return tree.ports, i, tree end
+end
+local function search(list, owner, orelse)
+for i, s in ipairs(list or {}) do
+if s == target then return list, i, owner, orelse end
+local l, j, o, e = search(s.body, s, false)
+if l then return l, j, o, e end
+l, j, o, e = search(s.orelse, s, true)
+if l then return l, j, o, e end
+end
+end
+for i, h in ipairs(tree.handlers) do
+if h == target then return tree.handlers, i, tree end
+local l, j, o, e = search(h.body, h, false)
+if l then return l, j, o, e end
+end
+return nil
+end
+
+
+
+function edit.palette(row)
+if row.kind == "machine" or row.place == "header" then
+local out = {}
+for _, kind in ipairs(schema.PALETTE.header) do out[#out + 1] = kind end
+for _, kind in ipairs(schema.PALETTE.top) do out[#out + 1] = kind end
+return out
+end
+local out = {}
+for _, kind in ipairs(schema.PALETTE.block) do out[#out + 1] = kind end
+if row.kind == "if" and not row.node.orelse then out[#out + 1] = "else" end
+if row.place == "top" then
+for _, kind in ipairs(schema.PALETTE.top) do out[#out + 1] = kind end
+end
+return out
+end
+
+
+
+
+
+
+function edit.insert(state, row, kind)
+local tree = state.tree
+if kind == "else" then
+if row.kind ~= "if" or row.node.orelse then
+return nil, "an else goes under an if that has none"
+end
+snapshot(state)
+row.node.orelse = {}
+return row.node
+end
+local rowKind = schema.KINDS[kind]
+if not rowKind then return nil, "no such line: " .. tostring(kind) end
+
+local list, at
+if kind == "makes" or kind == "yields" then
+
+tree.makes = tree.makes or {}
+list = tree.makes
+at = (row.list == tree.makes) and row.index + 1 or #tree.makes + 1
+elseif rowKind.place == "header" then
+list = tree.ports
+at = (row.list == tree.ports) and row.index + 1 or (row.kind == "machine" and 1)
+or #tree.ports + 1
+elseif rowKind.place == "top" then
+list = tree.handlers
+if row.place == "top" then
+at = row.index + 1
+elseif row.place == "block" then
+
+local node = row.node
+local l, i, owner = edit.find(state, node)
+while owner and owner ~= tree do
+node = owner
+l, i, owner = edit.find(state, node)
+end
+at = (i or #tree.handlers) + 1
+else
+at = 1
+end
+else
+if row.kind == "machine" or row.place == "header" then
+return nil, "a statement goes under a handler: every, when or on"
+end
+if row.kind == "else" then
+list, at = row.node.orelse, 1
+elseif row.node.body then
+list, at = row.node.body, 1
+else
+list, at = row.list, row.index + 1
+end
+end
+snapshot(state)
+local n = schema.new(kind, edit.nextId(state))
+table.insert(list, at, n)
+return n
+end
+
+
+
+function edit.remove(state, row)
+if row.kind == "machine" then return nil, "the machine line stays" end
+snapshot(state)
+if row.kind == "else" then
+row.node.orelse = nil
+return true
+end
+table.remove(row.list, row.index)
+
+if row.list == state.tree.makes and #row.list == 0 then state.tree.makes = nil end
+return true
+end
+
+
+function edit.holdsLines(row)
+if row.kind == "else" then return #(row.node.orelse or {}) > 0 end
+return #(row.node.body or {}) > 0 or #(row.node.orelse or {}) > 0
+end
+
+
+
+
+
+local function fits(state, node, list)
+local tree = state.tree
+local row = schema.KINDS[node.kind]
+if not row then return false end
+if node.kind == "makes" or node.kind == "yields" then return list == tree.makes end
+if row.place == "header" then return list == tree.ports end
+if row.place == "top" then return list == tree.handlers end
+if list == tree.ports or list == tree.handlers then return false end
+
+local function under(xs)
+for _, s in ipairs(xs or {}) do
+if s.body == list or s.orelse == list or under(s.body) or under(s.orelse) then
+return true
+end
+end
+return false
+end
+return node.body ~= list and node.orelse ~= list
+and not under(node.body) and not under(node.orelse)
+end
+
+
+
+function edit.moveTo(state, node, list, at)
+if not fits(state, node, list) then
+return nil, "that line cannot go there"
+end
+local from, i = edit.find(state, node)
+if not from then return nil, "not in the script" end
+snapshot(state)
+table.remove(from, i)
+at = math.max(1, math.min(at, #list + 1))
+table.insert(list, at, node)
+return true
+end
+
+
+
+local function after(list, anchor, node)
+local at, from = nil, nil
+for i, s in ipairs(list) do
+if s == anchor then at = i end
+if s == node then from = i end
+end
+if from and from < at then return at end
+return at + 1
+end
+
+
+local function handlerOf(state, row)
+if row.place == "top" then return row.node end
+if row.place ~= "block" then return nil end
+local node = row.node
+local _, _, owner = edit.find(state, node)
+while owner and owner ~= state.tree do
+node = owner
+_, _, owner = edit.find(state, node)
+end
+return node
+end
+
+
+
+
+
+function edit.dropAt(state, moving, target, depth)
+local tree, node = state.tree, moving.node
+local place = schema.KINDS[node.kind] and schema.KINDS[node.kind].place
+if place == "header" then
+local list = (node.kind == "makes" or node.kind == "yields") and tree.makes
+or tree.ports
+if target.kind == "machine" then return edit.moveTo(state, node, list, 1) end
+if target.place ~= "header" then return nil, "a port stays in the header" end
+if target.list ~= list then
+return nil, "ports come first, then the makes lines"
+end
+return edit.moveTo(state, node, list, after(list, target.node, node))
+elseif place == "top" then
+local h = handlerOf(state, target)
+if not h then return edit.moveTo(state, node, tree.handlers, 1) end
+if h == node then return nil, "it is there already" end
+return edit.moveTo(state, node, tree.handlers, after(tree.handlers, h, node))
+end
+
+if target.kind == "machine" or target.place == "header" then
+return nil, "a statement goes under a handler: every, when or on"
+end
+if target.place == "top" then return edit.moveTo(state, node, target.node.body, 1) end
+if depth > target.depth then
+if target.kind == "else" then return edit.moveTo(state, node, target.node.orelse, 1) end
+if target.node.body then return edit.moveTo(state, node, target.node.body, 1) end
+end
+
+local anchor, anchorDepth = target.node, target.depth
+while anchorDepth > math.max(depth, 1) do
+local _, _, owner = edit.find(state, anchor)
+if not owner or schema.KINDS[owner.kind].place ~= "block" then break end
+anchor, anchorDepth = owner, anchorDepth - 1
+end
+if anchor == node then return nil, "it is there already" end
+local list = edit.find(state, anchor)
+return edit.moveTo(state, node, list, after(list, anchor, node))
+end
+
+
+function edit.shift(state, row, step)
+if row.kind == "machine" or row.kind == "else" then return nil, "it stays" end
+local target = row.index + step
+if target < 1 or target > #row.list then return nil, "it is at the end already" end
+return edit.moveTo(state, row.node, row.list, target)
+end
+
+
+function edit.indent(state, row)
+if row.place ~= "block" or row.kind == "else" then return nil, "only a statement moves in" end
+local above = row.list[row.index - 1]
+if not above then return nil, "there is no line above it to go under" end
+local into = above.orelse or above.body
+if not into then return nil, ("a %s has no block to go into"):format(above.kind) end
+return edit.moveTo(state, row.node, into, #into + 1)
+end
+
+
+
+function edit.outdent(state, row)
+if row.place ~= "block" or row.kind == "else" then return nil, "only a statement moves out" end
+local _, _, owner = edit.find(state, row.node)
+if not owner or schema.KINDS[owner.kind].place == "top" then
+return nil, "a statement stays under its handler"
+end
+local list, i = edit.find(state, owner)
+return edit.moveTo(state, row.node, list, i + 1)
+end
+
+
+
+
+function edit.set(state, node, field, value)
+snapshot(state)
+node[field] = value
+return true
+end
+
+
+
+
+function edit.replace(state, row, text)
+if row.kind == "else" then return nil, {{col = 1, message = "else has nothing to type"}} end
+if row.kind == "machine" then
+local name = text:match("^%s*machine%s+([a-z_][a-z0-9_]*)%s*$")
+if not name then
+return nil, {{col = 1, message = "the first line is machine <name>"}}
+end
+snapshot(state)
+state.tree.machine = name
+return state.tree
+end
+local n, top, errors = parse.line(text, row.place, state.top)
+if not n then return nil, errors end
+snapshot(state)
+state.top = top
+local old = row.node
+if n.kind == old.kind then n.id = old.id end
+if n.body then
+n.body = old.body or {}
+n.orelse = old.orelse
+n.elseNotes, n.elseComment = old.elseNotes, old.elseComment
+end
+n.notes = old.notes
+row.list[row.index] = n
+return n
+end
+
+
+
+
+function edit.marks(report)
+local byId = {}
+for _, list in ipairs({{report.errors, "error"}, {report.warnings, "warning"}}) do
+for _, p in ipairs(list[1] or {}) do
+if p.node then
+byId[p.node] = byId[p.node] or {}
+table.insert(byId[p.node], {level = list[2], message = p.message})
+end
+end
+end
+return byId
+end
+
+return edit

@@ -1,0 +1,150 @@
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+local res = require("mfg.hmi.resourcespanel")
+
+local stock = {}
+
+stock.EVERY = 5
+stock.BACKGROUND = 30
+stock.READ = {timeout = 3, attempts = 2}
+
+function stock.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+names = opts.names or {},
+groups = nil,
+readAt = nil, readWhy = nil,
+offer = nil,
+list = app.newList(),
+jump = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+function stock.refresh(view) view.readAt = nil end
+
+function stock.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+local every = ((view.onScreen == false) and stock.BACKGROUND or stock.EVERY) * 1000
+if not view.readAt or app.clock(view) - view.readAt >= every then return {kind = "read"} end
+return nil
+end
+
+function stock.exchange(view, job)
+if job.kind ~= "read" then return false end
+view.readAt = app.clock(view)
+local answer = view.transport.request({command = "resources"}, stock.READ) or {}
+app.noteLink(view, answer)
+if answer.status == app.COMPLETED and type(answer.groups) == "table" then
+view.groups, view.readWhy = answer.groups, nil
+view.offer = view.offer or {name = "resources"}
+else
+view.readWhy = tostring(answer.reason or answer.status or "no answer")
+end
+return true
+end
+
+local function net(g)
+local n = g.net or 0
+if math.abs(n) < 0.05 then return "" end
+if math.abs(n) >= 10 then return ("%+d/m"):format(math.floor(n + 0.5)) end
+return ("%+.1f/m"):format(n)
+end
+
+local function entries(view)
+local sorted = {}
+for _, g in ipairs(view.groups or {}) do sorted[#sorted + 1] = g end
+table.sort(sorted, function(a, b)
+local oa, ob = res.ORDER[a.state] or 9, res.ORDER[b.state] or 9
+if oa ~= ob then return oa < ob end
+return a.id < b.id
+end)
+local out = {}
+for _, g in ipairs(sorted) do
+out[#out + 1] = {value = g.id,
+label = ("%s %-10s %5s/%-5s %6s %s"):format(res.MARK[g.state] or "?",
+tostring(g.name):sub(1, 10), res.amount(g.held),
+g.goal and res.amount(g.goal.target) or "-", net(g), res.doing(view, g)),
+chip = res.CHIP[g.state] or "gray"}
+end
+return out
+end
+
+function stock.document(view, width, height)
+local open = doc.button("Resources", {key = "r", colour = "action",
+action = {kind = "goto"}, keep = 3, name = "goto-resources"})
+local rows = {app.header(view, "STOCK", open), doc.rule({keep = 2})}
+if not view.groups then
+rows[#rows + 1] = doc.text(view.readWhy and ("the controller refused: "
+.. view.readWhy) or "reading..", {colour = view.readWhy and "bad" or "dim",
+wrap = true, keep = doc.REQUIRED, name = "read-state"})
+else
+local list = entries(view)
+if #list == 0 then
+rows[#rows + 1] = doc.text(" nothing is kept yet -- groups are set in Resources",
+{colour = "dim", wrap = true, keep = 20, name = "empty"})
+end
+for _, row in ipairs(app.listRows(view.list, list, "group",
+function(entry) return {kind = "open", id = entry.value} end,
+{limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.spacer()
+return doc.stack(rows, {name = "stock"})
+end
+
+function stock.settle(view, report) return app.settle(view.list, report, "group") end
+
+function stock.act(view, action)
+local kind = action and action.kind
+if app.page(view.list, kind, action) then return true end
+if kind == "open" then
+view.jump = {app = "resources", action = {kind = "open", id = action.id}}
+return true
+elseif kind == "goto" then
+view.jump = {app = "resources", action = {kind = "show", screen = "list"}}
+return true
+end
+return false
+end
+
+function stock.searching(view) return view.groups and view.list or nil end
+
+function stock.keyboard(view, event)
+if not event then return false end
+local list = stock.searching(view)
+if list then return app.type(list, event) end
+return false
+end
+
+function stock.handle(view, event, grid)
+local took, chose = stock.keyboard(view, event)
+if took then
+if chose then stock.act(view, chose) end
+return true
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return stock.act(view, action)
+end
+
+return stock
