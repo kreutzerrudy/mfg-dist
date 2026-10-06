@@ -1,0 +1,55 @@
+local rpc = require("mfg.common.rpc")
+local resources = require("mfg.controller.resources")
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "set_resource",
+label       = "Set a resource group",
+tier        = "node",
+destructive = false,
+
+parameters = {
+{name = "id", label = "Group", type = "number", integer = true, min = 1,
+required = false, help = "The group to change; omit for a new one."},
+{name = "name", label = "Name", type = "text", required = false},
+{name = "unit", label = "Unit", type = "item", required = false,
+help = "The form people use, e.g. the ingot."},
+{name = "forms", label = "Forms", type = "table", required = false,
+help = "The group's other items: packed and input forms."},
+{name = "keep", label = "Keep loose", type = "number", integer = true, min = 0,
+max = 1000000, required = false},
+{name = "low", label = "Unpack below", type = "number", integer = true, min = 0,
+max = 1000000, required = false},
+{name = "target", label = "Target", type = "number", integer = true, min = 0,
+max = 1000000, required = false,
+help = "What gathering aims for, loose and packed together; 0 clears it."},
+{name = "gather", label = "Gather below", type = "number", integer = true, min = 0,
+max = 1000000, required = false},
+{name = "horizon", label = "Horizon", type = "number", integer = true, min = 1,
+max = 1440, required = false, help = "Minutes to reach the target in."},
+{name = "enabled", label = "On", type = "flag", required = false},
+{name = "link", label = "Link forms", type = "flag", required = false,
+help = "Add every form the book links that no other group holds."},
+{name = "auto", label = "With its channels", type = "flag", required = false,
+help = "A new group comes with every channel it could have; false for none."},
+},
+
+returns = {group = "table"},
+
+run = function(params, ctx)
+if not params.id and not params.unit then
+return rpc.REJECTED, {reason = "a new group needs a unit item"}
+end
+local group, why = resources.set(params, ctx and ctx.by)
+if not group then return rpc.REJECTED, {reason = tostring(why)} end
+return rpc.COMPLETED, {group = group}
+end,
+}
