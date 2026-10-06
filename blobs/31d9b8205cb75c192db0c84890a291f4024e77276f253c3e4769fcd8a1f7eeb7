@@ -1,0 +1,480 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+local validate = require("mfg.common.actions.validate")
+
+local order = {}
+
+order.ACTION = "make"
+
+order.OFFER_RETRY = 5
+order.OFFER_REFRESH = 30
+order.JOBS_EVERY = 5
+
+
+
+
+order.READ = {timeout = 3, attempts = 2}
+order.MAKE = {timeout = 10, attempts = 1}
+
+
+
+function order.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+
+offer = nil,
+offerWhy = nil,
+offerAskedAt = nil,
+recipes = {},
+recipe = nil,
+quantity = 1,
+list = app.newList(),
+
+confirming = nil,
+sending = nil,
+result = nil,
+
+jobs = nil,
+jobsWhy = nil,
+jobsAt = nil,
+
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+order.parameter = app.parameter
+
+local function clampQuantity(view, value)
+local param = app.parameter(view, "quantity")
+return app.clamp(value, param and param.min or 1, param and param.max or 4096)
+end
+
+local function labelOf(view, id)
+for _, entry in ipairs(view.recipes) do
+if entry.value == id then return entry.label end
+end
+return tostring(id)
+end
+
+
+function order.params(view)
+if not view.offer then return nil, "the controller has not said what it offers" end
+if #view.recipes == 0 then return nil, "no recipes yet -- register one" end
+if not view.recipe then return nil, "pick a recipe" end
+local checked, why = validate.check(view.offer,
+{recipe = view.recipe, quantity = view.quantity})
+if not checked then return nil, why end
+return checked
+end
+
+function order.blocked(view)
+if view.sending then return "an order is being sent" end
+local _, why = order.params(view)
+return why
+end
+
+
+
+function order.offerDue(view)
+if not view.offerAskedAt then return true end
+local every = view.offer and order.OFFER_REFRESH or order.OFFER_RETRY
+return (app.clock(view) - view.offerAskedAt) >= every * 1000
+end
+
+function order.jobsDue(view)
+if not view.offer then return false end
+if not view.jobsAt then return true end
+return (app.clock(view) - view.jobsAt) >= order.JOBS_EVERY * 1000
+end
+
+
+
+function order.refresh(view)
+view.offerAskedAt = nil
+view.jobsAt = nil
+end
+
+function order.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+if order.offerDue(view) then return {kind = "offer"} end
+if order.jobsDue(view) then return {kind = "jobs"} end
+return nil
+end
+
+
+
+local function recipeRows(view, height)
+if #view.recipes == 0 then
+return {doc.text("no recipes yet -- register one in the Register app",
+{colour = "warn", wrap = true, keep = 20, name = "no-recipes"})}
+end
+local entries = {}
+for _, entry in ipairs(view.recipes) do
+entries[#entries + 1] = {value = entry.value, label = entry.label or entry.value,
+selected = view.recipe == entry.value}
+end
+
+
+return app.listRows(view.list, entries, "recipe",
+function(entry) return {kind = "recipe", recipe = entry.value} end,
+{arrows = true, limit = height})
+end
+
+
+
+function order.productOf(view)
+for _, entry in ipairs(view.recipes or {}) do
+if entry.value == view.recipe then
+return tostring(entry.label or ""):match("%-> %d+ (%S+)$")
+end
+end
+return nil
+end
+
+local function actionRow(view)
+local blocked = order.blocked(view)
+return doc.row({
+doc.gap(1),
+doc.button("Make", {key = (not blocked) and "enter" or nil,
+colour = blocked and "dim" or "good",
+action = (not blocked) and {kind = "make"} or nil,
+keep = doc.REQUIRED, name = "make"}),
+doc.gap(1),
+
+doc.button("Keep stocked", {colour = order.productOf(view) and "action" or "dim",
+action = order.productOf(view) and {kind = "keep"} or nil, keep = 5,
+name = "keep"}),
+doc.gap(1),
+doc.text(blocked or "", {colour = "dim", truncate = doc.TRUNCATED, keep = 4,
+name = "why-blocked"}),
+}, {keep = doc.REQUIRED, name = "actions"})
+end
+
+local function confirmRows(view)
+local question
+if view.confirming.cancel then
+question = ("Cancel job %d?"):format(view.confirming.cancel)
+else
+local params = view.confirming.make
+question = ("Make %d of %s?"):format(params.quantity, labelOf(view, params.recipe))
+end
+local note = view.confirming.cancel
+and "A batch already running finishes first; nothing after it runs."
+or "Queues a job. The controller crafts it, and the ingredients it makes too."
+return {
+doc.text(question, {colour = "title", wrap = true, keep = doc.REQUIRED,
+name = "confirm"}),
+doc.text(note, {colour = "text", wrap = true, keep = 6, name = "note"}),
+doc.row({
+doc.button("yes", {key = "y", colour = "good", action = {kind = "yes"},
+keep = doc.REQUIRED, name = "yes"}),
+doc.gap(1),
+doc.button("no", {key = "n", colour = "bad", action = {kind = "no"},
+keep = doc.REQUIRED, name = "no"}),
+}, {keep = doc.REQUIRED, name = "confirm-actions"}),
+}
+end
+
+
+
+
+local function statusRow(view)
+local function line(text, colour)
+return doc.text(" " .. text, {colour = colour, wrap = true,
+keep = app.KEEP_STATUS, name = "status"})
+end
+if view.sending then
+local seconds = math.floor((app.clock(view) - view.sending.since) / 1000)
+return line(("ordering %d of %s.. %ds"):format(view.sending.params.quantity,
+labelOf(view, view.sending.params.recipe), seconds), "warn")
+end
+local result = view.result
+if not result then return doc.text("", {colour = "dim", keep = 1, name = "status"}) end
+
+local fields = result.fields or {}
+if result.status == app.COMPLETED and result.kind == "make" then
+local steps = {}
+for _, step in ipairs(fields.steps or {}) do
+steps[#steps + 1] = ("%s x%d"):format(tostring(step.label), step.sets)
+end
+return line(("job %d queued: %d sets -> %d %s (%s)"):format(
+fields.job or 0, fields.sets or 0, fields.yield or 0,
+app.shortName(fields.product), table.concat(steps, ", ")), "good")
+elseif result.status == app.COMPLETED then
+return line(("job %d cancelled"):format(result.job or 0), "good")
+elseif result.status == app.TIMED_OUT then
+return line(("no answer from %s -- it may or may not have been queued; "
+.. "the jobs below will say"):format(view.host), "warn")
+end
+return line("refused: " .. tostring(result.reason), "bad")
+end
+
+
+local function describeJob(job)
+local state = tostring(job.state)
+if job.state == "blocked" then
+return ("blocked: %s"):format(tostring(job.reason))
+elseif job.state == "waiting" then
+
+return tostring(job.reason or "waiting")
+elseif job.state == "queued" or job.state == "running" then
+local step = job.step
+return ("%s step %d/%d%s"):format(state, job.position or 1, job.steps or 1,
+step and (" %s %d/%d"):format(tostring(step.label), step.done or 0,
+step.sets or 0) or "")
+end
+return state
+end
+
+local OPEN = {queued = true, running = true, blocked = true, waiting = true}
+
+local function jobRows(view)
+local rows = {}
+if view.jobsWhy and not view.jobs then
+rows[#rows + 1] = doc.text("jobs: " .. view.jobsWhy, {colour = "bad",
+truncate = doc.TRUNCATED, keep = 2, name = "jobs-why"})
+return rows
+end
+if not view.jobs or #view.jobs == 0 then return rows end
+
+rows[#rows + 1] = doc.rule({keep = 3})
+
+if view.threads and #view.threads > 0 then
+local cells = {}
+for _, thread in ipairs(view.threads) do
+cells[#cells + 1] = thread.state == "busy"
+and (thread.job and ("%s #%d"):format(thread.id, thread.job)
+or (thread.id .. " busy"))
+or (thread.state == "offline" and (thread.id .. " off")
+or (thread.id .. " idle"))
+end
+rows[#rows + 1] = doc.text(" " .. table.concat(cells, " | "), {colour = "dim",
+truncate = doc.TRUNCATED, keep = 2, name = "threads"})
+end
+local shown = 0
+for index = #view.jobs, 1, -1 do
+local job = view.jobs[index]
+shown = shown + 1
+local children = {
+doc.text(("#%d %s %s%s"):format(job.id, tostring(job.label or
+app.shortName(job.product)), describeJob(job),
+(job.running or 0) > 1 and (" (%d running)"):format(job.running) or ""),
+{width = "fill", truncate = doc.TRUNCATED,
+colour = job.state == "blocked" and "warn"
+or (OPEN[job.state] and "text" or "dim"),
+name = "job:" .. job.id}),
+}
+if OPEN[job.state] then
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = doc.button("x", {colour = "bad",
+action = {kind = "cancel", job = job.id}, name = "cancel:" .. job.id})
+end
+
+rows[#rows + 1] = doc.row(children, {keep = math.max(1, 3 - shown),
+name = "jobrow:" .. job.id})
+end
+return rows
+end
+
+function order.document(view, width, height)
+local rows = {app.header(view, "ORDER"), doc.rule({keep = 2})}
+
+if not view.offer then
+rows[#rows + 1] = doc.text(view.offerWhy
+and ("the controller refused: " .. tostring(view.offerWhy))
+or "asking the controller what it offers..",
+{colour = view.offerWhy and "bad" or "dim", wrap = true,
+keep = doc.REQUIRED, name = "offer-state"})
+elseif view.confirming then
+for _, row in ipairs(confirmRows(view)) do rows[#rows + 1] = row end
+else
+for _, row in ipairs(recipeRows(view, height)) do rows[#rows + 1] = row end
+
+
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = app.quantityRow(view.quantity, not view.sending, nil, 1)
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "between-controls"})
+rows[#rows + 1] = actionRow(view)
+end
+
+rows[#rows + 1] = statusRow(view)
+for _, row in ipairs(jobRows(view)) do rows[#rows + 1] = row end
+rows[#rows + 1] = doc.spacer()
+return doc.stack(rows, {name = "order"})
+end
+
+function order.settle(view, report)
+return app.settle(view.list, report, "recipe")
+end
+
+
+
+function order.act(view, action)
+local kind = action and action.kind
+
+if app.page(view.list, kind, action) then return true end
+if kind == "recipe" then
+view.recipe = action.recipe
+return true
+elseif kind == "delta" then
+view.quantity = clampQuantity(view, view.quantity + (action.n or 0))
+return true
+elseif kind == "keep" then
+local item = order.productOf(view)
+if not item then return false end
+view.jump = {app = "resources", action = {kind = "for-item", item = item,
+target = view.quantity}}
+return true
+elseif kind == "make" then
+local params, why = order.params(view)
+if not params then
+view.result = {status = app.REJECTED, reason = why}
+return true
+end
+view.confirming = {make = params}
+return true
+elseif kind == "cancel" then
+view.confirming = {cancel = action.job}
+return true
+elseif kind == "yes" then
+local confirmed = view.confirming
+view.confirming = nil
+if confirmed and confirmed.make then
+app.ask(view, {kind = "make", params = confirmed.make})
+elseif confirmed and confirmed.cancel then
+app.ask(view, {kind = "cancel", job = confirmed.cancel})
+end
+return true
+elseif kind == "no" then
+view.confirming = nil
+return true
+end
+return false
+end
+
+
+function order.searching(view)
+if view.offer and not view.confirming and #view.recipes > 0 then return view.list end
+return nil
+end
+
+
+function order.handle(view, event, grid)
+if order.searching(view) then
+local took, chose = app.type(view.list, event)
+if took then
+if chose then order.act(view, chose) end
+return true
+end
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return order.act(view, action)
+end
+
+
+
+function order.exchange(view, job)
+local body, opts
+if job.kind == "offer" then
+view.offerAskedAt = app.clock(view)
+body, opts = {command = "offer", name = order.ACTION}, order.READ
+elseif job.kind == "jobs" then
+view.jobsAt = app.clock(view)
+body, opts = {command = "jobs"}, order.READ
+elseif job.kind == "make" then
+body = {command = "make", recipe = job.params.recipe,
+quantity = job.params.quantity}
+opts = order.MAKE
+view.sending = {params = job.params, since = app.clock(view)}
+view.result = nil
+elseif job.kind == "cancel" then
+body, opts = {command = "cancel_job", job = job.job}, order.MAKE
+else
+return false
+end
+
+local answer = view.transport.request(body, opts) or {}
+order.apply(view, job, answer)
+return true
+end
+
+function order.apply(view, job, answer)
+app.noteLink(view, answer)
+
+if job.kind == "offer" then
+local decl = answer.status == app.COMPLETED
+and type(answer.actions) == "table" and answer.actions[1]
+if not decl then
+
+
+if not view.offer then
+view.offerWhy = answer.reason or answer.status or "no answer"
+end
+return
+end
+view.offer, view.offerWhy = decl, nil
+
+view.recipes = {}
+local param = app.parameter(view, "recipe")
+if param and type(param.choices) == "table" and not param.choices.source then
+for _, entry in ipairs(param.choices) do
+if type(entry) == "table" then
+view.recipes[#view.recipes + 1] = {value = entry.value,
+label = entry.label or entry.value}
+else
+view.recipes[#view.recipes + 1] = {value = entry, label = entry}
+end
+end
+end
+local still = false
+for _, entry in ipairs(view.recipes) do
+if entry.value == view.recipe then still = true end
+end
+if not still then view.recipe = nil end
+if not view.recipe and #view.recipes == 1 then
+view.recipe = view.recipes[1].value
+end
+view.quantity = clampQuantity(view, view.quantity)
+
+elseif job.kind == "jobs" then
+if answer.status == app.COMPLETED and type(answer.jobs) == "table" then
+view.jobs, view.jobsWhy = answer.jobs, nil
+view.threads = answer.threads
+else
+view.jobsWhy = tostring(answer.reason or answer.status or "no answer")
+end
+
+elseif job.kind == "make" or job.kind == "cancel" then
+view.sending = nil
+view.result = {kind = job.kind, status = answer.status or app.REJECTED,
+reason = answer.reason, fields = answer, job = job.job,
+at = app.clock(view)}
+app.sound(view, answer.status == app.COMPLETED and "done" or "refused")
+
+view.jobsAt = nil
+end
+end
+
+return order

@@ -1,0 +1,285 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local pattern = require("mfg.common.pattern")
+local turtles = require("mfg.controller.turtles")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local CONTROL = "mfg-control"
+
+
+local function sortedItems(counts)
+local names = {}
+for item in pairs(counts) do names[#names + 1] = item end
+table.sort(names)
+return names
+end
+
+local decl = {
+name        = "run_batch",
+label       = "Run a batch",
+role        = "turtle",
+tier        = "orchestrated",
+
+
+uses        = {"count", "arrange", "craft", "drain"},
+manual      = true,
+
+destructive = true,
+requires    = {state = "idle"},
+
+parameters = {
+{name = "target", label = "Node", type = "node", required = true,
+choices = {source = "nodes"},
+help = "The crafter's id. Its inventory is the volume /<id>, bound to its "
+.. "name on the wired network."},
+
+{name = "pattern_id", label = "Pattern", type = "text", required = true,
+help = "Names the arrangement -- usually the recipe id -- for the journal."},
+
+{name = "pattern", label = "Slots", type = "pattern", required = true,
+help = "Grid slot to item."},
+
+{name = "amount", label = "Sets", type = "number", integer = true,
+min = 1, max = 64, required = true,
+help = "How many sets to craft. One set is the pattern filled once. 64 is "
+.. "the deepest a slot can be filled, so 65 is two batches."},
+
+{name = "source", label = "Source", type = "path", required = false,
+choices = {source = "volumes"},
+help = "The volume to draw from and return to. Defaults to the node "
+.. "record's source, then /pool."},
+},
+
+returns = {
+delivered = "items", depth = "number",
+produced = "items", consumed = "items", collected = "items",
+},
+}
+
+
+
+local function volumeOf(node, ctx)
+local path = turtles.volumeOf(node.id)
+if node.inventory then return path end
+local points = turtles.points(node, {timeout = 3, attempts = 2})
+if not points then
+return nil, ("%s is not answering, and its inventory isn't bound yet")
+:format(node.id)
+end
+if not points.inventory then
+return nil, ("%s has no wired modem beside it -- place one, right-click it, "
+.. "and its inventory binds on the next batch"):format(node.id)
+end
+local bound, why = turtles.setInventory(node.id, points.inventory)
+if not bound then return nil, why end
+return path
+end
+
+local function batch(params, ctx)
+
+
+local node = turtles.get(params.target)
+if not node then
+return rpc.REJECTED, {reason = "no such node: " .. params.target}
+end
+if type(node.host) ~= "string" or node.host == "" then
+return rpc.REJECTED, {reason = ("%s has no host to reach it at")
+:format(params.target)}
+end
+local crafter, unbound = volumeOf(node, ctx)
+if not crafter then return rpc.REJECTED, {reason = unbound} end
+
+
+
+local source = params.source or node.source
+or require("mfg.common.config").setting("source")
+
+
+
+local slots = params.pattern
+local requirement = {}
+for item, perSet in pairs(pattern.occurrences(slots)) do
+requirement[item] = perSet * params.amount
+end
+local items = sortedItems(requirement)
+
+
+
+local short = {}
+for _, item in ipairs(items) do
+local status, fields = actions.invoke("count",
+{path = source, item = item}, ctx)
+if status ~= rpc.COMPLETED then
+return rpc.REJECTED, {reason = ("could not count %s in %s: %s")
+:format(item, source, tostring(fields.reason))}
+end
+if fields.count < requirement[item] then
+short[item] = {wanted = requirement[item], have = fields.count}
+end
+end
+
+if next(short) then
+local parts = {}
+for _, item in ipairs(sortedItems(short)) do
+parts[#parts + 1] = ("%s wants %d, holds %d"):format(
+item, short[item].wanted, short[item].have)
+end
+return rpc.REJECTED, {
+reason = ("%s is short for %d sets of %s: %s -- nothing moved")
+:format(source, params.amount, params.pattern_id,
+table.concat(parts, "; ")),
+short = short,
+}
+end
+
+
+
+
+
+
+
+
+local result = {
+target = params.target, pattern_id = params.pattern_id,
+amount = params.amount, source = source, delivered = {},
+}
+
+local function settle(status, fields)
+local outStatus, outFields = actions.invoke("drain",
+{from = crafter, to = source}, ctx)
+if outStatus == rpc.COMPLETED then fields.collected = outFields.drained end
+
+
+
+
+
+if outStatus == rpc.COMPLETED
+and source == require("mfg.common.config").setting("source") then
+local flows = require("mfg.controller.flows")
+local who = "turtle:" .. tostring(params.target)
+local net = {}
+for item, n in pairs(fields.collected or {}) do net[item] = n end
+for item, n in pairs(result.delivered or {}) do
+net[item] = (net[item] or 0) - n
+end
+for item, n in pairs(net) do
+if n > 0 then flows.add(item, n, "in", who)
+elseif n < 0 then flows.add(item, -n, "out", who) end
+end
+end
+
+
+
+
+if outStatus ~= rpc.COMPLETED then
+fields.step = fields.step or "collect"
+local why = ("collect %s: %s -- it stays in the turtle until the next "
+.. "batch drains it"):format(crafter, tostring(outFields.reason))
+fields.reason = fields.reason and (fields.reason .. "; " .. why) or why
+return status == rpc.TIMED_OUT and status or rpc.REJECTED, fields
+end
+return status, fields
+end
+
+
+
+
+
+local function failed(step, status, why, detail)
+result.step = step
+result.reason = ("%s: %s"):format(step, tostring(why))
+if detail then result.detail = detail end
+if status ~= rpc.TIMED_OUT then status = rpc.REJECTED end
+return settle(status, result)
+end
+
+
+local clearStatus, cleared = actions.invoke("drain",
+{from = crafter, to = source}, ctx)
+if clearStatus ~= rpc.COMPLETED then
+return rpc.REJECTED, {step = "clear", reason = ("%s holds something that "
+.. "can't go home: %s"):format(crafter, tostring(cleared.reason))}
+end
+if next(cleared.drained or {}) then result.cleared = cleared.drained end
+
+
+
+
+
+local grid = {}
+for slot, item in pairs(slots) do grid[slot] = item end
+local status, placed = actions.invoke("arrange", {from = source, to = crafter,
+pattern = grid, sets = params.amount}, ctx)
+result.delivered = placed and placed.delivered or {}
+if status ~= rpc.COMPLETED then
+return failed("arrange", status, placed and placed.reason)
+end
+result.depth = placed.depth
+
+
+
+local body = {command = "craft", operator = ctx.operator, policy = ctx.policy}
+local sent, fields = actions.invoke("transmit", {
+target = node.host,
+protocol = CONTROL,
+content = textutils.serialize(body),
+}, ctx)
+local reply = fields.reply or {}
+if sent ~= rpc.COMPLETED then return failed("craft", sent, fields.reason) end
+result.produced = reply.produced
+result.consumed = reply.consumed
+
+
+
+return settle(rpc.COMPLETED, result)
+end
+
+
+
+
+
+decl.run = function(params, ctx)
+local claimed, holder = turtles.claim(params.target,
+ctx.policy or ctx.by or "a batch")
+if not claimed then
+return rpc.REJECTED, {reason = ("%s is busy with a batch for %s")
+:format(params.target, holder)}
+end
+local result = table.pack(pcall(batch, params, ctx))
+turtles.release(params.target)
+if not result[1] then error(result[2], 0) end
+return table.unpack(result, 2, result.n)
+end
+
+return decl

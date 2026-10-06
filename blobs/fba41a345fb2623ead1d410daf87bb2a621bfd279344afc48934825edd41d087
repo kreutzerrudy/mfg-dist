@@ -1,0 +1,52 @@
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+
+
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "arrange",
+label       = "Place a crafting grid",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "from", label = "From", type = "path", required = true,
+choices = {source = "volumes"},
+help = "The volume to take the ingredients from."},
+
+{name = "to", label = "Crafter", type = "path", required = true,
+choices = {source = "volumes"},
+help = "The crafter's inventory -- one turtle on the wired network."},
+
+{name = "pattern", label = "Slots", type = "pattern", required = true,
+help = "Grid slot to item."},
+
+{name = "sets", label = "Sets", type = "number", integer = true,
+min = 1, max = 64, required = true,
+help = "How deep to fill each slot. A slot that takes fewer limits the rest."},
+},
+
+returns = {depth = "number", placed = "table", delivered = "items"},
+
+run = function(params)
+local placed, why = store.arrange(params.from, params.to, params.pattern,
+params.sets)
+if not placed then return rpc.REJECTED, {reason = tostring(why)} end
+if placed.depth < 1 then
+return rpc.REJECTED, {reason = placed.why, depth = 0,
+placed = placed.placed, delivered = placed.delivered}
+end
+return rpc.COMPLETED, {depth = placed.depth, placed = placed.placed,
+delivered = placed.delivered}
+end,
+}

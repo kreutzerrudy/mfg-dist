@@ -1,0 +1,203 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local hal = require("mfg.common.hal")
+local state = require("mfg.common.state")
+local pattern = require("mfg.common.pattern")
+local pointlist = require("mfg.common.points")
+local bootinfo = require("mfg.common.bootinfo")
+local equipment = require("mfg.common.equipment")
+
+local node = {}
+
+local STATE_FILE = "turtle"
+
+
+
+node.OUTPUT_SLOT = 16
+
+
+node.IDLE = "idle"
+node.FAULTED = "faulted"
+
+local current = nil
+
+local function fresh()
+return {
+state = node.IDLE,
+fault = nil,
+heartbeat = os.epoch("utc"),
+}
+end
+
+
+
+
+local STATE_OPTS = {schema = 2, migrate = function(value)
+value.pattern, value.pattern_id = nil, nil
+return value
+end}
+
+function node.load()
+local why
+current, why = state.read(STATE_FILE, nil, STATE_OPTS)
+if type(current) ~= "table" then
+current = fresh()
+if why then
+current.state = node.FAULTED
+current.fault = "persisted state refused: " .. why
+end
+end
+return current
+end
+
+
+node.POINTS_VERSION = pointlist.VERSION
+
+function node.points()
+if not current then node.load() end
+current.heartbeat = os.epoch("utc")
+local hw = hal.turtle()
+
+
+local boot = bootinfo.points()
+return {
+points_version = node.POINTS_VERSION,
+firmware = boot.firmware,
+config_rev = boot.config_rev,
+boot_state = boot.boot_state,
+equipment_missing = boot.equipment_missing,
+state = current.state,
+fault = current.fault,
+heartbeat = current.heartbeat,
+fuel = hw.fuelLevel(),
+
+
+
+inventory = hw.networkName and hw.networkName() or nil,
+held = hw.held and hw.held() or nil,
+}
+end
+
+local function persist()
+state.write(STATE_FILE, current, STATE_OPTS)
+end
+
+local function setState(name, fault)
+current.state = name
+current.fault = fault
+persist()
+end
+
+function node.state()
+if not current then node.load() end
+return current.state
+end
+
+
+
+
+
+function node.selfCheck()
+local hw = hal.turtle()
+local problems = {}
+
+local seen = hw.surroundings and hw.surroundings() or {}
+seen.inventory = hw.networkName and hw.networkName() or nil
+if not seen.inventory then
+problems[#problems + 1] = "no wired modem beside it -- place one on any face "
+.. "and right-click it"
+end
+
+local fuel = hw.fuelLevel()
+if fuel ~= "unlimited" and fuel == 0 then
+problems[#problems + 1] = "out of fuel"
+end
+
+
+
+
+
+local fitted, unread = equipment.read(hw)
+if fitted then
+local doc = require("mfg.common.config").current()
+local required = doc and doc.equipment or require("mfg.common.roles").turtle.equipment
+seen.equipment = fitted
+seen.missing = equipment.missing(required, fitted)
+for _, id in ipairs(seen.missing) do
+problems[#problems + 1] = "not fitted: " .. id
+end
+else
+problems[#problems + 1] = "cannot read equipment: " .. tostring(unread)
+end
+
+return #problems == 0, problems, seen
+end
+
+
+
+function node.clearFault()
+if not current then node.load() end
+if current.state ~= node.FAULTED then return false, "not faulted" end
+setState(node.IDLE, nil)
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+function node.craft()
+if not current then node.load() end
+
+local hw = hal.turtle()
+local before = pattern.totals(hw.slots())
+if next(before) == nil then return false, "holding nothing to craft" end
+
+
+hw.select(node.OUTPUT_SLOT)
+
+local valid, validErr = hw.craft(0)
+if not valid then
+return false, "rejected: " .. tostring(validErr)
+end
+
+local crafted, craftErr = hw.craft()
+if not crafted then
+return false, tostring(craftErr)
+end
+
+local after = pattern.totals(hw.slots())
+
+local produced, consumed = {}, {}
+for item, count in pairs(after) do
+local had = before[item] or 0
+if count > had then produced[item] = count - had end
+end
+for item, count in pairs(before) do
+local left = after[item] or 0
+if left < count then consumed[item] = count - left end
+end
+
+return true, {produced = produced, consumed = consumed}
+end
+
+return node

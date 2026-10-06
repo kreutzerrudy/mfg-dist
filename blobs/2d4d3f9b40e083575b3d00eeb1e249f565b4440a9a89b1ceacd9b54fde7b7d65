@@ -1,0 +1,48 @@
+
+
+
+
+
+
+
+
+
+local services = require("mfg.common.services")
+
+local turtle = {}
+
+function turtle.declare(manager, ctx)
+local node = require("mfg.turtle.node")
+
+
+node.load()
+
+
+
+services.declare(manager, {
+name = "control",
+critical = true,
+requires = {"netstack"},
+ready = ctx.admitted,
+start = function()
+local net = require("net")
+local actions = require("mfg.common.actions")
+local rtu = require("mfg.turtle.rtu")
+
+
+
+ctx.bind({"mfg-control", "mfg-report"})
+print("serving -- state: " .. node.state())
+
+
+
+
+
+while true do
+actions.invoke("serve_control", {once = true}, {legacy = rtu.handle})
+end
+end,
+})
+end
+
+return turtle

@@ -1,0 +1,35 @@
+
+
+
+
+
+
+
+local points = {}
+
+
+
+
+
+
+
+
+
+points.VERSION = 6
+
+
+
+
+points.DRIVABLE = 6
+
+
+
+function points.understood(version)
+return type(version) == "number" and version <= points.VERSION
+end
+
+function points.outdated(version)
+return type(version) == "number" and version < points.DRIVABLE
+end
+
+return points

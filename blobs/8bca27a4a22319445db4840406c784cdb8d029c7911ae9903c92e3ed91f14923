@@ -1,0 +1,47 @@
+local rpc = require("mfg.common.rpc")
+local dispatch = require("mfg.controller.dispatch")
+
+
+
+
+
+
+
+return {
+name        = "jobs",
+label       = "The job queue",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {},
+
+returns = {jobs = "table", threads = "table"},
+
+run = function()
+local runner = require("mfg.controller.runner")
+local out = {}
+for _, job in ipairs(dispatch.jobs()) do
+local step = job.steps[job.position]
+out[#out + 1] = {
+id = job.id, label = job.label, product = job.product,
+requested = job.requested, yield = job.yield, by = job.by,
+state = job.state, position = job.position, steps = #job.steps,
+step = step and {label = step.label, sets = step.sets,
+done = job.stepDone or 0} or nil,
+reason = job.lastError, retryAt = job.retryAt,
+committed = job.committed, finished = job.finished,
+priority = job.priority,
+
+running = runner.running(job.id),
+}
+end
+
+local threads = {}
+for _, thread in ipairs(runner.threads()) do
+threads[#threads + 1] = {id = thread.id, state = thread.state,
+job = thread.job, sets = thread.sets}
+end
+return rpc.COMPLETED, {jobs = out, threads = threads}
+end,
+}
