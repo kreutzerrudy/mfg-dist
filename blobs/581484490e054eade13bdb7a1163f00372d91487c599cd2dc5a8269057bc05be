@@ -1,0 +1,269 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+local store = require("mfg.storage")
+local state = require("mfg.common.state")
+
+local turtles = {}
+
+local STATE_FILE = "turtles"
+local CONTROL = "mfg-control"
+
+
+
+
+
+
+
+
+
+
+
+function turtles.register(id, opts)
+local inPath = ("/%s/in"):format(id)
+local outPath = ("/%s/out"):format(id)
+
+store.declare(inPath, {node = id, role = "input"})
+store.declare(outPath, {node = id, role = "output"})
+
+
+
+
+if opts.input then
+store.bind(inPath, {opts.input}, {node = id, role = "input"})
+end
+if opts.output then
+store.bind(outPath, {opts.output}, {node = id, role = "output"})
+end
+
+local all = state.read(STATE_FILE, {})
+all[id] = {
+id = id,
+host = opts.host,
+input = inPath,
+output = outPath,
+source = opts.source,
+recipe = opts.recipe,
+
+
+
+
+label = opts.label or id,
+labelled = false,
+registered = os.epoch("utc"),
+}
+state.write(STATE_FILE, all)
+return all[id]
+end
+
+function turtles.all()
+return state.read(STATE_FILE, {})
+end
+
+function turtles.get(id)
+return turtles.all()[id]
+end
+
+
+
+
+
+
+
+
+
+
+function turtles.setTransit(id, seconds)
+local all = turtles.all()
+if not all[id] then return nil, "no such turtle: " .. tostring(id) end
+all[id].transit = seconds
+state.write(STATE_FILE, all)
+return all[id]
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function turtles.setPattern(id, patternId, pattern)
+local all = turtles.all()
+if not all[id] then return nil, "no such turtle: " .. tostring(id) end
+all[id].pattern_id = patternId
+all[id].pattern = pattern
+state.write(STATE_FILE, all)
+return all[id]
+end
+
+
+
+local function command(turtle, body, opts)
+return rpc.request(turtle.host, CONTROL, body, opts)
+end
+
+function turtles.points(turtle, opts)
+local answer = command(turtle, {command = "points"}, opts)
+if answer.status ~= rpc.COMPLETED then return nil, answer end
+return answer.points, answer
+end
+
+
+
+
+
+
+
+
+
+
+
+function turtles.setLabel(turtle, opts)
+opts = opts or {}
+local label = opts.label or turtle.label or turtle.id
+if not label then return false, "no label to set" end
+
+local answer = command(turtle, {command = "set_label", label = label}, opts)
+if not answer or answer.status ~= rpc.COMPLETED then
+return false, (answer and (answer.reason or answer.status)) or "no reply"
+end
+
+local confirmed = answer.label or label
+local all = turtles.all()
+if all[turtle.id] then
+all[turtle.id].label = confirmed
+all[turtle.id].labelled = true
+state.write(STATE_FILE, all)
+end
+return true, confirmed
+end
+
+function turtles.clearFault(turtle, opts)
+return command(turtle, {command = "clear_fault"}, opts)
+end
+
+
+
+
+function turtles.stop(turtle, opts)
+return command(turtle, {command = "stop"}, opts)
+end
+
+
+
+
+
+
+function turtles.observe(turtle, opts)
+local answer = command(turtle, {command = "probe_observe"}, opts)
+if answer.status ~= rpc.COMPLETED then return nil, answer end
+return answer.observed, answer
+end
+
+function turtles.emitMarker(turtle, marker, opts)
+local answer = command(turtle, {command = "probe_emit", marker = marker}, opts)
+if answer.status ~= rpc.COMPLETED then
+return false, answer.reason or answer.status
+end
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+function turtles.reachable(turtle, opts)
+opts = opts or {}
+local icmp = require("icmp")
+local net = require("net")
+
+local address = turtle.address
+if not address then
+address = net.resolve(turtle.host)
+if not address then return false, "cannot resolve " .. tostring(turtle.host) end
+end
+
+return icmp.reachable(address, {
+timeout = opts.timeout or 2,
+attempts = opts.attempts or 3,
+})
+end
+
+
+
+
+
+
+
+
+
+
+
+function turtles.condition(turtle, opts)
+local points = turtles.points(turtle, opts)
+if points then return "ok", points end
+
+local reachable = turtles.reachable(turtle, opts)
+if reachable then return "silent" end
+return "unreachable"
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+local busy = {}
+
+
+function turtles.claim(id, holder)
+if busy[id] then return nil, busy[id] end
+busy[id] = tostring(holder or "a batch")
+return true
+end
+
+function turtles.release(id)
+busy[id] = nil
+end
+
+
+function turtles.holder(id)
+return busy[id]
+end
+
+return turtles
