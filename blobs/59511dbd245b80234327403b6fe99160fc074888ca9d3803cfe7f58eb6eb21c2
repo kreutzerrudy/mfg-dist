@@ -1,0 +1,914 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+
+local bind = {}
+
+bind.EVERY = 3
+bind.FAST = 1
+bind.BACKGROUND = 30
+bind.READ = {timeout = 3, attempts = 2}
+bind.ACT = {timeout = 10, attempts = 1}
+
+bind.PRINT = {timeout = 30, attempts = 1}
+bind.NAME_LENGTH = 12
+
+local METHOD = {
+new = {label = "New device", colour = "selected",
+says = "Turn on the modem of the one block to bind; you say yes to what "
+.. "appeared."},
+show = {label = "Show me", colour = "good",
+says = "Put an item into it, or flip a lever on its wire; the one thing that "
+.. "changes is bound."},
+page = {label = "Page", colour = "action",
+says = "Print a page, take it from the tray, and drop it in the chest."},
+}
+
+function bind.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+
+data = nil,
+readAt = nil,
+readWhy = nil,
+offer = nil,
+
+screen = "list",
+list = app.newList(),
+chosen = nil,
+keepPages = true,
+lastShow = nil,
+walk = nil,
+make = nil,
+makeList = app.newList(),
+many = nil,
+kindList = app.newList(),
+newStore = nil,
+itemList = app.newList(),
+
+jump = nil,
+sending = nil,
+result = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+local function has(list, value)
+for _, v in ipairs(list or {}) do if v == value then return true end end
+return false
+end
+
+
+function bind.item(view, path)
+local data = view.data or {}
+for _, item in ipairs(data.todo or {}) do
+if item.path == path then return item end
+end
+for _, door in ipairs(data.doors or {}) do
+if door.path == path then return door end
+end
+return nil
+end
+
+
+local function nextOfWalk(view)
+for _, item in ipairs((view.data or {}).todo or {}) do
+if item.machine == view.walk and not item.pending then return item end
+end
+return nil
+end
+
+
+local function backToList(view)
+view.screen = "list"
+if not view.walk or not view.data then return end
+local item = nextOfWalk(view)
+if item then
+view.chosen, view.screen = item.path, "methods"
+else
+view.result = {text = ("every port of %s is bound or has a page out -- enable "
+.. "it in Machines"):format(view.walk), colour = "good"}
+view.walk = nil
+end
+end
+
+
+
+function bind.refresh(view)
+view.readAt = nil
+end
+
+function bind.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+local every = bind.EVERY
+if view.onScreen == false then
+every = bind.BACKGROUND
+elseif view.data and view.data.show then
+every = bind.FAST
+end
+if not view.readAt or app.clock(view) - view.readAt >= every * 1000 then
+return {kind = "read"}
+end
+return nil
+end
+
+function bind.exchange(view, job)
+local body, opts = nil, bind.READ
+if job.kind == "read" then
+view.readAt = app.clock(view)
+body = {command = "bind_pages"}
+elseif job.kind == "act" then
+body = {command = job.command, operator = true}
+for k, v in pairs(job.params) do body[k] = v end
+opts = job.opts or bind.ACT
+view.sending, view.result = job, nil
+else
+return false
+end
+bind.apply(view, job, view.transport.request(body, opts) or {})
+return true
+end
+
+
+local function noteLast(view)
+local last = view.data and view.data.last
+
+
+local id = last and last.id or false
+if id == view.lastShow then return end
+local first = view.lastShow == nil or view.skipLast
+view.lastShow, view.skipLast = id, nil
+if first or not last then return end
+view.result = {text = last.ok and last.text or ("not bound: " .. tostring(last.text)),
+colour = last.ok and "good" or "bad"}
+app.sound(view, last.ok and "done" or "refused")
+if view.screen == "flow" then
+if last.ok then backToList(view) else view.screen = "methods" end
+end
+end
+
+
+
+
+
+
+local function noteShow(view)
+local show = view.data and view.data.show
+local was = view.heard
+if not show then
+view.heard = nil
+return
+end
+local now = {id = show.id, state = show.state, made = #(show.made or {}),
+note = show.note}
+view.heard = now
+if not was or was.id ~= now.id then
+was = {id = now.id, made = 0}
+end
+if now.made > (was.made or 0) then
+app.sound(view, "ready")
+elseif now.note and now.note ~= was.note and show.mode == "many" then
+app.sound(view, "refused")
+elseif now.state == "confirm" and was.state ~= "confirm" then
+app.sound(view, "found")
+elseif now.state == "watching" and was.state ~= "watching" then
+app.sound(view, "ready")
+end
+end
+
+function bind.apply(view, job, answer)
+app.noteLink(view, answer)
+local ok = answer.status == app.COMPLETED
+if job.kind == "read" then
+if ok and type(answer.todo) == "table" then
+view.data = answer
+view.readWhy = nil
+view.offer = view.offer or {name = "bind_pages"}
+noteShow(view)
+noteLast(view)
+if view.walk and view.screen == "list" then backToList(view) end
+else
+view.readWhy = tostring(answer.reason or answer.status or "no answer")
+end
+return
+end
+view.sending = nil
+view.readAt = nil
+if not ok then
+view.result = answer.status == app.TIMED_OUT
+and {text = ("no answer from %s -- look again before asking again")
+:format(view.host), colour = "warn"}
+or {text = "refused: " .. tostring(answer.reason), colour = "bad"}
+app.sound(view, "refused")
+return
+end
+local command, params = job.command, job.params
+local text, colour = "done", "good"
+if command == "print_bind_pages" then
+local n = answer.count or 0
+text = ("printed %d page%s -- take %s from the tray and drop %s in the chest")
+:format(n, n == 1 and "" or "s", n == 1 and "it" or "them",
+n == 1 and "it" or "each")
+if answer.failed then text, colour = text .. "; not all: " .. answer.failed, "warn" end
+view.result = {text = text, colour = colour}
+backToList(view)
+elseif command == "show_me" then
+if params.cancel then
+view.result = {text = "stopped", colour = "text"}
+view.screen = "methods"
+elseif params.answer ~= nil then
+view.result = {text = tostring(answer.said or "done"),
+colour = params.answer and "good" or "text"}
+
+
+if answer.done then
+view.lastShow = nil
+view.skipLast = true
+if params.answer then backToList(view) else view.screen = "methods" end
+end
+else
+view.screen = "flow"
+if params.mode == "many" then view.many, view.make = nil, nil end
+end
+elseif command == "cancel_bind_page" then
+view.result = {text = ("cancelled %d page%s"):format(answer.cancelled or 0,
+answer.cancelled == 1 and "" or "s"), colour = "text"}
+elseif command == "add_store" then
+
+view.newStore = nil
+view.chosen, view.screen = answer.path, "methods"
+view.result = {text = ("made %s, holding %s -- now bind its drawer"):format(
+tostring(answer.path), tostring(params.holds)), colour = "good"}
+elseif command == "add_machines" then
+local made = answer.made or {}
+view.result = {text = ("made %d under /%s: %s"):format(#made, tostring(params.group),
+table.concat(made, ", ")), colour = (answer.failed and #answer.failed > 0)
+and "warn" or "good"}
+view.many, view.make, view.screen = nil, nil, "list"
+elseif command == "add_machine" then
+view.walk, view.make = params.machine, nil
+view.result = {text = ("made %s from %s -- now its ports, one at a time")
+:format(params.machine, params.script), colour = "good"}
+view.screen = "list"
+end
+app.sound(view, "done")
+end
+
+
+
+local function statusRow(view)
+local text, colour = "", "text"
+if view.sending then
+text, colour = ("asking %s.."):format(view.host), "warn"
+elseif view.result then
+text, colour = view.result.text, view.result.colour or "text"
+end
+return doc.text(" " .. text, {colour = colour, wrap = true, keep = app.KEEP_STATUS,
+name = "status"})
+end
+
+local function back(label, screen)
+return doc.button(label, {key = "<", action = {kind = "show", screen = screen},
+keep = doc.REQUIRED, name = "back"})
+end
+
+
+local function entryFor(item)
+if item.machine then
+local what = item.signal and "signal"
+or (item.kind == "inventory" and "machine slots" or "chest")
+return {value = item.path, label = ("%s %s"):format(item.machine, item.port),
+note = ("%s %s%s"):format(item.direction or "", what,
+item.pending and ", page out" or ""),
+chip = item.pending and "yellow" or "red"}
+end
+local note, chip
+if item.kind == "member" then
+note = ("%s, %d device%s"):format(item.holds and ("holds " .. item.holds)
+or "general", item.devices, item.devices == 1 and "" or "s")
+chip = item.devices > 0 and (item.holds and "cyan" or "lime") or "red"
+if item.pending then note = note .. ", page out" end
+return {value = item.path, label = item.path, note = note, chip = chip}
+end
+if item.kind == "pool" then
+note, chip = ("%d chest%s: add one"):format(item.devices,
+item.devices == 1 and "" or "s"), "lime"
+elseif item.devices > 0 then
+note, chip = "bound", "gray"
+else
+note, chip = "NOT BOUND", "red"
+end
+if item.pending then note = note .. ", page out" end
+return {value = item.path, label = item.path, note = note, chip = chip}
+end
+
+
+local function sessionRow(view)
+local show = view.data and view.data.show
+if not show then return nil end
+return doc.row({doc.gap(1), doc.button(("binding %s: %s -- open"):format(show.path,
+show.state == "confirm" and "found one, say yes or no" or "watching"), {
+colour = "warn", action = {kind = "show", screen = "flow"}, keep = 61,
+truncate = doc.TRUNCATED, name = "session"})}, {keep = 61, name = "session-row"})
+end
+
+local function listDocument(view, height)
+local control = doc.button("+ machine", {key = "+", colour = "selected",
+action = {kind = "open-make"}, keep = doc.REQUIRED, name = "open-make"})
+local rows = {app.header(view, "BIND", control), doc.rule({keep = 2})}
+if not view.data then
+rows[#rows + 1] = doc.text(view.readWhy and ("the controller refused: "
+.. view.readWhy) or "reading what is waiting..", {colour = view.readWhy
+and "bad" or "dim", wrap = true, keep = doc.REQUIRED, name = "read-state"})
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+rows[#rows + 1] = sessionRow(view)
+local entries = {}
+for _, item in ipairs(view.data.todo or {}) do entries[#entries + 1] = entryFor(item) end
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" every machine's ports are bound", {colour = "dim",
+keep = 20, name = "all-bound"})
+end
+for _, door in ipairs(view.data.doors or {}) do entries[#entries + 1] = entryFor(door) end
+for _, row in ipairs(app.listRows(view.list, entries, "bind",
+function(entry) return {kind = "pick", path = entry.value} end,
+{limit = height})) do
+rows[#rows + 1] = row
+end
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("+ store", {colour = "action",
+action = {kind = "open-store"}, keep = doc.REQUIRED, name = "open-store"})},
+{keep = doc.REQUIRED, name = "list-actions"})
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function methodsDocument(view)
+local rows = {app.header(view, "BIND " .. tostring(view.chosen), back("Bind", "list")),
+doc.rule({keep = 2})}
+local item = bind.item(view, view.chosen)
+if not item then
+rows[#rows + 1] = doc.text(view.data and (" " .. tostring(view.chosen)
+.. " is bound, or gone") or " reading..", {colour = "dim", wrap = true,
+keep = doc.REQUIRED, name = "gone"})
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+rows[#rows + 1] = doc.text(" " .. tostring(item.words or item.path), {colour = "title",
+wrap = true, keep = 50, name = "words"})
+if item.pending then
+rows[#rows + 1] = doc.row({doc.gap(1),
+doc.text("a page is out for this", {colour = "warn", keep = doc.REQUIRED,
+name = "page-out"}),
+doc.gap(1), doc.button("cancel page", {colour = "dim",
+action = {kind = "cancel-page", path = item.path}, keep = doc.REQUIRED,
+name = "cancel-page"})}, {keep = 45, name = "page-out-row"})
+end
+local busy = view.sending ~= nil or (view.data and view.data.show ~= nil)
+local printBlocked = view.data and view.data.printBlocked
+for index, method in ipairs(item.methods or {}) do
+local m = METHOD[method]
+if m then
+local blocked = busy or (method == "page" and printBlocked ~= nil)
+or (method == "page" and item.pending and item.kind ~= "pool")
+local children = {doc.gap(1), doc.button(m.label, {key = tostring(index),
+colour = blocked and "dim" or m.colour,
+action = (not blocked) and {kind = "method", method = method} or nil,
+keep = doc.REQUIRED, name = "method-" .. method})}
+if method == "page" then
+local keep = view.keepPages ~= false
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = doc.button(keep and "keep page: yes"
+or "keep page: no", {colour = keep and "good" or "dim",
+action = {kind = "keep"}, keep = 4, name = "keep"})
+end
+rows[#rows + 1] = doc.row(children, {keep = 40 - index, name = "method:" .. method})
+rows[#rows + 1] = doc.text("   " .. (method == "page" and printBlocked
+or m.says), {colour = "dim", wrap = true, keep = 30 - index,
+name = "says:" .. method})
+end
+end
+if view.data and view.data.show then
+rows[#rows + 1] = sessionRow(view)
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+local function flowDocument(view)
+local show = view.data and view.data.show
+local rows = {app.header(view, "BIND " .. tostring(show and show.path or view.chosen),
+back("Back", "methods")), doc.rule({keep = 2})}
+if not show then
+
+rows[#rows + 1] = doc.text(view.sending and " starting.."
+or " nothing is being watched now -- < to go back", {colour = "dim",
+keep = doc.REQUIRED, name = "starting"})
+elseif show.state == "confirm" then
+rows[#rows + 1] = doc.text((" Found %s."):format(tostring(show.found)), {
+colour = "title", wrap = true, keep = doc.REQUIRED, name = "found"})
+rows[#rows + 1] = doc.text((" Bind it as %s?"):format(show.path), {colour = "text",
+wrap = true, keep = doc.REQUIRED, name = "question"})
+rows[#rows + 1] = doc.row({doc.gap(1),
+doc.button("bind it", {key = "enter", colour = "good",
+action = {kind = "answer", yes = true}, keep = doc.REQUIRED, name = "yes"}),
+doc.gap(1),
+doc.button("no", {key = "n", colour = "bad", action = {kind = "answer",
+yes = false}, keep = doc.REQUIRED, name = "no"})},
+{keep = doc.REQUIRED, name = "answers"})
+elseif show.state == "watching" then
+rows[#rows + 1] = doc.text(" " .. tostring(show.instructions), {colour = "warn",
+wrap = true, keep = doc.REQUIRED, name = "instructions"})
+rows[#rows + 1] = doc.text((" %d seconds left"):format(show.left or 0), {
+colour = "dim", keep = 40, name = "left"})
+if show.mode == "many" then
+local made = show.made or {}
+rows[#rows + 1] = doc.text((" made %d%s"):format(#made, #made > 0
+and (": " .. table.concat(made, ", ")) or ""), {colour = "good",
+wrap = true, keep = 45, name = "made"})
+if show.note then
+rows[#rows + 1] = doc.text(" " .. show.note, {colour = "text", wrap = true,
+keep = 44, name = "note"})
+end
+end
+else
+rows[#rows + 1] = doc.text(" hold on -- looking at what is there now..", {
+colour = "dim", wrap = true, keep = doc.REQUIRED, name = "settling"})
+end
+if show and show.lost then
+rows[#rows + 1] = doc.text((" careful: %s just lost its device -- was that the "
+.. "right modem?"):format(show.lost), {colour = "bad", wrap = true, keep = 45,
+name = "lost"})
+end
+rows[#rows + 1] = doc.spacer()
+if show then
+local many = show.mode == "many"
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button(many and "done" or "stop", {
+key = many and "d" or "s", colour = many and "good" or "bad",
+action = {kind = "stop"}, keep = doc.REQUIRED, name = "stop"})},
+{keep = doc.REQUIRED, name = "stop-row"})
+end
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+
+function bind.suggestName(view, script)
+local letter = (tostring(script):match("%a") or "m"):lower()
+local taken = {}
+for _, name in ipairs((view.data or {}).machines or {}) do taken[name] = true end
+local n = 1
+while taken[letter .. n] do n = n + 1 end
+return letter .. n
+end
+
+function bind.makeBlocked(view)
+local make = view.make
+if view.sending then return "asking the controller.." end
+if not make.script then return "choose a type above" end
+if make.name == "" then return "type a name: letters and digits, like h1" end
+return nil
+end
+
+local function makeDocument(view, height)
+local rows = {app.header(view, "MAKE A MACHINE", back("Bind", "list")),
+doc.rule({keep = 2})}
+local make = view.make
+local entries = {}
+for _, t in ipairs((view.data or {}).types or {}) do
+entries[#entries + 1] = {value = t.script, label = t.script,
+note = ("rev %d"):format(t.rev or 0), selected = make.script == t.script}
+end
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" no types yet -- write one in Machines > Types",
+{colour = "dim", wrap = true, keep = 20, name = "empty"})
+end
+for _, row in ipairs(app.listRows(view.makeList, entries, "make-type",
+function(entry) return {kind = "make-type", script = entry.value} end,
+{pickKeys = false, arrows = true, limit = height})) do
+rows[#rows + 1] = row
+end
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.text("name", {colour = "label", keep = doc.REQUIRED, name = "name-label"}),
+doc.gap(1),
+doc.text(" " .. make.name .. (make.script and "_" or ""), {width = 14,
+colour = make.script and "title" or "dim", bg = "field",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "make-name"}),
+}, {keep = doc.REQUIRED, name = "make-fields"})
+local why = bind.makeBlocked(view)
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("Make", {key = (not why) and "enter"
+or nil, colour = why and "dim" or "selected", action = (not why) and {kind = "make"}
+or nil, keep = doc.REQUIRED, name = "make"}),
+doc.gap(1), doc.button("Make several", {colour = make.script and "action" or "dim",
+action = make.script and {kind = "open-many"} or nil, keep = 5,
+name = "open-many"})}, {keep = doc.REQUIRED, name = "make-actions"})
+rows[#rows + 1] = doc.text(" " .. (why or "then its ports are offered one at a time"),
+{colour = "dim", wrap = true, keep = app.KEEP_STATUS - 1, name = "why-blocked"})
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+
+local function typeOf(view, script)
+for _, t in ipairs((view.data or {}).types or {}) do
+if t.script == script then return t end
+end
+return nil
+end
+
+
+function bind.manyBlocked(view)
+if view.sending then return "asking the controller.." end
+local t = typeOf(view, view.many.script)
+if t and t.slotted == false then
+return ("%s's ports have no slots yet: a furnace is feed slots 1, fuel slots 2, "
+.. "made slots 3. Click +slots on each port in the editor."):format(
+view.many.script)
+end
+if view.many.group == "" then return "type the group, like smelter" end
+return nil
+end
+
+local function manyDocument(view, height)
+local many = view.many
+local rows = {app.header(view, "SEVERAL " .. tostring(many.script), back("Back", "make")),
+doc.rule({keep = 2})}
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.text("group /", {colour = "label", keep = doc.REQUIRED, name = "group-label"}),
+doc.text(many.group .. "_", {width = 14, colour = "title", bg = "field",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "group"}),
+}, {keep = doc.REQUIRED, name = "group-row"})
+local letter = (tostring(many.script):match("%a") or "m"):lower()
+rows[#rows + 1] = doc.text((" named /%s/%s1, %s2 and on"):format(many.group, letter,
+letter), {colour = "dim", truncate = doc.TRUNCATED, keep = 30, name = "naming"})
+local why = bind.manyBlocked(view)
+rows[#rows + 1] = doc.text(" every unbound block of a kind:", {colour = "label",
+keep = 29, name = "kinds-label"})
+local entries = {}
+for _, k in ipairs((view.data or {}).kinds or {}) do
+entries[#entries + 1] = {value = k.kind, label = k.words,
+note = ("%d unbound"):format(k.count)}
+end
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" none unbound on the network", {colour = "dim",
+keep = 20, name = "no-kinds"})
+end
+for _, row in ipairs(app.listRows(view.kindList, entries, "kind",
+function(entry) return (not why) and {kind = "many-kind", block = entry.value} or nil end,
+{pickKeys = false, limit = height})) do
+rows[#rows + 1] = row
+end
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+local unslotted = (typeOf(view, many.script) or {}).slotted == false
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("One by one", {key = "enter",
+colour = why and "dim" or "selected",
+action = (not why) and {kind = "many-new"} or nil, keep = doc.REQUIRED,
+name = "many-new"}),
+doc.gap(1), doc.button("Edit the type", {
+colour = unslotted and "selected" or "action",
+action = {kind = "edit-type", script = many.script}, keep = 5,
+name = "edit-type"})}, {keep = doc.REQUIRED, name = "many-actions"})
+rows[#rows + 1] = doc.text(" " .. (why or "one by one: each modem you turn on is the "
+.. "next machine"), {colour = "dim", wrap = true, keep = app.KEEP_STATUS - 1,
+name = "why-blocked"})
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+
+function bind.storeName(holds)
+local word = tostring(holds):match("[^:/]+$") or "store"
+word = word:lower():gsub("[^a-z0-9_%-]", "_")
+return word:sub(1, bind.NAME_LENGTH)
+end
+
+function bind.storeBlocked(view)
+local st = view.newStore
+if view.sending then return "asking the controller.." end
+if not st.holds or st.holds == "" then return "pick what it holds, or type a tag" end
+if st.name == "" then return "type its name, like wood" end
+return nil
+end
+
+local function storeDocument(view, height)
+local st = view.newStore
+local rows = {app.header(view, "NEW STORE", back("Bind", "list")), doc.rule({keep = 2})}
+rows[#rows + 1] = doc.text(" What it holds -- an item from the pool:", {
+colour = "label", keep = 30, name = "holds-label"})
+local entries = {}
+for _, item in ipairs((view.data or {}).items or {}) do
+entries[#entries + 1] = {value = item.item, label = item.name,
+note = item.name ~= item.item and item.item or nil,
+chip = app.chipFor(item.item), selected = st.holds == item.item}
+end
+if #entries == 0 then
+rows[#rows + 1] = doc.text(" the pool holds nothing yet: type a tag below",
+{colour = "dim", keep = 20, name = "no-items"})
+end
+for _, row in ipairs(app.listRows(view.itemList, entries, "store-item",
+function(entry) return {kind = "store-item", item = entry.value} end,
+{pickKeys = false, arrows = true, limit = height})) do
+rows[#rows + 1] = row
+end
+rows[#rows + 1] = doc.text("", {keep = doc.REQUIRED, name = "above-controls"})
+local function field(label, value, which, width)
+local focused = st.field == which
+return {
+doc.text(label, {colour = "label", keep = doc.REQUIRED, name = which .. "-label"}),
+doc.gap(1),
+doc.text(" " .. value .. (focused and "_" or ""), {width = width,
+colour = focused and "title" or "text", bg = "field",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+action = {kind = "store-focus", field = which}, name = which}),
+}
+end
+local holdsRow = {doc.gap(1)}
+for _, child in ipairs(field("holds", st.holds or "", "holds", 24)) do
+holdsRow[#holdsRow + 1] = child
+end
+holdsRow[#holdsRow + 1] = doc.gap(1)
+holdsRow[#holdsRow + 1] = doc.text("(click to type a #tag)", {colour = "dim",
+truncate = doc.TRUNCATED, keep = 2, name = "tag-hint"})
+rows[#rows + 1] = doc.row(holdsRow, {keep = doc.REQUIRED, name = "holds-row"})
+local nameRow = {doc.gap(1)}
+for _, child in ipairs(field("name /pool/", st.name, "name", 14)) do
+nameRow[#nameRow + 1] = child
+end
+rows[#rows + 1] = doc.row(nameRow, {keep = doc.REQUIRED, name = "name-row"})
+local why = bind.storeBlocked(view)
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("Make store", {key = (not why)
+and "enter" or nil, colour = why and "dim" or "selected",
+action = (not why) and {kind = "make-store"} or nil, keep = doc.REQUIRED,
+name = "make-store"})}, {keep = doc.REQUIRED, name = "store-actions"})
+rows[#rows + 1] = doc.text(" " .. (why or "then bind its drawer; it takes only this, "
+.. "and backs up when full"), {colour = "dim", wrap = true,
+keep = app.KEEP_STATUS - 1, name = "why-blocked"})
+rows[#rows + 1] = statusRow(view)
+return rows
+end
+
+function bind.document(view, width, height)
+local rows
+if view.screen == "methods" then
+rows = methodsDocument(view)
+elseif view.screen == "flow" then
+rows = flowDocument(view)
+elseif view.screen == "make" and view.make then
+rows = makeDocument(view, height)
+elseif view.screen == "many" and view.many then
+rows = manyDocument(view, height)
+elseif view.screen == "store" and view.newStore then
+rows = storeDocument(view, height)
+else
+rows = listDocument(view, height)
+end
+return doc.stack(rows, {name = "bind"})
+end
+
+function bind.settle(view, report)
+if view.screen == "list" then return app.settle(view.list, report, "bind") end
+if view.screen == "make" then return app.settle(view.makeList, report, "make-type") end
+if view.screen == "many" then return app.settle(view.kindList, report, "kind") end
+if view.screen == "store" then return app.settle(view.itemList, report, "store-item") end
+return false
+end
+
+
+
+local function ask(view, command, params, opts)
+app.ask(view, {kind = "act", command = command, params = params, opts = opts})
+end
+
+function bind.act(view, action)
+local kind = action and action.kind
+local lists = {list = view.list, make = view.makeList, many = view.kindList,
+store = view.itemList}
+local list = lists[view.screen]
+if list and app.page(list, kind, action) then return true end
+
+if kind == "show" then
+if action.screen == "list" then view.walk = nil end
+view.screen = action.screen
+return true
+elseif kind == "pick" then
+view.chosen, view.screen = action.path, "methods"
+return true
+elseif kind == "keep" then
+view.keepPages = view.keepPages == false
+return true
+elseif kind == "method" then
+local path = view.chosen
+if action.method == "page" then
+ask(view, "print_bind_pages", {paths = {path}, keep = view.keepPages ~= false},
+bind.PRINT)
+else
+ask(view, "show_me", {path = path, mode = action.method})
+end
+return true
+elseif kind == "bind-new" and action.path then
+
+
+view.chosen = action.path
+ask(view, "show_me", {path = action.path, mode = "new"})
+return true
+elseif kind == "answer" then
+ask(view, "show_me", {answer = action.yes})
+return true
+elseif kind == "stop" then
+ask(view, "show_me", {cancel = true})
+return true
+elseif kind == "cancel-page" then
+ask(view, "cancel_bind_page", {path = action.path})
+return true
+elseif kind == "open-make" then
+view.make = {script = action.script, name = "", typed = false}
+if action.script then view.make.name = bind.suggestName(view, action.script) end
+view.makeList = app.newList()
+view.screen = "make"
+return true
+elseif kind == "make-type" then
+view.make.script = action.script
+if not view.make.typed then view.make.name = bind.suggestName(view, action.script) end
+return true
+elseif kind == "open-many" then
+if not (view.make and view.make.script) then return false end
+view.many = {script = view.make.script, group = view.make.script}
+view.kindList = app.newList()
+view.screen = "many"
+return true
+elseif kind == "open-store" then
+view.newStore = {holds = nil, name = "", field = "search", typed = false}
+view.itemList = app.newList()
+view.screen = "store"
+return true
+elseif kind == "store-item" then
+local st = view.newStore
+st.holds = action.item
+if not st.typed then st.name = bind.storeName(action.item) end
+st.field = "name"
+return true
+elseif kind == "store-focus" then
+view.newStore.field = action.field
+if action.field == "holds" and not view.newStore.holds then view.newStore.holds = "#" end
+return true
+elseif kind == "make-store" then
+if bind.storeBlocked(view) then return false end
+ask(view, "add_store", {name = view.newStore.name, holds = view.newStore.holds})
+return true
+elseif kind == "edit-type" then
+
+view.jump = {app = "machines", action = {kind = "edit", script = action.script}}
+return true
+elseif kind == "many-kind" then
+if bind.manyBlocked(view) then return false end
+ask(view, "add_machines", {script = view.many.script, group = view.many.group,
+kind = action.block}, bind.PRINT)
+return true
+elseif kind == "many-new" then
+if bind.manyBlocked(view) then return false end
+ask(view, "show_me", {mode = "many", script = view.many.script,
+group = view.many.group})
+return true
+elseif kind == "make" then
+if bind.makeBlocked(view) then return false end
+ask(view, "add_machine", {machine = view.make.name, script = view.make.script})
+return true
+end
+return false
+end
+
+function bind.searching(view)
+if view.screen == "list" and view.data then return view.list end
+return nil
+end
+
+
+
+function bind.keyboard(view, event)
+if not event then return false end
+if view.screen == "store" and view.newStore then
+local st = view.newStore
+if st.field == "search" then
+return app.type(view.itemList, event)
+end
+local pattern = st.field == "holds" and "^[%w_%-:%./#]$" or "^[%w_%-]$"
+local value = st.field == "holds" and (st.holds or "") or st.name
+if event.kind == "char" and type(event.char) == "string"
+and event.char:match(pattern) then
+if #value < 40 then value = value .. event.char:lower() end
+elseif event.kind == "key" and keys
+and (event.key == keys.backspace or event.key == keys.delete) then
+value = event.key == keys.delete and "" or value:sub(1, -2)
+elseif event.kind == "key" and keys and event.key == keys.enter then
+return true, {kind = "make-store"}
+else
+return app.type(view.itemList, event)
+end
+if st.field == "holds" then
+st.holds = value
+if not st.typed then st.name = bind.storeName(value) end
+else
+st.name, st.typed = value:sub(1, bind.NAME_LENGTH), true
+end
+return true
+end
+if view.screen == "many" and view.many then
+local many = view.many
+if event.kind == "char" and type(event.char) == "string"
+and event.char:match("^[%w_%-]$") then
+if #many.group < bind.NAME_LENGTH then many.group = many.group .. event.char:lower() end
+return true
+end
+if event.kind == "key" and keys
+and (event.key == keys.backspace or event.key == keys.delete) then
+many.group = event.key == keys.delete and "" or many.group:sub(1, -2)
+return true
+end
+if event.kind == "key" and keys and event.key == keys.enter then
+return true, {kind = "many-new"}
+end
+return app.type(view.kindList, event)
+end
+if view.screen == "make" and view.make then
+local make = view.make
+if not make.script then
+if event.kind == "key" and keys and event.key == keys.enter and view.makeList.top then
+return true, view.makeList.top
+end
+return app.type(view.makeList, event)
+end
+if event.kind == "char" and type(event.char) == "string"
+and event.char:match("^[%w_%-]$") then
+if #make.name < bind.NAME_LENGTH then
+make.name, make.typed = make.name .. event.char:lower(), true
+end
+return true
+end
+if event.kind == "key" and keys
+and (event.key == keys.backspace or event.key == keys.delete) then
+make.name = event.key == keys.delete and "" or make.name:sub(1, -2)
+make.typed = true
+return true
+end
+if event.kind == "key" and keys and event.key == keys.enter then
+return true, {kind = "make"}
+end
+return app.type(view.makeList, event)
+end
+local list = bind.searching(view)
+if list then return app.type(list, event) end
+return false
+end
+
+function bind.handle(view, event, grid)
+local took, chose = bind.keyboard(view, event)
+if took then
+if chose then bind.act(view, chose) end
+return true
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return bind.act(view, action)
+end
+
+return bind
