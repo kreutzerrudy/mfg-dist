@@ -1,0 +1,51 @@
+local rpc = require("mfg.common.rpc")
+local mint = require("mfg.controller.mint")
+
+
+
+
+
+
+
+return {
+name        = "mint_drive",
+label       = "The minting drives",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "eject", label = "Eject the drive", type = "text", required = false},
+},
+
+returns = {drives = "table", players = "table", roles = "table", names = "table"},
+
+run = function(params)
+if params.eject then
+local found = false
+for _, drive in ipairs(mint.drives()) do
+if drive.name == params.eject then found = true end
+end
+if not found then
+return rpc.REJECTED, {reason = "no such drive: " .. tostring(params.eject)}
+end
+mint.eject(params.eject)
+end
+
+local drives = {}
+for _, drive in ipairs(mint.drives()) do drives[#drives + 1] = mint.inspect(drive) end
+
+local roles, names = {}, {}
+for role in pairs(require("mfg.common.roles")) do
+roles[#roles + 1] = role
+names[role] = mint.suggestName(role)
+end
+table.sort(roles)
+local players = mint.players()
+for _, player in ipairs(players) do
+names["pocket:" .. player] = mint.suggestName("hmi", player)
+end
+return rpc.COMPLETED, {drives = drives, players = players, roles = roles,
+names = names}
+end,
+}

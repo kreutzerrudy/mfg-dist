@@ -1,0 +1,158 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local enrollment = require("mfg.common.enrollment")
+
+local leases = {}
+
+local STATE = require("mfg.common.state")
+
+local NAME = "leases"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function load()
+local out = STATE.read(NAME, {})
+if type(out) ~= "table" then out = {} end
+return out
+end
+
+local function save(state)
+return STATE.write(NAME, state or {})
+end
+
+function leases.all()
+return load()
+end
+
+function leases.get(instanceId)
+return load()[tostring(instanceId)]
+end
+
+
+
+
+function leases.issue(instanceId, secret, address, name, role, ttlSeconds, owner)
+local state = load()
+local now = os.epoch("utc")
+state[tostring(instanceId)] = {
+owner = owner,
+instance = tostring(instanceId),
+secret = enrollment.toHex(secret),
+address = address,
+name = name,
+role = role,
+issued = now,
+expires = now + (ttlSeconds or enrollment.DEFAULT_LEASE_SECONDS) * 1000,
+consumed = false,
+}
+local ok, err = save(state)
+if not ok then return nil, err end
+return state[tostring(instanceId)]
+end
+
+function leases.isExpired(lease, now)
+return (now or os.epoch("utc")) > (lease.expires or 0)
+end
+
+
+
+
+
+function leases.claimable(instanceId, now)
+local lease = leases.get(instanceId)
+if not lease then return nil, "no lease for that instance" end
+if lease.consumed then return nil, "lease already consumed" end
+if leases.isExpired(lease, now) then return nil, "lease expired" end
+return lease
+end
+
+
+
+function leases.consume(instanceId, publicKeyHex, computer)
+local state = load()
+local lease = state[tostring(instanceId)]
+if not lease then return nil, "no lease for that instance" end
+lease.consumed = true
+lease.consumedAt = os.epoch("utc")
+lease.publicKey = publicKeyHex
+lease.computer = computer
+local ok, err = save(state)
+if not ok then return nil, err end
+return lease
+end
+
+
+
+
+function leases.reclaim(now)
+local state = load()
+now = now or os.epoch("utc")
+local freed = {}
+for id, lease in pairs(state) do
+if not lease.consumed and leases.isExpired(lease, now) then
+freed[#freed + 1] = id
+state[id] = nil
+end
+end
+if #freed > 0 then save(state) end
+return freed
+end
+
+
+
+
+function leases.drop(instanceId)
+local state = load()
+if not state[tostring(instanceId)] then return false end
+state[tostring(instanceId)] = nil
+return save(state)
+end
+
+function leases.revoke(instanceId)
+local state = load()
+local lease = state[tostring(instanceId)]
+if not lease then return false end
+lease.revoked = true
+lease.revokedAt = os.epoch("utc")
+return save(state)
+end
+
+
+function leases._reset()
+STATE.clear(NAME)
+end
+
+return leases

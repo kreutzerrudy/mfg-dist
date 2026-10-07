@@ -1,0 +1,454 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+
+local mintpanel = {}
+
+mintpanel.EVERY = 2
+mintpanel.BACKGROUND = 30
+mintpanel.READ = {timeout = 3, attempts = 2}
+
+
+mintpanel.ACT = {timeout = 60, attempts = 1}
+mintpanel.NAME_LENGTH = 20
+
+
+
+mintpanel.KINDS = {
+{role = "turtle", label = "Turtle"},
+{role = "builder", label = "Builder"},
+{role = "station", label = "Station"},
+{role = "hmi", label = "Terminal"},
+{role = "pocket", label = "Pocket"},
+{role = "controller", label = "Controller"},
+}
+
+local STATE = {
+empty = {text = "empty", colour = "dim"},
+["no-disk"] = {text = "no disk yet -- turn it on once", colour = "warn"},
+ready = {text = "READY", colour = "good"},
+minted = {text = "already minted", colour = "warn"},
+}
+
+function mintpanel.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+
+data = nil,
+readAt = nil, readWhy = nil,
+offer = nil,
+
+kind = "turtle",
+owner = nil,
+drive = nil,
+name = "", typed = false,
+confirm = false,
+
+sending = nil,
+result = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+function mintpanel.refresh(view) view.readAt = nil end
+
+function mintpanel.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+local every = ((view.onScreen == false) and mintpanel.BACKGROUND or mintpanel.EVERY)
+* 1000
+if not view.readAt or app.clock(view) - view.readAt >= every then
+return {kind = "read"}
+end
+return nil
+end
+
+local function roleOf(view)
+return view.kind == "pocket" and "hmi" or view.kind
+end
+
+
+local function suggested(view)
+local names = view.data and view.data.names or {}
+if view.kind == "pocket" then
+return view.owner and names["pocket:" .. view.owner] or ""
+end
+return names[view.kind] or view.kind
+end
+
+local function chosenDrive(view)
+for _, drive in ipairs(view.data and view.data.drives or {}) do
+if drive.name == view.drive then return drive end
+end
+return nil
+end
+
+
+
+
+local function settle(view)
+local drives = view.data and view.data.drives or {}
+if not chosenDrive(view) then
+view.drive = drives[1] and drives[1].name or nil
+for _, drive in ipairs(drives) do
+if drive.state == "ready" or drive.state == "minted" then
+view.drive = drive.name
+break
+end
+end
+end
+local drive = chosenDrive(view)
+if view.confirm and not (drive and drive.state == "minted") then view.confirm = false end
+if not view.typed then view.name = suggested(view) end
+end
+
+function mintpanel.apply(view, job, answer)
+app.noteLink(view, answer)
+local ok = answer.status == app.COMPLETED
+if job.kind == "read" or job.kind == "eject" then
+if ok and type(answer.drives) == "table" then
+view.data, view.readWhy = answer, nil
+view.offer = view.offer or {name = "mint_node"}
+settle(view)
+else
+view.readWhy = tostring(answer.reason or answer.status or "no answer")
+end
+return
+end
+view.sending = nil
+if ok then
+local text = ("minted %s at %s -- take it out, place it, turn it on"):format(
+tostring(answer.name), tostring(answer.address))
+if answer.owner then
+text = ("minted %s for %s -- give it to them; it works only in their "
+.. "inventory"):format(tostring(answer.name), tostring(answer.owner))
+end
+if (tonumber(answer.fetch) or 0) > 0 then
+text = text .. (" (it fetches %d files on first boot)"):format(answer.fetch)
+end
+view.result = {text = text, colour = "good"}
+view.typed, view.confirm = false, false
+app.sound(view, "done")
+else
+view.result = {text = "not minted: " .. tostring(answer.reason or answer.status),
+colour = "bad"}
+app.sound(view, "refused")
+end
+view.readAt = nil
+end
+
+function mintpanel.exchange(view, job)
+local body, opts = nil, mintpanel.READ
+if job.kind == "read" then
+view.readAt = app.clock(view)
+body = {command = "mint_drive"}
+elseif job.kind == "eject" then
+view.readAt = app.clock(view)
+body = {command = "mint_drive", eject = job.drive, operator = true}
+elseif job.kind == "mint" then
+body = {command = "mint_node", operator = true}
+for k, v in pairs(job.params) do body[k] = v end
+opts = mintpanel.ACT
+view.sending = job
+else
+return false
+end
+mintpanel.apply(view, job, view.transport.request(body, opts) or {})
+return true
+end
+
+
+
+
+
+local function wrapped(buttons, width, indent, name)
+local rows, row, used = {}, {doc.gap(indent)}, indent
+for _, button in ipairs(buttons) do
+local cells = #button.label + 2
+if used > indent and used + 1 + cells > width then
+rows[#rows + 1] = doc.row(row, {keep = doc.REQUIRED, name = name .. #rows})
+row, used = {doc.gap(indent)}, indent
+end
+if used > indent then
+row[#row + 1] = doc.gap(1)
+used = used + 1
+end
+row[#row + 1] = button
+used = used + cells
+end
+rows[#rows + 1] = doc.row(row, {keep = doc.REQUIRED, name = name .. #rows})
+return rows
+end
+
+local function kinds(view)
+local known, out = {}, {}
+local roles = {}
+for _, role in ipairs(view.data and view.data.roles or {}) do roles[role] = true end
+for _, kind in ipairs(mintpanel.KINDS) do
+known[kind.role] = true
+if roles[kind.role] or (kind.role == "pocket" and roles.hmi) then
+out[#out + 1] = kind
+end
+end
+for _, role in ipairs(view.data and view.data.roles or {}) do
+if not known[role] then out[#out + 1] = {role = role, label = role} end
+end
+return out
+end
+
+local function whatRows(view, width)
+local buttons = {}
+for _, kind in ipairs(kinds(view)) do
+buttons[#buttons + 1] = doc.button(kind.label, {
+colour = view.kind == kind.role and "selected" or "action",
+action = {kind = "kind", role = kind.role},
+keep = doc.REQUIRED, name = "kind-" .. kind.role})
+end
+local rows = {doc.text(" What", {colour = "label", keep = doc.REQUIRED, name = "what"})}
+for _, row in ipairs(wrapped(buttons, width, 1, "kinds")) do rows[#rows + 1] = row end
+return rows
+end
+
+local function ownerRows(view, width)
+local players = view.data and view.data.players or {}
+if #players == 0 then
+return {doc.text(" no player has an Inventory Manager bound as /players/<name>/inv",
+{colour = "dim", wrap = true, keep = doc.REQUIRED, name = "no-players"})}
+end
+local buttons = {}
+for _, player in ipairs(players) do
+buttons[#buttons + 1] = doc.button(player, {
+colour = view.owner == player and "selected" or "action",
+action = {kind = "owner", owner = player},
+keep = doc.REQUIRED, name = "owner-" .. player})
+end
+local rows = {doc.text(" For", {colour = "label", keep = doc.REQUIRED, name = "for"})}
+for _, row in ipairs(wrapped(buttons, width, 1, "owners")) do rows[#rows + 1] = row end
+return rows
+end
+
+local function nameRow(view)
+return doc.row({
+doc.text(" Name", {colour = "label", keep = doc.REQUIRED, name = "name-label"}),
+doc.gap(1),
+doc.text(" " .. view.name .. "_", {width = "fill", colour = "title", bg = "field",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "name"}),
+}, {keep = doc.REQUIRED, name = "name-row"})
+end
+
+local function driveRows(view, width)
+local drives = view.data and view.data.drives or {}
+if #drives == 0 then
+return {doc.text(" no disk drive -- put one beside the controller, or on its "
+.. "wired network", {colour = "bad", wrap = true, keep = doc.REQUIRED,
+name = "no-drive"})}
+end
+local rows = {}
+if #drives > 1 then
+local buttons = {}
+for _, drive in ipairs(drives) do
+buttons[#buttons + 1] = doc.button(drive.name, {
+colour = view.drive == drive.name and "selected" or "action",
+action = {kind = "drive", drive = drive.name},
+keep = 6, name = "drive-" .. drive.name})
+end
+for _, row in ipairs(wrapped(buttons, width, 1, "drives")) do
+row.keep = 6
+rows[#rows + 1] = row
+end
+end
+local drive = chosenDrive(view)
+local seen = STATE[drive and drive.state] or STATE.empty
+local says = seen.text
+if drive and drive.state == "minted" and drive.minted then
+says = ("minted as %s%s"):format(tostring(drive.minted.name),
+drive.minted.role and (" (" .. drive.minted.role .. ")") or "")
+end
+rows[#rows + 1] = doc.text((" Drive %s: %s"):format(drive and drive.name or "-", says),
+{colour = seen.colour, truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+name = "drive-state"})
+if not drive or drive.state == "empty" or drive.state == "no-disk" then
+rows[#rows + 1] = doc.text(" 1 place it and turn it on once", {colour = "text",
+keep = 5, name = "step-1"})
+rows[#rows + 1] = doc.text(" 2 break it, put it in the drive", {colour = "text",
+keep = 5, name = "step-2"})
+end
+local role = roleOf(view)
+if role == "turtle" or role == "builder" then
+rows[#rows + 1] = doc.text(" needs a TURTLE, not a computer", {colour = "warn",
+keep = 4, name = "turtle-note"})
+end
+return rows
+end
+
+local function canMint(view)
+local drive = chosenDrive(view)
+if not drive or (drive.state ~= "ready" and drive.state ~= "minted") then return false end
+if view.kind == "pocket" and not view.owner then return false end
+return view.name ~= "" and not view.sending
+end
+
+local function actionRow(view)
+local drive = chosenDrive(view)
+local children = {doc.gap(1)}
+if drive and drive.state ~= "empty" then
+children[#children + 1] = doc.button("Eject", {colour = "action",
+action = {kind = "eject"}, keep = 3, name = "eject"})
+end
+children[#children + 1] = doc.spacer()
+if view.sending then
+children[#children + 1] = doc.text("minting..", {colour = "dim",
+keep = doc.REQUIRED, name = "sending"})
+elseif view.confirm then
+children[#children + 1] = doc.button("Mint over it", {colour = "bad",
+action = {kind = "mint", again = true}, keep = doc.REQUIRED, name = "again"})
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = doc.button("No", {colour = "action",
+action = {kind = "cancel"}, keep = doc.REQUIRED, name = "cancel"})
+else
+local again = drive and drive.state == "minted"
+children[#children + 1] = doc.button(again and "Re-mint" or "Mint", {
+colour = canMint(view) and "good" or "dim",
+action = {kind = "mint"}, keep = doc.REQUIRED, name = "mint"})
+end
+children[#children + 1] = doc.gap(1)
+return doc.row(children, {keep = doc.REQUIRED, name = "actions"})
+end
+
+function mintpanel.document(view, width, height)
+local rows = {app.header(view, "MINT")}
+if not view.data then
+rows[#rows + 1] = doc.text(view.readWhy and ("the controller refused: "
+.. view.readWhy) or "reading..", {colour = view.readWhy and "bad" or "dim",
+wrap = true, keep = doc.REQUIRED, name = "read-state"})
+rows[#rows + 1] = doc.spacer()
+return doc.stack(rows, {name = "mint"})
+end
+for _, row in ipairs(whatRows(view, width)) do rows[#rows + 1] = row end
+if view.kind == "pocket" then
+for _, row in ipairs(ownerRows(view, width)) do rows[#rows + 1] = row end
+end
+rows[#rows + 1] = nameRow(view)
+rows[#rows + 1] = doc.rule({keep = 2})
+for _, row in ipairs(driveRows(view, width)) do rows[#rows + 1] = row end
+if view.confirm then
+rows[#rows + 1] = doc.text(" its old identity stops working", {colour = "warn",
+keep = doc.REQUIRED, name = "confirm"})
+end
+if view.result then
+rows[#rows + 1] = doc.text(" " .. view.result.text, {colour = view.result.colour,
+wrap = true, keep = 7, name = "result"})
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = actionRow(view)
+return doc.stack(rows, {name = "mint"})
+end
+
+
+
+local function mintNow(view, again)
+local drive = chosenDrive(view)
+if not canMint(view) then
+if view.kind == "pocket" and not view.owner then
+view.result = {text = "choose whose pocket it is", colour = "bad"}
+end
+app.sound(view, "refused")
+return true
+end
+if drive.state == "minted" and not again then
+view.confirm = true
+return true
+end
+view.result, view.confirm = nil, false
+app.ask(view, {kind = "mint", params = {drive = drive.name, role = roleOf(view),
+name = view.name, owner = view.kind == "pocket" and view.owner or nil,
+again = again or nil}})
+return true
+end
+
+function mintpanel.act(view, action)
+local kind = action and action.kind
+if kind == "kind" then
+view.kind, view.confirm = action.role, false
+if view.kind ~= "pocket" then view.owner = nil end
+if not view.typed then view.name = suggested(view) end
+return true
+elseif kind == "owner" then
+view.owner = action.owner
+if not view.typed then view.name = suggested(view) end
+return true
+elseif kind == "drive" then
+view.drive, view.confirm = action.drive, false
+return true
+elseif kind == "mint" then
+return mintNow(view, action.again)
+elseif kind == "cancel" then
+view.confirm = false
+return true
+elseif kind == "eject" then
+if view.drive then
+view.result, view.confirm = nil, false
+app.ask(view, {kind = "eject", drive = view.drive})
+end
+return true
+end
+return false
+end
+
+
+
+
+function mintpanel.keyboard(view, event)
+if not event or not view.data then return false end
+if event.kind == "char" and type(event.char) == "string"
+and event.char:match("^[%w_%-]$") then
+if not view.typed then view.name, view.typed = "", true end
+if #view.name < mintpanel.NAME_LENGTH then view.name = view.name .. event.char end
+return true
+end
+if event.kind == "key" and keys and event.key == keys.backspace then
+view.typed = true
+view.name = view.name:sub(1, -2)
+return true
+end
+if event.kind == "key" and keys and event.key == keys.delete then
+view.typed = false
+view.name = suggested(view)
+return true
+end
+if event.kind == "key" and keys and event.key == keys.enter then
+return true, {kind = "mint", again = view.confirm or nil}
+end
+return false
+end
+
+function mintpanel.handle(view, event, grid)
+local took, chose = mintpanel.keyboard(view, event)
+if took then
+if chose then mintpanel.act(view, chose) end
+return true
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return mintpanel.act(view, action)
+end
+
+return mintpanel
