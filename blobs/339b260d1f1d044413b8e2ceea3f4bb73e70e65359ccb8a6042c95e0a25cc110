@@ -1,0 +1,554 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local dispatch = require("mfg.controller.dispatch")
+local recipes = require("mfg.controller.recipes")
+local turtles = require("mfg.controller.turtles")
+local configs = require("mfg.controller.configs")
+local alarms = require("mfg.controller.alarms")
+local pattern = require("mfg.common.pattern")
+
+local runner = {}
+
+runner.MAX_SETS = 64
+runner.RETRY = 30
+runner.RETRY_TIMEOUT = 60
+runner.RETRY_DRIFT = 300
+runner.OFFLINE = 60
+runner.IDLE = 2
+runner.WAIT = 10
+runner.STALL = 300
+runner.STALL_CYCLES = 10
+
+runner.PRIORITY = {unpack = 1, demand = 2, compact = 3, sweep = 4}
+
+local CRAFTING_TABLE = "minecraft:crafting_table"
+
+
+
+
+
+local running = {}
+local inflight = {}
+local cooling = {}
+local refusals = {}
+
+function runner.reset()
+running, inflight, cooling, refusals = {}, {}, {}, {}
+end
+
+
+function runner.threads(now)
+now = now or os.epoch("utc")
+local out = {}
+for _, id in ipairs(runner.fitted()) do
+local entry = {id = id, state = "idle"}
+if running[id] then
+entry.state, entry.job = "busy", running[id].job
+entry.step, entry.sets = running[id].step, running[id].sets
+elseif turtles.holder(id) then
+entry.state, entry.by = "busy", turtles.holder(id)
+elseif cooling[id] and cooling[id] > now then
+entry.state, entry.until_ = "offline", cooling[id]
+end
+out[#out + 1] = entry
+end
+return out
+end
+
+
+
+
+function runner.fitted()
+local out = {}
+for id, record in pairs(turtles.all()) do
+local fitted = true
+local seen = type(record.host) == "string" and configs.observed(record.host)
+for _, item in ipairs(seen and seen.equipment_missing or {}) do
+if item == CRAFTING_TABLE then fitted = false end
+end
+if fitted and type(record.host) == "string" and record.host ~= "" then
+out[#out + 1] = id
+end
+end
+table.sort(out)
+return out
+end
+
+
+
+function runner.idle(now)
+local out = {}
+for _, thread in ipairs(runner.threads(now)) do
+if thread.state == "idle" then out[#out + 1] = thread.id end
+end
+return out
+end
+
+local function copy(t)
+local out = {}
+for k, v in pairs(t) do out[k] = v end
+return out
+end
+
+
+function runner.running(jobId)
+local n = 0
+for _, entry in pairs(running) do
+if entry.job == jobId then n = n + 1 end
+end
+return n
+end
+
+
+
+
+local function publish(now)
+pcall(require("mfg.common.state").write, "threads",
+{at = now, threads = runner.threads(now)})
+end
+
+function runner.snapshot()
+return require("mfg.common.state").read("threads", nil)
+end
+
+local function inflightOf(jobId, index)
+return (inflight[jobId] or {})[index] or 0
+end
+
+local function busyJob(jobId)
+for _, n in pairs(inflight[jobId] or {}) do
+if n > 0 then return true end
+end
+return false
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function runner.askRuns(job, step, def)
+local runs = require("mfg.controller.runs")
+local scripts = require("mfg.controller.scripts")
+local still = step.count - (job.made or 0)
+local want = math.ceil(still / math.max(1, def.output.count)) - runs.forJob(job.id)
+if want <= 0 then return 0 end
+local types = {}
+for _, t in ipairs(scripts.all()) do
+for _, recipeType in ipairs(t.runs or {}) do
+if recipeType == def.type then
+types[t.name] = (t.batches and t.batches[recipeType]) or 1
+end
+end
+end
+local inputs = {}
+for i, side in ipairs(def.list or {}) do inputs[i] = {item = side.item, n = side.n} end
+local asked = 0
+for _, m in ipairs(scripts.machines()) do
+if want <= 0 then break end
+if types[m.script] and m.enabled and m.state == scripts.RUNNING
+and not runs.busy(m.name) then
+local cycles = math.min(want, types[m.script])
+runs.request(m.name, {job = job.id, recipe = {id = def.id, type = def.type,
+inputs = inputs, output = {item = def.output.item,
+count = def.output.count}, cycles = cycles}})
+want, asked = want - cycles, asked + 1
+end
+end
+return asked
+end
+
+function runner.waitFor(job, step, def, now)
+local throughput = require("mfg.controller.throughput")
+local count, session = throughput.counter(def.process, def.output.item)
+local mark = {session = session, n = count}
+local item = def.output.item:match("[^:]+$") or def.output.item
+if not job.mark then
+dispatch.progress(job.id, job.made or 0, mark, now, ("waiting for %s: 0 of %d %s")
+:format(def.process, step.count, item), now + runner.WAIT * 1000)
+return {job = job.id, outcome = "waiting"}
+end
+
+
+local base = job.mark.session == session and job.mark.n or 0
+local arrived = math.max(0, count - base)
+local made = (job.made or 0) + arrived
+local since = arrived > 0 and now or (job.since or now)
+local reason = ("waiting for %s: %d of %d %s"):format(def.process, made, step.count,
+item)
+
+local rate = throughput.rate(def.id, now)
+local cycle = rate and rate > 0 and (60 * def.output.count / (rate * math.max(1,
+def.machines or 1))) or 0
+local stallAfter = math.max(runner.STALL, runner.STALL_CYCLES * cycle)
+local key = ("job.%d.stalled"):format(job.id)
+if made < step.count and now - since > stallAfter * 1000 then
+alarms.raise(key, ("job %d (%s): %s has collected no %s for %d min -- are its "
+.. "machines enabled and supplied?"):format(job.id, tostring(job.label),
+def.process, item, math.floor((now - since) / 60000)),
+{now = now, source = "jobs", severity = "advice"})
+reason = reason .. " -- stalled"
+else
+alarms.clear(key, now)
+end
+
+dispatch.progress(job.id, made, mark, since, reason, now + runner.WAIT * 1000)
+if made >= step.count then
+return {job = job.id, outcome = "ran", process = def.process, made = made}
+end
+return {job = job.id, outcome = "waiting", reason = reason}
+end
+
+
+
+local function blocked(job, reason, retry, now, alarm)
+dispatch.fail(job.id, reason, false, now + retry * 1000)
+if alarm then
+alarms.raise(("job.%d.%s"):format(job.id, alarm),
+("job %d (%s): %s"):format(job.id, tostring(job.label), reason),
+{now = now, source = "jobs", severity = "hold"})
+end
+return {job = job.id, outcome = "blocked", reason = reason}
+end
+
+
+
+local function finish(job, index, def, node, amount, status, fields, now)
+fields = fields or {}
+if status == rpc.COMPLETED then
+refusals[job.id] = nil
+
+local sets = math.min(amount, tonumber(fields.depth) or amount)
+local made = (fields.produced or {})[def.output.item] or 0
+local expected = sets * def.output.count
+local recorded = dispatch.record(job.id, sets,
+{node = node, sets = sets, produced = fields.produced}, index)
+alarms.clear(("job.%d.timeout"):format(job.id), now)
+if not recorded then
+
+return {job = job.id, outcome = "cancelled", node = node, sets = sets}
+end
+if made < expected then
+
+
+return blocked(job, ("%s made %d %s from %d sets, the book says %d -- "
+.. "recipe drift"):format(node, made, def.output.item, sets, expected),
+runner.RETRY_DRIFT, now, "drift")
+end
+return {job = job.id, outcome = "ran", node = node, step = index, sets = sets}
+end
+
+if status == rpc.TIMED_OUT then
+
+
+return blocked(job, ("%s timed out: %s"):format(node, tostring(fields.reason)),
+runner.RETRY_TIMEOUT, now, "timeout")
+end
+
+if fields.short then
+
+
+return blocked(job, tostring(fields.reason), runner.RETRY, now)
+end
+
+
+
+cooling[node] = now + runner.OFFLINE * 1000
+refusals[job.id] = refusals[job.id] or {}
+table.insert(refusals[job.id], ("%s: %s"):format(node, tostring(fields.reason)))
+return {job = job.id, outcome = "refused", node = node,
+reason = tostring(fields.reason)}
+end
+
+
+
+
+local function ordered(now)
+local out = {}
+for _, job in ipairs(dispatch.jobs()) do
+if dispatch.isOpen(job) and not (job.retryAt and job.retryAt > now) then
+out[#out + 1] = job
+end
+end
+table.sort(out, function(a, b)
+local pa = runner.PRIORITY[a.priority or "demand"] or 2
+local pb = runner.PRIORITY[b.priority or "demand"] or 2
+if pa ~= pb then return pa < pb end
+return a.id < b.id
+end)
+return out
+end
+
+
+local function setsFrom(def, free)
+local sets = runner.MAX_SETS
+for item, perSet in pairs(pattern.occurrences(def.pattern)) do
+sets = math.min(sets, math.floor((free[item] or 0) / perSet))
+end
+return math.max(0, sets)
+end
+
+
+local function shortOf(def, free)
+local parts = {}
+for item, perSet in pairs(pattern.occurrences(def.pattern)) do
+if (free[item] or 0) < perSet then
+parts[#parts + 1] = ("%s needs %d a set, %d free"):format(item, perSet,
+math.floor(free[item] or 0))
+end
+end
+table.sort(parts)
+return table.concat(parts, "; ")
+end
+
+
+
+
+
+
+
+
+
+
+function runner.pass(opts)
+opts = opts or {}
+local invoke = opts.invoke or actions.invoke
+local now = opts.now or os.epoch("utc")
+local results = {}
+
+local jobs = ordered(now)
+if #jobs == 0 then return nil end
+
+local supervisor = require("mfg.controller.supervisor")
+local available, breakdown = supervisor.available(nil, nil,
+opts.stock and opts.stock() or nil)
+if not available then
+return {{outcome = "blocked", reason = "the pool cannot be read: "
+.. tostring(breakdown)}}
+end
+local idle = runner.idle(now)
+local anyCrafter = #runner.fitted() > 0
+
+for _, job in ipairs(jobs) do
+
+
+local free = {}
+for item, n in pairs(breakdown.stock) do
+local others = breakdown.claims[item] or 0
+for _, claim in ipairs((breakdown.byJob or {})[item] or {}) do
+if claim.job == job.id then others = others - claim.count end
+end
+free[item] = math.max(0, n - math.floor(others + 0.5)
+- ((breakdown.held or {})[item] or 0))
+end
+
+local started, why, firstDef = false, nil, nil
+for index = job.position, #job.steps do
+local step = job.steps[index]
+local def = recipes.get(step.recipe)
+if not def then
+
+
+if index == job.position then
+why = step.process and ("step %d (%s): %s no longer makes it -- "
+.. "put the `makes` line back in its script"):format(index,
+tostring(step.label), step.process)
+or ("step %d (%s) needs a recipe no longer in the book -- "
+.. "register it again"):format(index, tostring(step.label))
+end
+break
+end
+if def.process then
+if index == job.position then
+
+
+local waited = runner.waitFor(job, step, def, now)
+results[#results + 1] = waited
+if def.typed and waited.outcome == "waiting" then
+runner.askRuns(dispatch.job(job.id) or job, step, def)
+end
+end
+else
+local remaining = step.sets - dispatch.doneOf(job, index)
+- inflightOf(job.id, index)
+local sets = math.min(remaining, setsFrom(def, free))
+if index == job.position and not firstDef then firstDef = def end
+while sets >= 1 and #idle > 0 do
+local node = table.remove(idle, 1)
+for item, perSet in pairs(pattern.occurrences(def.pattern)) do
+free[item] = (free[item] or 0) - perSet * sets
+end
+inflight[job.id] = inflight[job.id] or {}
+inflight[job.id][index] = inflightOf(job.id, index) + sets
+running[node] = {job = job.id, step = index, sets = sets, since = now}
+started = true
+publish(now)
+
+local amount = sets
+local function batch()
+
+
+local ctx = {by = "jobs", policy = ("jobs:%d"):format(job.id)}
+local ok, status, fields = pcall(invoke, "run_batch", {
+target = node, pattern_id = def.id,
+pattern = copy(def.pattern), amount = amount,
+}, ctx)
+if not ok then status, fields = rpc.REJECTED, {reason = status} end
+local result = finish(job, index, def, node, amount, status,
+fields, opts.now or os.epoch("utc"))
+running[node] = nil
+inflight[job.id][index] = inflightOf(job.id, index) - amount
+publish(opts.now or os.epoch("utc"))
+return result
+end
+if opts.spawn then
+opts.spawn(batch)
+results[#results + 1] = {job = job.id, outcome = "started",
+node = node, step = index, sets = sets}
+else
+results[#results + 1] = batch()
+end
+
+remaining = remaining - sets
+sets = math.min(remaining, setsFrom(def, free))
+
+local current = dispatch.job(job.id)
+if not current or not dispatch.isOpen(current) then break end
+end
+end
+end
+
+
+if not started and not busyJob(job.id) and dispatch.isOpen(dispatch.job(job.id)
+or {state = "done"}) then
+local current = job.steps[job.position]
+if why then
+results[#results + 1] = blocked(job, why, runner.RETRY, now)
+elseif current and not current.process and firstDef then
+if not anyCrafter then
+results[#results + 1] = blocked(job,
+"no crafting node is registered and fitted", runner.RETRY, now)
+elseif setsFrom(firstDef, free) < 1 then
+results[#results + 1] = blocked(job, ("step %d (%s) is short: %s")
+:format(job.position, tostring(current.label),
+shortOf(firstDef, free)), runner.RETRY, now)
+elseif #runner.idle(now) == 0 and refusals[job.id] then
+local all = true
+for _, thread in ipairs(runner.threads(now)) do
+if thread.state ~= "offline" then all = false end
+end
+if all then
+results[#results + 1] = blocked(job, "no node could run it -- "
+.. table.concat(refusals[job.id], "; "), runner.RETRY, now)
+refusals[job.id] = nil
+end
+end
+end
+end
+end
+
+if #results == 0 then return nil end
+return results
+end
+
+
+
+
+
+
+function runner.run(opts)
+opts = copy(opts or {})
+local workers = {}
+opts.spawn = function(fn)
+workers[#workers + 1] = {co = coroutine.create(function()
+local ok, err = pcall(fn)
+if not ok then print("jobs: " .. tostring(err)) end
+os.queueEvent("mfg_runner")
+end)}
+end
+
+workers[1] = {main = true, co = coroutine.create(function()
+while true do
+local ok, results = pcall(runner.pass, opts)
+if not ok then
+print("jobs: " .. tostring(results))
+else
+for _, result in ipairs(results or {}) do
+if result.outcome == "blocked" and result.job then
+print(("jobs: job %d blocked: %s"):format(result.job,
+tostring(result.reason or "")))
+end
+end
+end
+local timer = os.startTimer(ok and runner.IDLE or runner.RETRY)
+while true do
+local event, id = os.pullEvent()
+if event == "mfg_runner" or (event == "timer" and id == timer) then break end
+end
+end
+end)}
+
+local event = {n = 0}
+while true do
+local i = 1
+while i <= #workers do
+local w = workers[i]
+if not w.started or w.filter == nil or w.filter == event[1]
+or event[1] == "terminate" then
+w.started = true
+local ok, filter = coroutine.resume(w.co, table.unpack(event, 1, event.n))
+if not ok then
+if w.main then error(filter, 0) end
+print("jobs: " .. tostring(filter))
+end
+w.filter = filter
+end
+if coroutine.status(w.co) == "dead" then
+if w.main then error("the dispatcher stopped", 0) end
+table.remove(workers, i)
+else
+i = i + 1
+end
+end
+event = table.pack(os.pullEventRaw())
+end
+end
+
+return runner
