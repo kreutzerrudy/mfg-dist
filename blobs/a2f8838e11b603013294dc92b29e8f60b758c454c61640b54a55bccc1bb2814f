@@ -1,0 +1,136 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local store = require("mfg.storage")
+local machines = require("mfg.controller.machines")
+local supervisor = require("mfg.controller.supervisor")
+local flows = require("mfg.controller.flows")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function ownClaim(ctx, item, breakdown)
+local name = type(ctx and ctx.by) == "string" and ctx.by:match("^machine:(.+)$")
+if not name then return 0 end
+local machine = require("mfg.controller.scripts").machine(name)
+if not machine then return 0 end
+local dispatch = require("mfg.controller.dispatch")
+local claimed = dispatch.processClaims(machine.script)[item] or 0
+
+local script = require("mfg.controller.scripts").get(machine.script)
+for _, recipeType in ipairs(script and script.runs or {}) do
+claimed = claimed + (dispatch.processClaims(recipeType)[item] or 0)
+end
+if claimed <= 0 then return 0 end
+local unheld = (breakdown.stock[item] or 0) - (breakdown.held[item] or 0)
+return math.max(0, math.min(math.floor(claimed), unheld))
+end
+
+return {
+name        = "supply",
+label       = "Supply a machine",
+tier        = "orchestrated",
+uses        = {"move"},
+policy      = true,
+destructive = false,
+
+parameters = {
+{name = "port", label = "Port", type = "path", required = true,
+choices = {source = "ports"}, help = "A machine's input volume."},
+{name = "item", label = "Item", type = "item", required = true},
+{name = "count", label = "Count", type = "number", integer = true,
+min = 1, max = 3456, required = true},
+{name = "upto", label = "Top up to count", type = "flag", default = false},
+},
+
+returns = {moved = "number", short = "number"},
+
+run = function(params, ctx)
+local _, bad = machines.volume(params.port, "input")
+if bad then return rpc.REJECTED, {reason = bad} end
+
+
+
+
+local selector = params.item
+if store.isFamily(selector) then
+require("mfg.controller.filters")
+if params.upto then
+local have, why = store.count(params.port, selector)
+if not have then return rpc.REJECTED, {reason = tostring(why)} end
+if have >= params.count then return rpc.COMPLETED, {moved = 0} end
+params = {port = params.port, item = selector, count = params.count - have}
+end
+local pool = require("mfg.common.config").setting("source")
+local chosen = nil
+local inPort = store.matching(params.port, selector) or {}
+local most = -1
+for key, n in pairs(inPort) do
+if n > most then chosen, most = store.parse(key), n end
+end
+if not chosen then
+local available, breakdown = supervisor.available(pool)
+if not available then return rpc.REJECTED, {reason = tostring(breakdown)} end
+local best = 0
+for key in pairs(store.matching(pool, selector) or {}) do
+local id = store.parse(key)
+local free = (available[id] or 0) + ownClaim(ctx, id, breakdown)
+if free > best then chosen, best = id, free end
+end
+end
+if not chosen then
+return rpc.COMPLETED, {moved = 0, short = params.count,
+reason = ("nothing matching %s is free in %s"):format(selector, pool)}
+end
+params = {port = params.port, item = chosen, count = params.count}
+end
+
+local want = params.count
+if params.upto then
+local have, why = store.count(params.port, params.item)
+if not have then return rpc.REJECTED, {reason = tostring(why)} end
+want = params.count - have
+if want <= 0 then return rpc.COMPLETED, {moved = 0} end
+end
+
+local pool = require("mfg.common.config").setting("source")
+local available, breakdown = supervisor.available(pool)
+if not available then return rpc.REJECTED, {reason = tostring(breakdown)} end
+local free = (available[params.item] or 0) + ownClaim(ctx, params.item,
+breakdown)
+local take = math.min(want, free)
+if take <= 0 then
+return rpc.COMPLETED, {moved = 0, short = want,
+reason = ("no %s free in %s"):format(params.item, pool)}
+end
+
+local status, fields = actions.invoke("move", {from = pool, to = params.port,
+item = params.item, count = take}, ctx)
+local moved = status == rpc.COMPLETED and (fields.moved or 0) or 0
+flows.add(params.item, moved, "out", flows.source(ctx, "operator"))
+local short = want - moved
+return rpc.COMPLETED, {moved = moved, short = short > 0 and short or nil,
+reason = short > 0 and ("%d of %d supplied: %s"):format(moved, want,
+moved < take and tostring(fields.reason or "the port is full")
+or "the rest is not free") or nil}
+end,
+}

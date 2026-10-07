@@ -1,0 +1,595 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local rpc = require("mfg.common.rpc")
+local journal = require("mfg.common.actions.journal")
+local store = require("mfg.storage")
+local alarms = require("mfg.controller.alarms")
+local flows = require("mfg.controller.flows")
+
+local throughput = {}
+
+local STORE, PLANNED = "throughput", "planned"
+
+throughput.SAMPLE = 10
+throughput.WINDOW = 300
+throughput.PLAN = 60
+throughput.ALPHA = 0.3
+throughput.MIN_WORK = 60
+throughput.RING = 12
+throughput.STALE = 3600
+throughput.HORIZON = 30
+throughput.DOWN_AFTER = 5
+throughput.FALLBACK = 300
+throughput.SHORT_FOR = 600
+throughput.MOSTLY = 0.5
+throughput.FULL = 64
+
+throughput.WORK, throughput.WAIT = "work", "wait"
+throughput.BLOCKED, throughput.OFF = "blocked", "off"
+
+
+
+local live = {}
+
+
+local rates = nil
+
+local plan = {at = nil, types = {}, held = {}}
+local lowerFor = {}
+local counters = {}
+throughput.SESSION = os.epoch("utc")
+local shortSince = {}
+
+local function clock(now) return now or os.epoch("utc") end
+
+local function loadRates()
+if not rates then
+local stored = state.read(STORE, {})
+rates = type(stored) == "table" and type(stored.rates) == "table" and stored.rates or {}
+if type(stored) == "table" and type(stored.plan) == "table" then
+
+
+plan.types = stored.plan.types or {}
+end
+end
+return rates
+end
+
+
+
+
+local function planTypes()
+local scripts = require("mfg.controller.scripts")
+local out = {}
+for _, record in ipairs(scripts.all()) do
+if record.makes and #record.makes > 0 then
+out[#out + 1] = {name = record.name, makes = record.makes,
+machines = scripts.machines(record.name)}
+end
+end
+return out
+end
+
+local function portPath(machine, port) return "/" .. machine .. "/" .. port end
+
+
+
+local function newWindow(now)
+return {start = now, work = 0, wait = 0, blocked = 0, off = 0, workBy = {}, out = {}}
+end
+
+
+local function classify(machine, makes)
+for _, recipe in ipairs(makes) do
+local held = store.count(portPath(machine.name, recipe.output.port), recipe.output.item)
+if held and held >= throughput.FULL then return throughput.BLOCKED, recipe.id end
+end
+for _, recipe in ipairs(makes) do
+local all = true
+for _, input in ipairs(recipe.inputs) do
+local n = store.count(portPath(machine.name, input.port), input.item)
+if not n or n < input.n then all = false; break end
+end
+if all then return throughput.WORK, recipe.id end
+end
+return throughput.WAIT, nil
+end
+
+
+function throughput.sample(now)
+now = clock(now)
+local running = require("mfg.controller.scripts").RUNNING
+local seen = {}
+for _, t in ipairs(planTypes()) do
+for _, machine in ipairs(t.machines) do
+seen[machine.name] = true
+local m = live[machine.name]
+if not m or m.type ~= t.name then
+m = {type = t.name, win = newWindow(now), ring = {}}
+live[machine.name] = m
+end
+
+
+if m.at and m.class then
+local seconds = (now - m.at) / 1000
+if seconds > 0 and seconds <= throughput.SAMPLE * 2 then
+m.win[m.class] = m.win[m.class] + seconds
+if m.class == throughput.WORK and m.recipe then
+m.win.workBy[m.recipe] = (m.win.workBy[m.recipe] or 0) + seconds
+end
+end
+end
+if machine.enabled and machine.state == running then
+local ok, class, recipe = pcall(classify, machine, t.makes)
+m.class = ok and class or throughput.WAIT
+m.recipe = ok and recipe or nil
+else
+m.class, m.recipe = throughput.OFF, nil
+end
+m.at = now
+end
+end
+for name in pairs(live) do
+if not seen[name] then live[name] = nil end
+end
+end
+
+
+
+
+
+
+function throughput.collected(by, port, drained)
+local name = type(by) == "string" and by:match("^machine:(.+)$")
+if not name or type(drained) ~= "table" then return end
+local scripts = require("mfg.controller.scripts")
+local machine = scripts.machine(name)
+local record = machine and scripts.get(machine.script)
+local m = live[name]
+for _, recipe in ipairs(record and record.makes or {}) do
+local n = drained[recipe.output.item]
+if n and portPath(name, recipe.output.port) == port then
+if m then m.win.out[recipe.id] = (m.win.out[recipe.id] or 0) + n end
+local byItem = counters[record.name] or {}
+counters[record.name] = byItem
+byItem[recipe.output.item] = (byItem[recipe.output.item] or 0) + n
+end
+end
+
+
+for _, recipeType in ipairs(record and record.runs or {}) do
+local byItem = counters[recipeType] or {}
+counters[recipeType] = byItem
+for item, n in pairs(drained) do byItem[item] = (byItem[item] or 0) + n end
+end
+end
+
+
+
+
+function throughput.counter(typeName, item)
+return (counters[typeName] or {})[item] or 0, throughput.SESSION
+end
+
+
+
+function throughput.closeWindows(now)
+now = clock(now)
+loadRates()
+for name, m in pairs(live) do
+if (now - m.win.start) / 1000 >= throughput.WINDOW then
+for recipe, work in pairs(m.win.workBy) do
+if work >= throughput.MIN_WORK then
+local measured = (m.win.out[recipe] or 0) / (work / 60)
+rates[recipe] = rates[recipe] or {}
+local prev = rates[recipe][name]
+local rate = prev and (throughput.ALPHA * measured
++ (1 - throughput.ALPHA) * prev.rate) or measured
+rates[recipe][name] = {rate = rate, at = now}
+end
+end
+table.insert(m.ring, 1, {work = m.win.work, wait = m.win.wait,
+blocked = m.win.blocked, off = m.win.off})
+while #m.ring > throughput.RING do table.remove(m.ring) end
+m.win = newWindow(now)
+end
+end
+end
+
+
+
+function throughput.split(name)
+local m = live[name]
+if not m then return nil end
+local out = {work = m.win.work, wait = m.win.wait, blocked = m.win.blocked, off = m.win.off}
+for _, w in ipairs(m.ring) do
+for k in pairs(out) do out[k] = out[k] + w[k] end
+end
+local on = out.work + out.wait + out.blocked
+out.utilisation = on > 0 and out.work / on or nil
+return out
+end
+
+local function median(list)
+if #list == 0 then return nil end
+table.sort(list)
+local mid = math.floor(#list / 2)
+if #list % 2 == 1 then return list[mid + 1] end
+return (list[mid] + list[mid + 1]) / 2
+end
+
+
+
+function throughput.rate(recipeId, now, from)
+now = clock(now)
+local by = (from or loadRates())[recipeId] or {}
+local values, newest = {}, nil
+for _, r in pairs(by) do
+values[#values + 1] = r.rate
+if not newest or r.at > newest then newest = r.at end
+end
+local value = median(values)
+if not value then return nil, "unmeasured" end
+if now - newest > throughput.STALE * 1000 then return value, "stale" end
+return value, "measured"
+end
+
+
+
+
+function throughput.planned()
+local stored = state.read(PLANNED, {})
+return type(stored) == "table" and stored or {}
+end
+
+function throughput.setPlanned(name, on, horizon)
+local all = throughput.planned()
+if on then
+all[name] = {horizon = horizon or (all[name] and all[name].horizon)
+or throughput.HORIZON}
+else
+all[name] = nil
+end
+state.write(PLANNED, all)
+return all[name]
+end
+
+local function shortName(item) return (tostring(item):gsub("^[^:]+:", ""):gsub("_", " ")) end
+
+local function figure(x)
+if x >= 10 then return ("%d"):format(math.floor(x + 0.5)) end
+return ("%.1f"):format(x)
+end
+
+
+
+local function available(machine)
+local scripts = require("mfg.controller.scripts")
+if not machine.enabled or machine.state == scripts.FAULTED then return false end
+return machine.heldBy ~= "limit"
+end
+
+
+local function planType(t, free, setting, prev, now)
+local avail = {}
+for _, machine in ipairs(t.machines) do
+if available(machine) then avail[#avail + 1] = machine.name end
+end
+table.sort(avail)
+local horizon = (setting and setting.horizon) or throughput.HORIZON
+
+
+
+
+local owed = require("mfg.controller.dispatch").processDemand(t.name)
+
+local need, unmeasured, parts = 0, nil, {}
+for _, recipe in ipairs(t.makes) do
+local input = recipe.inputs[1]
+local rate, status = throughput.rate(recipe.id, now)
+local inflow = flows.inflow(input.item, now)
+local backlog = (free[input.item] or 0) / horizon
+local jobs = owed[recipe.output.item] or 0
+local perOutput = input.n / recipe.output.n
+
+local demand = inflow + backlog + jobs / horizon * perOutput
+if not rate or rate <= 0 then
+unmeasured = unmeasured or recipe.id
+else
+local perMachine = rate * perOutput
+need = need + demand / perMachine
+end
+parts[#parts + 1] = {recipe = recipe.id, input = input.item, inflow = inflow,
+free = free[input.item] or 0, jobs = jobs, demand = demand, rate = rate,
+status = status}
+end
+
+local target, why
+if unmeasured then
+
+target = #avail
+why = ("%s is not measured yet: all %d run"):format(unmeasured, #avail)
+else
+target = math.min(math.ceil(need - 1e-9), #avail)
+why = ("need %s"):format(figure(need))
+end
+
+
+local before = prev and prev.setpoint or #avail
+local setpoint = target
+if target < before then
+lowerFor[t.name] = (lowerFor[t.name] or 0) + 1
+if lowerFor[t.name] >= throughput.DOWN_AFTER then
+setpoint = before - 1
+else
+setpoint = before
+why = why .. (" -- lower for %d of %d cycles"):format(lowerFor[t.name],
+throughput.DOWN_AFTER)
+end
+else
+lowerFor[t.name] = 0
+end
+setpoint = math.max(0, math.min(setpoint, #avail))
+
+return {type = t.name, need = (not unmeasured) and need or nil, setpoint = setpoint,
+available = #avail, machines = #t.machines, run = {table.unpack(avail, 1, setpoint)},
+idle = {table.unpack(avail, setpoint + 1)}, why = why, parts = parts,
+unmeasured = unmeasured}
+end
+
+
+local function advise(t, p, free, now)
+local key = "plan." .. t.name
+local function clear(suffix) alarms.clear(key .. suffix) end
+local function raise(suffix, text)
+alarms.raise(key .. suffix, text, {source = "plan", severity = "advice"})
+end
+
+local enabled = 0
+for _, machine in ipairs(t.machines) do
+if machine.enabled then enabled = enabled + 1 end
+end
+if p.need and p.need > p.available then
+shortSince[t.name] = shortSince[t.name] or now
+if now - shortSince[t.name] >= throughput.SHORT_FOR * 1000 then
+local first = p.parts[1]
+local more = math.ceil(p.need - 1e-9) - p.available
+raise(".short", ("%s: need %d, %d enabled -- add %d %s (%s in at %s/min, %s/min "
+.. "each)"):format(t.name, math.ceil(p.need - 1e-9), enabled, more, t.name,
+shortName(first.input), figure(first.inflow),
+figure((first.rate or 0) * t.makes[1].inputs[1].n / t.makes[1].output.n)))
+end
+else
+shortSince[t.name] = nil
+clear(".short")
+end
+
+local work, wait, blocked = 0, 0, 0
+for _, machine in ipairs(t.machines) do
+local split = throughput.split(machine.name)
+if split then
+work, wait, blocked = work + split.work, wait + split.wait, blocked + split.blocked
+end
+end
+local on = work + wait + blocked
+local input = t.makes[1].inputs[1].item
+if on >= throughput.WINDOW and wait / on > throughput.MOSTLY and (free[input] or 0) > 0 then
+raise(".starved", ("%s: starved while the pool holds %s -- the script's supply is "
+.. "failing"):format(t.name, shortName(input)))
+else
+clear(".starved")
+end
+if on >= throughput.WINDOW and blocked / on > throughput.MOSTLY then
+raise(".blocked", ("%s: output not collected"):format(t.name))
+else
+clear(".blocked")
+end
+end
+
+local function same(a, b)
+if #a ~= #b then return false end
+for i = 1, #a do if a[i] ~= b[i] then return false end end
+return true
+end
+
+
+
+function throughput.plan(now)
+now = clock(now)
+loadRates()
+local pool = require("mfg.common.config").setting("source")
+local ok, free = pcall(require("mfg.controller.supervisor").available, pool)
+if not ok or type(free) ~= "table" then free = {} end
+local settings = throughput.planned()
+
+local types, held = {}, {}
+for _, t in ipairs(planTypes()) do
+local prev = plan.types[t.name]
+local p = planType(t, free, settings[t.name], prev, now)
+p.on = settings[t.name] ~= nil
+types[t.name] = p
+if p.on then
+for _, name in ipairs(p.idle) do
+held[name] = ("plan: %d of %d needed"):format(p.setpoint, p.available)
+end
+if not prev or prev.setpoint ~= p.setpoint or not same(prev.run or {}, p.run) then
+
+journal.record({action = "plan", params = {type = t.name},
+status = rpc.COMPLETED, by = "plan", at = now,
+reason = ("%s: %d of %d to run (%s)"):format(t.name, p.setpoint,
+p.available, p.why)})
+end
+advise(t, p, free, now)
+else
+
+shortSince[t.name] = nil
+for _, suffix in ipairs({".short", ".starved", ".blocked"}) do
+alarms.clear("plan." .. t.name .. suffix)
+end
+end
+end
+plan = {at = now, types = types, held = held}
+throughput.save(now)
+return plan
+end
+
+
+
+function throughput.held(name, now)
+if not plan.at or clock(now) - plan.at > throughput.FALLBACK * 1000 then return nil end
+return plan.held[name]
+end
+
+
+
+function throughput.save(now)
+local util = {}
+for name in pairs(live) do
+local split = throughput.split(name)
+if split then util[name] = split end
+end
+state.write(STORE, {at = clock(now), rates = loadRates(), plan = {at = plan.at,
+types = plan.types}, util = util})
+end
+
+
+function throughput.snapshot()
+local stored = state.read(STORE, {})
+return type(stored) == "table" and stored or {}
+end
+
+
+function throughput.view(now)
+local util = {}
+for name in pairs(live) do util[name] = throughput.split(name) end
+return {at = clock(now), rates = loadRates(), plan = {at = plan.at, types = plan.types},
+util = util}
+end
+
+
+
+function throughput.current(now)
+if plan.at or next(live) then return throughput.view(now) end
+local stored = throughput.snapshot()
+return {at = stored.at, rates = stored.rates or {},
+plan = type(stored.plan) == "table" and stored.plan or {types = {}},
+util = stored.util or {}}
+end
+
+
+
+function throughput.rates(only, now)
+now = clock(now)
+local view = throughput.current(now)
+local settings = throughput.planned()
+local out = {}
+for _, t in ipairs(planTypes()) do
+if not only or t.name == only then
+local recipes = {}
+for _, recipe in ipairs(t.makes) do
+local rate, status = throughput.rate(recipe.id, now, view.rates)
+local per = {}
+for machine, r in pairs(view.rates[recipe.id] or {}) do
+per[#per + 1] = {machine = machine, rate = r.rate, at = r.at}
+end
+table.sort(per, function(a, b) return a.machine < b.machine end)
+recipes[#recipes + 1] = {id = recipe.id, output = recipe.output,
+inputs = recipe.inputs, rate = rate, status = status, machines = per}
+end
+local machines = {}
+for _, m in ipairs(t.machines) do
+machines[#machines + 1] = {name = m.name, state = m.state,
+split = view.util[m.name]}
+end
+out[#out + 1] = {type = t.name, planned = settings[t.name] ~= nil,
+horizon = settings[t.name] and settings[t.name].horizon or nil,
+recipes = recipes, machines = machines}
+end
+end
+return out
+end
+
+
+
+function throughput.brief(name, script, view, now)
+local record = require("mfg.controller.scripts").get(script)
+if not record or not record.makes then return nil end
+local rate = nil
+for _, recipe in ipairs(record.makes) do
+local r = (view.rates[recipe.id] or {})[name]
+if r then rate = rate or r.rate end
+end
+local split = view.util[name]
+return {rate = rate, utilisation = split and split.utilisation or nil}
+end
+
+function throughput.clear()
+live, rates, plan, lowerFor, shortSince = {}, {}, {at = nil, types = {}, held = {}}, {}, {}
+
+counters, throughput.SESSION = {}, throughput.SESSION + 1
+state.clear(STORE)
+state.clear(PLANNED)
+end
+
+
+
+
+local lastPlan = nil
+function throughput.tick(now)
+now = clock(now)
+throughput.sample(now)
+throughput.closeWindows(now)
+if not lastPlan or now - lastPlan >= throughput.PLAN * 1000 then
+
+
+
+local resources = require("mfg.controller.resources")
+local ok, why = pcall(resources.migrate)
+if not ok then printError("resources: " .. tostring(why)) end
+ok, why = pcall(resources.cycle, now)
+if not ok then printError("resources: " .. tostring(why)) end
+throughput.plan(now)
+lastPlan = now
+end
+flows.flush(now)
+end
+
+
+function throughput.run()
+local interp = require("mfg.common.script.interp")
+while true do
+local ok, err = pcall(throughput.tick)
+if not ok then printError("plan: " .. tostring(err)) end
+local now = os.epoch("utc")
+sleep(math.max(0.05, (interp.beat(now, throughput.SAMPLE * 1000) - now) / 1000))
+end
+end
+
+return throughput

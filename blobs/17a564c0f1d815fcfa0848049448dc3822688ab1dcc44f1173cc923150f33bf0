@@ -1,0 +1,24 @@
+local rpc = require("mfg.common.rpc")
+local filters = require("mfg.controller.filters")
+
+
+return {
+name        = "filters",
+label       = "Filters",
+tier        = "node",
+quiet       = true,
+destructive = false,
+
+parameters = {},
+
+returns = {filters = "table"},
+
+run = function()
+local out = {}
+for _, record in ipairs(filters.all()) do
+out[#out + 1] = {name = record.name, source = record.source, rev = record.rev,
+entries = record.entries, users = filters.users(record.name)}
+end
+return rpc.COMPLETED, {filters = out}
+end,
+}

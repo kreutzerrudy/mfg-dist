@@ -1,0 +1,226 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local lex = require("mfg.common.script.lex")
+local store = require("mfg.storage")
+
+local filters = {}
+
+local STORE = "filters"
+local MODES = {include = true, exclude = true}
+
+local function load()
+local data = state.read(STORE, {})
+return type(data) == "table" and data or {}
+end
+
+local function save(data) return state.write(STORE, data) end
+
+
+
+
+
+function filters.parse(source)
+local lines, errors = lex.lines(source)
+local tree = {entries = {}}
+local notes = {}
+local seenHead = false
+for _, line in ipairs(lines) do
+if line.bad or line.blank then
+
+elseif #line.tokens == 0 then
+notes[#notes + 1] = line.comment
+else
+local toks = line.tokens
+local first = toks[1]
+if not seenHead then
+seenHead = true
+if line.indent ~= 0 or first.v ~= "filter" or not toks[2]
+or toks[2].t ~= "word" or #toks > 2 then
+errors[#errors + 1] = {line = line.line, col = first.col,
+message = "a filter starts with `filter <name>`"}
+else
+tree.name, tree.comment = toks[2].v, line.comment
+if #notes > 0 then tree.notes = notes end
+if lex.KEYWORDS[tree.name] then
+errors[#errors + 1] = {line = line.line, col = toks[2].col,
+message = ("`%s` is a keyword and cannot be a filter's name")
+:format(tree.name)}
+end
+end
+elseif line.indent ~= 1 or not MODES[first.v] or not toks[2]
+or toks[2].t ~= "item" or #toks > 2 then
+errors[#errors + 1] = {line = line.line, col = first.col,
+message = "each line under it is `include` or `exclude`, then an "
+.. "item or a #tag"}
+elseif toks[2].v:sub(1, 1) == "@" then
+errors[#errors + 1] = {line = line.line, col = toks[2].col,
+message = "a filter names items and tags, not another filter"}
+else
+tree.entries[#tree.entries + 1] = {mode = first.v, item = toks[2].v,
+comment = line.comment, notes = #notes > 0 and notes or nil}
+end
+notes = {}
+end
+end
+if #notes > 0 then tree.trailing = notes end
+if not seenHead then
+errors[#errors + 1] = {line = 1, col = 1, message = "a filter starts with `filter <name>`"}
+end
+return tree, errors
+end
+
+
+function filters.format(tree)
+local out = {}
+local function emit(indent, text, comment, notes)
+local pad = string.rep("\t", indent)
+for _, note in ipairs(notes or {}) do out[#out + 1] = pad .. "--" .. note end
+if comment then text = text .. "  --" .. comment end
+out[#out + 1] = pad .. text
+end
+emit(0, "filter " .. tostring(tree.name), tree.comment, tree.notes)
+for _, e in ipairs(tree.entries) do
+emit(1, ("%s %s"):format(e.mode, e.item), e.comment, e.notes)
+end
+for _, note in ipairs(tree.trailing or {}) do out[#out + 1] = "--" .. note end
+return table.concat(out, "\n") .. "\n"
+end
+
+
+local function selectorOf(record)
+local sel = {kind = "filter", include = {}, exclude = {}, name = nil}
+for _, e in ipairs(record.entries or {}) do
+local list = e.mode == "include" and sel.include or sel.exclude
+list[#list + 1] = e.item
+end
+return sel
+end
+
+
+
+
+function filters.check(source, pool)
+local tree, errors = filters.parse(source)
+local report = {tree = tree, errors = errors, warnings = {}, matches = {}, matched = {}}
+if #errors == 0 then
+local includes = 0
+for _, e in ipairs(tree.entries) do
+if e.mode == "include" then includes = includes + 1 end
+end
+if includes == 0 then
+
+errors[#errors + 1] = {line = 1, col = 1,
+message = "a filter needs at least one include"}
+end
+end
+report.ok = #errors == 0
+if not report.ok then return report end
+report.text = filters.format(tree)
+
+if pool then
+for _, e in ipairs(tree.entries) do
+local found = store.matching(pool, e.item) or {}
+local plain = {}
+for key, n in pairs(found) do
+local id = store.parse(key)
+plain[id] = (plain[id] or 0) + n
+end
+report.matches[e.item] = plain
+if next(plain) == nil then
+report.warnings[#report.warnings + 1] = {message = ("%s matches nothing "
+.. "in %s now"):format(e.item, pool)}
+end
+end
+for key, n in pairs(store.matching(pool, selectorOf(tree)) or {}) do
+local id = store.parse(key)
+report.matched[id] = (report.matched[id] or 0) + n
+end
+if next(report.matched) == nil then
+report.warnings[#report.warnings + 1] = {message = ("nothing in %s matches "
+.. "it now"):format(pool)}
+end
+end
+return report
+end
+
+
+
+function filters.get(name) return load()[name] end
+
+function filters.all()
+local out = {}
+for _, record in pairs(load()) do out[#out + 1] = record end
+table.sort(out, function(a, b) return a.name < b.name end)
+return out
+end
+
+
+function filters.users(name)
+local out = {}
+local ok, scripts = pcall(require, "mfg.controller.scripts")
+if not ok then return out end
+for _, t in ipairs(scripts.all()) do
+for _, used in ipairs(t.filters or {}) do
+if used == name then out[#out + 1] = t.name end
+end
+end
+return out
+end
+
+
+function filters.register(source, by, pool)
+local report = filters.check(source, pool)
+if not report.ok then return nil, report end
+local data = load()
+local previous = data[report.tree.name]
+data[report.tree.name] = {name = report.tree.name, source = report.text,
+entries = report.tree.entries, rev = (previous and previous.rev or 0) + 1,
+registered = {at = os.epoch("utc"), by = by}}
+save(data)
+return data[report.tree.name], report
+end
+
+
+function filters.forget(name)
+local data = load()
+if not data[name] then return nil, "no filter called " .. tostring(name) end
+local users = filters.users(name)
+if #users > 0 then
+return nil, ("%s is named by %s -- change those scripts first"):format(name,
+table.concat(users, ", "))
+end
+data[name] = nil
+save(data)
+return true
+end
+
+
+function filters.names()
+local out = {}
+for name in pairs(load()) do out[name] = true end
+return out
+end
+
+function filters.clear() state.clear(STORE) end
+
+
+function filters.selector(name)
+local record = load()[name]
+return record and selectorOf(record) or nil
+end
+
+store.filterSource = filters.selector
+
+return filters

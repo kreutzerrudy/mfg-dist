@@ -1,0 +1,28 @@
+local rpc = require("mfg.common.rpc")
+local filters = require("mfg.controller.filters")
+
+
+
+
+return {
+name        = "check_filter",
+label       = "Check a filter",
+tier        = "node",
+quiet       = true,
+destructive = false,
+
+parameters = {
+{name = "source", label = "Filter text", type = "text", required = true},
+},
+
+returns = {ok = "flag", errors = "table", warnings = "table", matches = "table"},
+
+run = function(params)
+local pool = require("mfg.common.config").setting("source")
+local report = filters.check(params.source, pool)
+return rpc.COMPLETED, {ok = report.ok, errors = report.errors,
+warnings = report.warnings, matches = report.matches,
+matched = report.matched, text = report.text,
+name = report.tree and report.tree.name}
+end,
+}

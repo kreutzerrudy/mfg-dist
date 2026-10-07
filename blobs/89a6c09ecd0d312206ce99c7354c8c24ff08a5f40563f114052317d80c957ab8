@@ -1,0 +1,23 @@
+local rpc = require("mfg.common.rpc")
+local filters = require("mfg.controller.filters")
+
+
+return {
+name        = "forget_filter",
+label       = "Forget a filter",
+tier        = "node",
+manual      = true,
+destructive = true,
+
+parameters = {
+{name = "filter", label = "Filter", type = "text", required = true},
+},
+
+returns = {filter = "text"},
+
+run = function(params)
+local ok, why = filters.forget(params.filter)
+if not ok then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, {filter = params.filter}
+end,
+}

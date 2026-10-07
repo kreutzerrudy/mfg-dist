@@ -1,0 +1,43 @@
+local rpc = require("mfg.common.rpc")
+local recipes = require("mfg.controller.recipes")
+
+
+
+
+return {
+name        = "recipe_types",
+label       = "Recipe types",
+tier        = "node",
+destructive = false,
+
+parameters = {},
+
+returns = {types = "table"},
+
+run = function()
+local scripts = require("mfg.controller.scripts")
+local byType = {}
+for _, t in ipairs(scripts.all()) do
+for _, recipeType in ipairs(t.runs or {}) do
+byType[recipeType] = byType[recipeType] or {}
+for _, m in ipairs(scripts.machines(t.name)) do
+local list = byType[recipeType]
+list[#list + 1] = {name = m.name, script = t.name, enabled = m.enabled,
+state = m.state}
+end
+end
+end
+local counts = {}
+for _, def in ipairs(recipes.all()) do
+
+local t = def.pattern and recipes.CRAFTING or (def.typed and def.type)
+if t then counts[t] = (counts[t] or 0) + 1 end
+end
+local out = {}
+for _, name in ipairs(recipes.types()) do
+out[#out + 1] = {name = name, recipes = counts[name] or 0,
+machines = byType[name] or {}}
+end
+return rpc.COMPLETED, {types = out}
+end,
+}

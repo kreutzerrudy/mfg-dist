@@ -1,0 +1,33 @@
+local rpc = require("mfg.common.rpc")
+local recipes = require("mfg.controller.recipes")
+
+
+
+
+return {
+name        = "add_recipe",
+label       = "Type a recipe in",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "type", label = "Recipe type", type = "text", required = true},
+{name = "inputs", label = "Inputs", type = "items", required = true},
+{name = "item", label = "Makes", type = "item", required = true},
+{name = "count", label = "How many", type = "number", integer = true, min = 1,
+max = 64, required = false},
+},
+
+returns = {recipe = "table"},
+
+run = function(params)
+local inputs = {}
+for item, n in pairs(params.inputs or {}) do inputs[#inputs + 1] = {item = item, n = n} end
+table.sort(inputs, function(a, b) return a.item < b.item end)
+local recipe, why = recipes.addTyped({type = params.type, inputs = inputs,
+output = {item = params.item, count = params.count or 1}})
+if not recipe then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, {recipe = recipe}
+end,
+}

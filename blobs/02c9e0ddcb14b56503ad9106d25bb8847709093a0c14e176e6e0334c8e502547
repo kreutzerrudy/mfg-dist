@@ -1,0 +1,31 @@
+local rpc = require("mfg.common.rpc")
+local filters = require("mfg.controller.filters")
+
+
+
+
+return {
+name        = "register_filter",
+label       = "Keep a filter",
+tier        = "node",
+manual      = true,
+destructive = true,
+
+parameters = {
+{name = "source", label = "Filter text", type = "text", required = true},
+},
+
+returns = {filter = "text", rev = "number"},
+
+run = function(params, ctx)
+local pool = require("mfg.common.config").setting("source")
+local record, report = filters.register(params.source, ctx and ctx.by, pool)
+if not record then
+local first = report.errors[1] or {}
+return rpc.REJECTED, {reason = ("line %s: %s"):format(tostring(first.line),
+tostring(first.message)), errors = report.errors}
+end
+return rpc.COMPLETED, {filter = record.name, rev = record.rev,
+warnings = report.warnings, matched = report.matched}
+end,
+}

@@ -1,0 +1,90 @@
+local rpc = require("mfg.common.rpc")
+local recipes = require("mfg.controller.recipes")
+local runs = require("mfg.controller.runs")
+
+
+
+
+
+
+
+
+
+
+
+local function sortedInputs(map)
+local list = {}
+for item, n in pairs(map or {}) do list[#list + 1] = {item = item, n = n} end
+table.sort(list, function(a, b) return a.item < b.item end)
+return list
+end
+
+local function said(req)
+return {id = req.id, state = req.state, status = req.status, reason = req.reason,
+machine = req.machine, recipe = req.recipe and req.recipe.id and req.recipe or nil,
+collected = req.collected}
+end
+
+return {
+name        = "learn_recipe",
+label       = "Learn a recipe on a machine",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "type", label = "Recipe type", type = "text", required = false},
+{name = "machine", label = "Machine", type = "text", required = false},
+{name = "inputs", label = "Inputs", type = "items", required = false},
+{name = "id", label = "A learn already asked", type = "number", integer = true,
+required = false},
+},
+
+returns = {id = "number", state = "text", recipe = "table"},
+
+run = function(params)
+if params.id then
+local req = runs.get(params.id)
+if not req then return rpc.REJECTED, {reason = "no such learn: " .. params.id} end
+local out = said(req)
+if req.state == "done" and req.recipe and req.recipe.id then
+out.recipe = req.recipe
+end
+return rpc.COMPLETED, out
+end
+
+local recipeType = params.type
+if not recipeType or recipeType == recipes.CRAFTING then
+return rpc.REJECTED, {reason = "learn a crafting recipe on the crafting grid; "
+.. "a machine learns a typed one, like pressing"}
+end
+local ok, why = recipes.addType(recipeType)
+if not ok then return rpc.REJECTED, {reason = why} end
+local inputs = sortedInputs(params.inputs)
+if #inputs == 0 then return rpc.REJECTED, {reason = "a recipe needs an input"} end
+
+local scripts = require("mfg.controller.scripts")
+local machine = scripts.machine(params.machine or "")
+if not machine then
+return rpc.REJECTED, {reason = "no such machine: " .. tostring(params.machine)}
+end
+local script = scripts.get(machine.script)
+local runsIt = false
+for _, t in ipairs(script and script.runs or {}) do
+if t == recipeType then runsIt = true end
+end
+if not runsIt then
+return rpc.REJECTED, {reason = ("%s does not run %s -- its script needs "
+.. "`runs %s` and an `on run` handler"):format(machine.name, recipeType,
+recipeType)}
+end
+if not machine.enabled then
+return rpc.REJECTED, {reason = machine.name .. " is not enabled"}
+end
+
+local id, busy = runs.request(machine.name, {learn = true,
+recipe = {type = recipeType, inputs = inputs}})
+if not id then return rpc.REJECTED, {reason = machine.name .. ": " .. busy} end
+return rpc.COMPLETED, said(runs.get(id))
+end,
+}

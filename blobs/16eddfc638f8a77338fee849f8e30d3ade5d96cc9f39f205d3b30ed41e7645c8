@@ -1,0 +1,337 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local pattern = require("mfg.common.pattern")
+
+local recipes = {}
+
+local STORE = "recipes"
+
+
+
+
+
+recipes.CRAFTING = "crafting"
+recipes.TYPES = {"crafting", "smelting", "alloying", "pressing"}
+
+
+local function migrate(value, from)
+if from ~= 1 then error("no migration from schema " .. tostring(from), 0) end
+for _, def in pairs(value.recipes or {}) do def.type = def.type or recipes.CRAFTING end
+return value
+end
+
+local OPTS = {schema = 2, migrate = migrate}
+
+local function load()
+local data, why = state.read(STORE, {recipes = {}, rev = 0, seq = 0}, OPTS)
+if why then error("the recipe book is unreadable: " .. why, 0) end
+if type(data) ~= "table" or type(data.recipes) ~= "table" then
+data = {recipes = {}, rev = 0, seq = 0}
+end
+return data
+end
+
+local function save(data)
+data.rev = (data.rev or 0) + 1
+return state.write(STORE, data, OPTS)
+end
+
+
+
+
+
+
+
+
+local function shortName(item) return (tostring(item):match("[^:]+$") or item) end
+
+function recipes.isProcess(id)
+return type(id) == "string" and id:match("^%d+=") == nil
+end
+
+
+local function processRecipes()
+local ok, scripts = pcall(require, "mfg.controller.scripts")
+if not ok then return {} end
+local out = {}
+for _, t in ipairs(scripts.all()) do
+if t.makes then
+local enabled = 0
+for _, m in ipairs(scripts.machines(t.name)) do
+if m.enabled then enabled = enabled + 1 end
+end
+for _, r in ipairs(t.makes) do
+local inputs = {}
+for _, input in ipairs(r.inputs) do
+inputs[input.item] = (inputs[input.item] or 0) + input.n
+end
+out[#out + 1] = {id = r.id, process = t.name, inputs = inputs,
+label = ("%s (%s)"):format(shortName(r.output.item), t.name),
+output = {item = r.output.item, count = r.output.n},
+machines = enabled}
+end
+end
+end
+return out
+end
+
+
+local function runners(recipeType)
+local ok, scripts = pcall(require, "mfg.controller.scripts")
+if not ok then return 0 end
+local runs = {}
+for _, t in ipairs(scripts.all()) do
+for _, name in ipairs(t.runs or {}) do
+if name == recipeType then runs[t.name] = true end
+end
+end
+local n = 0
+for _, m in ipairs(scripts.machines()) do
+if runs[m.script] and m.enabled then n = n + 1 end
+end
+return n
+end
+
+
+
+
+
+local function view(def)
+if not def then return nil end
+def.type = def.type or recipes.CRAFTING
+if def.pattern then
+def.inputs = pattern.occurrences(def.pattern)
+else
+def.inputs = {}
+for _, side in ipairs(def.list or {}) do
+def.inputs[side.item] = (def.inputs[side.item] or 0) + side.n
+end
+def.process, def.typed = def.type, true
+def.machines = runners(def.type)
+end
+return def
+end
+
+function recipes.get(id)
+local stored = load().recipes[id]
+if stored then return view(stored) end
+if recipes.isProcess(id) then
+for _, def in ipairs(processRecipes()) do
+if def.id == id then return def end
+end
+return nil
+end
+return nil
+end
+
+
+function recipes.all()
+local out = {}
+for _, def in pairs(load().recipes) do out[#out + 1] = view(def) end
+for _, def in ipairs(processRecipes()) do out[#out + 1] = def end
+table.sort(out, function(a, b)
+if a.label ~= b.label then return a.label < b.label end
+return a.id < b.id
+end)
+return out
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+function recipes.producing(item)
+local idle = nil
+local processes = processRecipes()
+for _, def in pairs(load().recipes) do
+if not def.pattern then processes[#processes + 1] = view(def) end
+end
+table.sort(processes, function(a, b) return a.id < b.id end)
+for _, def in ipairs(processes) do
+if def.output.item == item then
+if def.machines > 0 then return def end
+idle = idle or def
+end
+end
+local best = nil
+for _, def in pairs(load().recipes) do
+if def.pattern and def.output.item == item and (not best or def.seq < best.seq) then
+best = def
+end
+end
+return view(best) or idle
+end
+
+
+
+
+
+
+
+function recipes.add(def)
+if type(def) ~= "table" or type(def.pattern) ~= "table" or next(def.pattern) == nil then
+return nil, "a recipe needs a pattern"
+end
+local inGrid, why = pattern.inGrid(def.pattern)
+if not inGrid then return nil, why end
+local output = def.output
+if type(output) ~= "table" or type(output.item) ~= "string"
+or type(output.count) ~= "number" or output.count < 1 then
+return nil, "a recipe needs an output: an item and a count"
+end
+
+local id = pattern.id(def.pattern)
+local data = load()
+local existing = data.recipes[id]
+if existing then
+return nil, ("that pattern is already registered, as %s"):format(existing.label)
+end
+
+data.seq = (data.seq or 0) + 1
+data.recipes[id] = {
+id = id,
+type = recipes.CRAFTING,
+label = def.label or output.item:match("[^:]+$") or output.item,
+pattern = def.pattern,
+output = {item = output.item, count = output.count},
+byproducts = def.byproducts,
+registered = def.registered,
+seq = data.seq,
+}
+save(data)
+return view(data.recipes[id])
+end
+
+
+
+
+function recipes.validType(name)
+return type(name) == "string" and name:match("^[a-z][a-z0-9_]*$") ~= nil
+and #name <= 20
+end
+
+
+function recipes.types()
+local out, seen = {}, {}
+for _, name in ipairs(recipes.TYPES) do out[#out + 1] = name; seen[name] = true end
+for _, name in ipairs(load().types or {}) do
+if not seen[name] then out[#out + 1] = name; seen[name] = true end
+end
+return out
+end
+
+
+
+function recipes.addType(name)
+if not recipes.validType(name) then
+return nil, ("a recipe type is a lowercase word, like pressing -- not %s")
+:format(tostring(name))
+end
+for _, known in ipairs(recipes.types()) do
+if known == name then return true end
+end
+local data = load()
+data.types = data.types or {}
+data.types[#data.types + 1] = name
+save(data)
+return true
+end
+
+
+
+
+function recipes.addTyped(def)
+if type(def) ~= "table" then return nil, "a recipe needs a type, inputs and an output" end
+if def.type == recipes.CRAFTING then
+return nil, "a crafting recipe is a pattern: register it on the crafting grid"
+end
+local ok, why = recipes.addType(def.type)
+if not ok then return nil, why end
+local output = def.output
+if type(output) ~= "table" or type(output.item) ~= "string"
+or type(output.count) ~= "number" or output.count < 1 then
+return nil, "a recipe needs an output: an item and a count"
+end
+if type(def.inputs) ~= "table" or #def.inputs == 0 then
+return nil, "a recipe needs at least one input"
+end
+local list = {}
+for _, side in ipairs(def.inputs) do
+if type(side) ~= "table" or type(side.item) ~= "string"
+or type(side.n) ~= "number" or side.n < 1 then
+return nil, "each input is an item and a count"
+end
+list[#list + 1] = {item = side.item, n = side.n}
+end
+
+local id = ("%s/%s"):format(def.type, output.item)
+local data = load()
+if data.recipes[id] then
+return nil, ("%s already has a recipe for %s"):format(def.type, output.item)
+end
+data.seq = (data.seq or 0) + 1
+data.recipes[id] = {
+id = id,
+type = def.type,
+label = def.label or ("%s (%s)"):format(output.item:match("[^:]+$") or output.item,
+def.type),
+list = list,
+output = {item = output.item, count = output.count},
+learned = def.learned,
+seq = data.seq,
+}
+save(data)
+return view(data.recipes[id])
+end
+
+
+
+function recipes.remove(id)
+if recipes.isProcess(id) and not load().recipes[id] then
+return nil, ("%s is a machine's recipe: remove the `makes` line from its "
+.. "script"):format(tostring(id))
+end
+local data = load()
+local existing = data.recipes[id]
+if not existing then return nil, "no such recipe: " .. tostring(id) end
+data.recipes[id] = nil
+save(data)
+return existing
+end
+
+
+
+
+function recipes.setsFor(def, quantity)
+local sets = math.ceil(quantity / def.output.count)
+return sets, sets * def.output.count
+end
+
+return recipes
