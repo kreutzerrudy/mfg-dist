@@ -1,0 +1,418 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+
+local panes = {}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+panes.LEADER = "tab"
+
+
+
+panes.BACK = panes.LEADER
+
+
+panes.COLUMN = 14
+
+function panes.new(opts)
+opts = opts or {}
+return {
+title = opts.title,
+apps = {},
+order = {},
+current = nil,
+previous = nil,
+drawerOpen = false,
+cursor = nil,
+}
+end
+
+
+
+
+
+
+
+
+
+
+function panes.add(host, app)
+if type(app) ~= "table" or type(app.name) ~= "string" then
+return nil, "an app needs a name"
+end
+if type(app.render) ~= "function" then
+return nil, ("app %s needs a render function"):format(app.name)
+end
+if host.apps[app.name] then
+return nil, ("app %s is already declared"):format(app.name)
+end
+
+host.apps[app.name] = app
+host.order[#host.order + 1] = app.name
+if not host.current then host.current = app.name end
+return app
+end
+
+
+
+function panes.select(host, name)
+if not host.apps[name] then return false, "no such app: " .. tostring(name) end
+if name ~= host.current then host.previous = host.current end
+host.current = name
+host.drawerOpen = false
+return true
+end
+
+function panes.app(host)
+return host.apps[host.current]
+end
+
+local function keyOf(host, name)
+local app = host.apps[name]
+if app.key then return app.key end
+for i, other in ipairs(host.order) do
+if other == name then return tostring(i) end
+end
+end
+
+function panes.openDrawer(host)
+host.drawerOpen = true
+host.cursor = host.current
+end
+
+function panes.closeDrawer(host)
+host.drawerOpen = false
+end
+
+
+
+local function headerElement(host)
+local app = panes.app(host)
+
+
+
+
+local hint = host.title
+if host.leaderPending then
+hint = (hint and (hint .. " ") or "") .. "TAB.."
+elseif hint then
+hint = hint .. " tab+"
+end
+
+local children = {
+doc.button("= Apps", {
+action = {kind = "drawer"},
+colour = host.drawerOpen and "selected" or "action",
+style = "tab",
+keep = doc.REQUIRED,
+name = "apps",
+}),
+doc.gap(1),
+
+
+doc.text(app and (app.label or app.name) or "", {colour = "text",
+width = "fill", truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+name = "current"}),
+}
+if hint then
+children[#children + 1] = doc.text(hint, {
+colour = host.leaderPending and "warn" or "label",
+keep = 3, name = "title"})
+end
+
+return doc.row(children, {keep = doc.REQUIRED, name = "header", bg = "bar"})
+end
+
+
+
+
+local function groupsOf(host)
+local groups, byName = {}, {}
+for _, name in ipairs(host.order) do
+local label = host.apps[name].group or ""
+local group = byName[label]
+if not group then
+group = {label = label, apps = {}}
+byName[label] = group
+groups[#groups + 1] = group
+end
+group.apps[#group.apps + 1] = name
+end
+return groups
+end
+
+
+
+local function columnsOf(groups, count)
+if count >= #groups then
+local out = {}
+for i, group in ipairs(groups) do out[i] = {group} end
+return out
+end
+local total = 0
+for _, group in ipairs(groups) do total = total + #group.apps + 2 end
+local target = math.ceil(total / count)
+local out, column, used = {}, {}, 0
+for _, group in ipairs(groups) do
+local size = #group.apps + 2
+if used > 0 and used + size > target and #out < count - 1 then
+out[#out + 1] = column
+column, used = {}, 0
+end
+column[#column + 1] = group
+used = used + size
+end
+out[#out + 1] = column
+return out
+end
+
+local function drawerElement(host, width)
+local count = math.max(1, math.floor((width + 1) / (panes.COLUMN + 1)))
+local columns = columnsOf(groupsOf(host), count)
+
+local row = {}
+for c, column in ipairs(columns) do
+if c > 1 then row[#row + 1] = doc.gap(1) end
+local rows = {}
+for g, group in ipairs(column) do
+if g > 1 then rows[#rows + 1] = doc.text("", {keep = 2}) end
+if group.label ~= "" then
+rows[#rows + 1] = doc.text(group.label:upper(), {colour = "label",
+keep = 3, name = "group " .. group.label})
+end
+for _, name in ipairs(group.apps) do
+local app = host.apps[name]
+local usable = (app.ready == nil) or app.ready()
+local key = keyOf(host, name)
+rows[#rows + 1] = doc.button(app.label or name, {
+
+
+key = input.scoped(panes.LEADER, key),
+keyLabel = key,
+width = "fill",
+align = "left",
+style = "row",
+colour = (host.cursor == name) and "selected"
+or (usable and "action" or "dim"),
+action = {kind = "app", app = name},
+
+keep = doc.REQUIRED,
+name = name,
+})
+end
+end
+row[#row + 1] = doc.stack(rows, {width = panes.COLUMN, keep = doc.REQUIRED,
+name = "column " .. c})
+end
+return doc.stack({
+doc.row(row, {keep = doc.REQUIRED, name = "drawer"}),
+}, {name = "drawer pane"})
+end
+
+panes.headerElement = headerElement
+panes.drawerElement = drawerElement
+
+
+
+
+
+
+
+
+function panes.document(host, width, height)
+local app = panes.app(host)
+if not app then
+return doc.stack({
+doc.text("NO APPS", {colour = "bad", keep = doc.REQUIRED}),
+}, {name = "empty"})
+end
+
+local paneHeight = math.max(1, height - 1)
+return doc.stack({
+headerElement(host),
+host.drawerOpen and drawerElement(host, width) or app.render(width, paneHeight),
+}, {name = "host"})
+end
+
+function panes.render(host, width, height, opts)
+return doc.render(panes.document(host, width, height), width, height, opts)
+end
+
+
+
+
+local function moveCursor(host, step)
+local at = 1
+for i, name in ipairs(host.order) do
+if name == host.cursor then at = i end
+end
+host.cursor = host.order[((at - 1 + step) % #host.order) + 1]
+end
+
+
+local function byKey(host, char)
+for _, name in ipairs(host.order) do
+if keyOf(host, name) == char then return name end
+end
+end
+
+
+
+local function drawerKey(host, event)
+if event.kind == "char" then
+local name = byKey(host, event.char)
+if name then
+panes.select(host, name)
+return true, {kind = "app", app = name}
+end
+return false
+end
+local key = input.keyName(event)
+if key == "up" or key == "left" then
+moveCursor(host, -1)
+elseif key == "down" or key == "right" then
+moveCursor(host, 1)
+elseif key == "enter" then
+panes.select(host, host.cursor or host.current)
+return true, {kind = "app", app = host.current}
+elseif key == "backspace" then
+panes.closeDrawer(host)
+return true, {kind = "drawer"}
+else
+return false
+end
+return true, {kind = "cursor"}
+end
+
+
+
+
+
+function panes.handle(host, event, grid)
+if not event then return false end
+
+local isLeader = event.kind == "key" and keys
+and event.key == keys[panes.LEADER]
+
+
+if isLeader and host.leaderPending then
+host.leaderPending = false
+panes.closeDrawer(host)
+if host.previous and host.apps[host.previous] then
+panes.select(host, host.previous)
+end
+return true, {kind = "app", app = host.current}
+end
+
+
+
+
+if isLeader then
+host.leaderPending = true
+panes.openDrawer(host)
+return true, {kind = "leader"}
+end
+
+
+
+
+
+
+if host.leaderPending then
+host.leaderPending = false
+local scoped = input.actionFor(grid, event, {leader = panes.LEADER})
+if scoped and scoped.kind == "app" then
+panes.select(host, scoped.app)
+return true, scoped
+end
+if event.kind == "char" then
+local name = byKey(host, event.char)
+if name then
+panes.select(host, name)
+return true, {kind = "app", app = name}
+end
+return false
+end
+if host.drawerOpen and event.kind == "key" then return drawerKey(host, event) end
+return false
+end
+
+if host.drawerOpen and (event.kind == "char" or event.kind == "key") then
+return drawerKey(host, event)
+end
+
+local action = input.actionFor(grid, event)
+if action and action.kind == "drawer" then
+if host.drawerOpen then panes.closeDrawer(host) else panes.openDrawer(host) end
+return true, action
+end
+if action and action.kind == "app" then
+panes.select(host, action.app)
+return true, action
+end
+
+if host.drawerOpen then return false, action end
+
+if not action then
+
+
+
+local app = panes.app(host)
+if app and app.handle then return app.handle(nil, event) end
+return false
+end
+
+local app = panes.app(host)
+if app and app.handle then return app.handle(action, event), action end
+return false, action
+end
+
+return panes

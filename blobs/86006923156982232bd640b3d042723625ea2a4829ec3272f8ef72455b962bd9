@@ -1,0 +1,289 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local panes = require("mfg.hmi.panes")
+local app = require("mfg.hmi.app")
+local panel = require("mfg.hmi.panel")
+local order = require("mfg.hmi.orderpanel")
+local storage = require("mfg.hmi.storagepanel")
+local machines = require("mfg.hmi.machinespanel")
+local bindpanel = require("mfg.hmi.bindpanel")
+local playerpanel = require("mfg.hmi.playerpanel")
+local stockpanel = require("mfg.hmi.stockpanel")
+local resourcespanel = require("mfg.hmi.resourcespanel")
+
+
+
+local APPS = {
+{name = "order", label = "Order", group = "Use"},
+{name = "storage", label = "Storage", group = "Use"},
+{name = "register", label = "Register", group = "Make"},
+{name = "machines", label = "Machines", group = "Make"},
+{name = "stock", label = "Stock", group = "Watch"},
+{name = "resources", label = "Res", group = "Watch"},
+{name = "batch", label = "Batch", group = "Setup"},
+{name = "bind", label = "Bind", group = "Setup"},
+}
+
+local host = {}
+
+
+
+
+
+local function ownerOf(opts)
+if opts.player ~= nil then return opts.player or nil end
+local ok, owner = pcall(function() return require("mfg.hmi.lock").owner() end)
+return ok and owner or nil
+end
+
+function host.new(opts)
+opts = opts or {}
+local owner = ownerOf(opts)
+
+
+local shared = {host = opts.host, display = opts.display,
+transport = opts.transport, now = opts.now, source = opts.source, names = {}}
+local function with(extra)
+local out = {}
+for k, v in pairs(shared) do out[k] = v end
+for k, v in pairs(extra) do out[k] = v end
+return out
+end
+
+local screen = panes.new({title = "MFG"})
+screen.display = opts.display
+screen.views = {
+order = order.new(shared),
+register = panel.new(with({action = "register_recipe", verb = "Register",
+title = "REGISTER",
+note = "Crafts one set to learn what it makes. The product stays in the "
+.. "pool."})),
+batch = panel.new(with({action = "run_batch", verb = "Run", title = "BATCH"})),
+storage = storage.new(shared),
+machines = machines.new(shared),
+bind = bindpanel.new(shared),
+stock = stockpanel.new(shared),
+resources = resourcespanel.new(shared),
+}
+screen.modules = {order = order, register = panel, batch = panel, storage = storage,
+machines = machines, bind = bindpanel, stock = stockpanel,
+resources = resourcespanel}
+local apps = {}
+for index, entry in ipairs(APPS) do
+apps[index] = {name = entry.name, label = entry.label, group = entry.group,
+key = tostring(index)}
+end
+if owner then
+
+
+screen.views.player = playerpanel.new(shared)
+screen.modules.player = playerpanel
+table.insert(apps, 1, {name = "player", label = "Me", group = "Use", key = "0"})
+end
+
+for _, entry in ipairs(apps) do
+local name = entry.name
+local view, module = screen.views[name], screen.modules[name]
+panes.add(screen, {
+name = name,
+label = entry.label,
+key = entry.key,
+group = entry.group,
+render = function(width, height) return module.document(view, width, height) end,
+handle = function(action) return module.act(view, action) end,
+ready = function() return view.offer ~= nil end,
+})
+end
+return screen
+end
+
+function host.view(screen, name)
+return screen.views[name or screen.current]
+end
+
+
+
+
+
+
+local function markOnScreen(screen)
+for name, view in pairs(screen.views) do view.onScreen = (name == screen.current) end
+end
+
+local function chosen(screen)
+markOnScreen(screen)
+local module = screen.modules[screen.current]
+if module.refresh then module.refresh(screen.views[screen.current]) end
+end
+
+function host.select(screen, name)
+local ok, why = panes.select(screen, name)
+if ok then chosen(screen) end
+return ok, why
+end
+
+
+local function followJump(screen)
+local view = host.view(screen)
+local jump = view and view.jump
+if not jump then return end
+view.jump = nil
+if host.select(screen, jump.app) and jump.action then
+screen.modules[jump.app].act(screen.views[jump.app], jump.action)
+end
+end
+
+
+
+
+function host.render(screen)
+local display = screen.display
+markOnScreen(screen)
+local width, height = display.size()
+local opts = {keys = not display.touchable(), colour = display.colour()}
+
+local grid, report = panes.render(screen, width, height, opts)
+local view, module = host.view(screen), screen.modules[screen.current]
+if grid and not screen.drawerOpen and module.settle
+and module.settle(view, report) then
+grid, report = panes.render(screen, width, height, opts)
+end
+
+if not grid then
+local diagnostic = doc.text("screen too small: " .. doc.explain(report),
+{colour = "bad", wrap = true, keep = doc.REQUIRED, name = "diagnostic"})
+grid = doc.render(diagnostic, width, height, opts)
+end
+screen.lastReport = report
+if grid then display.paint(grid) end
+return grid
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function host.handle(screen, event, grid)
+if not event then return false end
+
+
+if event.kind == "act" or event.kind == "carry" or event.kind == "drop" then
+if screen.drawerOpen then return false end
+local module, view = screen.modules[screen.current], host.view(screen)
+
+
+local outcome = module.act(view, event.kind == "act" and event.action
+or {kind = event.kind, drag = event.drag, over = event.over, x = event.x})
+followJump(screen)
+return outcome
+end
+local isLeader = event.kind == "key" and keys and event.key == keys[panes.LEADER]
+local module, view = screen.modules[screen.current], host.view(screen)
+
+if not isLeader and not screen.leaderPending and not screen.drawerOpen then
+local took, chose
+if module.keyboard then
+took, chose = module.keyboard(view, event)
+else
+local list = module.searching and module.searching(view)
+if list then took, chose = app.type(list, event) end
+end
+if took then
+if chose then module.act(view, chose) end
+followJump(screen)
+return true
+end
+end
+if not isLeader and not input.heard(event) then
+return false
+end
+if event.kind == "scroll" or event.kind == "drag" then return false end
+local before = screen.current
+local outcome, action = panes.handle(screen, event, grid)
+followJump(screen)
+if screen.current ~= before then chosen(screen) end
+
+
+
+
+local quiet = {leader = true, scrollbar = true, focus = true, cursor = true}
+if outcome and action and not quiet[action.kind] then
+app.sound({display = screen.display},
+screen.current ~= before and "tab" or "click")
+end
+return outcome
+end
+
+
+
+
+
+function host.pass(screen)
+local names = {screen.current}
+for _, name in ipairs(screen.order) do
+if name ~= screen.current then names[#names + 1] = name end
+end
+for _, name in ipairs(names) do
+local view, module = screen.views[name], screen.modules[name]
+local job = module.nextJob(view)
+if job then
+module.exchange(view, job)
+return true
+end
+end
+return false
+end
+
+function host.serve(screen, opts)
+opts = opts or {}
+while true do
+if not host.pass(screen) then sleep(opts.idle or 0.2) end
+end
+end
+
+function host.run(screen, opts)
+opts = opts or {}
+parallel.waitForAny(
+function() host.serve(screen, opts) end,
+function()
+input.drive(screen.display,
+function() return host.render(screen) end,
+function(event, grid) return host.handle(screen, event, grid) end,
+{wait = opts.wait or 1})
+end)
+end
+
+return host
