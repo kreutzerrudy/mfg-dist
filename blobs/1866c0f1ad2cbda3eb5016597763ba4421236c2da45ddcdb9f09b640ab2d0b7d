@@ -1,0 +1,1149 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local state = require("mfg.common.state")
+local actions = require("mfg.common.actions")
+local rpc = require("mfg.common.rpc")
+local recipes = require("mfg.controller.recipes")
+local dispatch = require("mfg.controller.dispatch")
+local alarms = require("mfg.controller.alarms")
+
+local resources = {}
+
+local STORE = "resources"
+
+resources.LOW = 0.75
+resources.MAX = 1000000
+resources.MAKE_MAX = 4096
+resources.PACK_MIN = 8
+resources.STACK = 64
+resources.ADVISE_AFTER = 2
+
+resources.OFF, resources.MET, resources.PACKING = "off", "met", "packing"
+resources.UNPACKING, resources.ADVICE, resources.LOWSTATE = "unpacking", "advice", "low"
+resources.GATHERING = "gathering"
+
+local strikes = {}
+local said = {}
+local gathering = {}
+local migrated
+local sources = {}
+local lastCycle = nil
+local since = {}
+local kept = {}
+local engagedNow = {}
+
+resources.FALLBACK = 300
+resources.NOTHING_AFTER = 600
+resources.HORIZON = 30
+resources.DOWN_AFTER = 5
+
+
+function resources.reset()
+gathering, sources, lastCycle, since, kept, engagedNow = {}, {}, nil, {}, {}, {}
+migrated = false
+end
+
+
+
+local function load()
+local data = state.read(STORE, {groups = {}, nextId = 1})
+if type(data) ~= "table" or type(data.groups) ~= "table" then
+data = {groups = {}, nextId = 1}
+end
+return data
+end
+
+local function save(data) state.write(STORE, data) end
+
+function resources.all()
+local out = {}
+for _, group in pairs(load().groups) do out[#out + 1] = group end
+table.sort(out, function(a, b) return a.id < b.id end)
+return out
+end
+
+function resources.get(id) return load().groups[id] end
+
+
+function resources.groupFor(item)
+for _, group in pairs(load().groups) do
+for _, form in ipairs(group.forms) do
+if form.item == item then return group end
+end
+end
+return nil
+end
+
+local function defaultLow(keep) return math.floor(keep * resources.LOW + 0.5) end
+
+
+
+
+
+local function single(def)
+local item, n = nil, 0
+for what, count in pairs(def.inputs or {}) do
+if item then return nil end
+item, n = what, count
+end
+return item, n
+end
+
+
+
+
+
+
+function resources.links(unit)
+local toUnit, fromUnit = {}, {}
+for _, def in ipairs(recipes.all()) do
+local item, n = single(def)
+if item and def.output.item == unit and item ~= unit then
+
+local entry = {per = def.output.count / n, recipe = def.id, process = def.process}
+if not toUnit[item] or (toUnit[item].process and not def.process) then
+toUnit[item] = entry
+end
+elseif item == unit and def.output.item ~= unit and not def.process then
+local into = def.output.item
+fromUnit[into] = fromUnit[into] or {per = n / def.output.count, recipe = def.id}
+end
+end
+local out, bad = {}, {}
+for item, back in pairs(toUnit) do
+local forward = fromUnit[item]
+
+
+if forward and back.per > 1 and not back.process then
+if math.abs(forward.per - back.per) < 1e-9 then
+out[#out + 1] = {item = item, per = back.per, role = "store",
+pack = forward.recipe, unpack = back.recipe}
+else
+bad[item] = ("%s packs as %s but unpacks as %s"):format(item,
+forward.per, back.per)
+end
+else
+out[#out + 1] = {item = item, per = back.per, role = "input", recipe = back.recipe}
+end
+end
+table.sort(out, function(a, b)
+if a.per ~= b.per then return a.per > b.per end
+return a.item < b.item
+end)
+return out, bad
+end
+
+
+
+local function buildForms(unit, wanted)
+local linked, bad = resources.links(unit)
+local byItem = {}
+for _, form in ipairs(linked) do byItem[form.item] = form end
+local forms = {{item = unit, per = 1, role = "unit"}}
+local list = wanted
+if not list then
+list = {}
+for _, form in ipairs(linked) do list[#list + 1] = form.item end
+end
+local stores = 0
+for _, item in ipairs(list) do
+if item ~= unit then
+local form = byItem[item]
+if not form then
+if bad[item] then return nil, bad[item] end
+return nil, ("register a recipe between %s and %s first"):format(unit, item)
+end
+if form.role == "store" then
+stores = stores + 1
+
+if stores > 1 then
+return nil, ("one packed form per group for now -- %s is a second"):format(item)
+end
+end
+forms[#forms + 1] = form
+end
+end
+return forms
+end
+
+local function storeForm(group)
+for _, form in ipairs(group.forms) do
+if form.role == "store" then return form end
+end
+return nil
+end
+
+
+
+
+
+function resources.linkable(group, data)
+data = data or load()
+local has, packed = {}, false
+for _, form in ipairs(group.forms or {}) do
+has[form.item] = true
+packed = packed or form.role == "store"
+end
+local out = {}
+for _, form in ipairs((resources.links(group.unit))) do
+local taken = false
+for _, other in pairs(data.groups) do
+if other.id ~= group.id then
+for _, theirs in ipairs(other.forms or {}) do
+if theirs.item == form.item then taken = true end
+end
+end
+end
+if not has[form.item] and not taken and not (form.role == "store" and packed) then
+out[#out + 1] = form.item
+if form.role == "store" then packed = true end
+end
+end
+return out
+end
+
+
+
+
+
+
+function resources.set(fields, by)
+local data = load()
+local group
+if fields.id then
+group = data.groups[fields.id]
+if not group then return nil, "no resource group " .. tostring(fields.id) end
+else
+if type(fields.unit) ~= "string" then return nil, "a group needs a unit item" end
+group = {id = data.nextId, unit = fields.unit, enabled = true}
+end
+
+local name = fields.name or group.name
+or (group.unit:match("[^:]+$") or group.unit):gsub("_ingot$", "")
+for _, other in pairs(data.groups) do
+if other.id ~= group.id and other.name == name then
+return nil, ("there is already a group called %s"):format(name)
+end
+end
+
+for _, item in ipairs(fields.forms or {}) do
+if type(item) ~= "string" then return nil, "forms is a list of item ids" end
+end
+local forms = group.forms
+local wanted = fields.forms
+if fields.link and forms then
+
+
+wanted = {}
+for _, form in ipairs(forms) do
+if form.role ~= "unit" then wanted[#wanted + 1] = form.item end
+end
+for _, item in ipairs(resources.linkable(group, data)) do wanted[#wanted + 1] = item end
+end
+if wanted or not forms then
+local why
+forms, why = buildForms(group.unit, wanted)
+if not forms then return nil, why end
+end
+
+for _, form in ipairs(forms) do
+for _, other in pairs(data.groups) do
+if other.id ~= group.id then
+for _, theirs in ipairs(other.forms) do
+if theirs.item == form.item then
+return nil, ("%s is already in the group %s"):format(form.item, other.name)
+end
+end
+end
+end
+end
+
+
+local band = nil
+local packed = false
+for _, form in ipairs(forms) do packed = packed or form.role == "store" end
+
+local keep = fields.keep or (group.band and group.band.keep)
+if packed and keep then
+if type(keep) ~= "number" or keep < 0 or keep > resources.MAX then
+return nil, ("keep is 0 to %d loose"):format(resources.MAX)
+end
+local low = fields.low
+if low == nil then
+local old = group.band
+low = (not old or old.low == defaultLow(old.keep)) and defaultLow(keep) or old.low
+end
+if low < 0 or low > keep then
+return nil, ("the low mark is 0 to keep (%d)"):format(keep)
+end
+band = {keep = keep, low = low}
+elseif fields.keep then
+return nil, ("%s has no packed form to keep loose beside"):format(name)
+elseif fields.low then
+return nil, "set keep before its low mark"
+end
+
+
+local held = group.goal
+if fields.target ~= nil then
+if fields.target == 0 then
+held = nil
+else
+if fields.target < 1 or fields.target > resources.MAX then
+return nil, ("a target is 1 to %d"):format(resources.MAX)
+end
+local old = group.goal
+local low = fields.gather
+if low == nil then
+low = (not old or old.low == defaultLow(old.target)) and defaultLow(fields.target)
+or old.low
+end
+held = {target = fields.target, low = low}
+end
+elseif fields.gather ~= nil and held then
+held = {target = held.target, low = fields.gather}
+elseif fields.gather ~= nil then
+return nil, "set a target before its gather mark"
+end
+if held and (held.low < 0 or held.low > held.target) then
+return nil, ("the gather mark is 0 to the target (%d)"):format(held.target)
+end
+if fields.horizon ~= nil then
+if fields.horizon < 1 or fields.horizon > 1440 then
+return nil, "a horizon is 1 to 1440 minutes"
+end
+group.horizon = fields.horizon
+end
+
+group.name, group.forms, group.band, group.goal = name, forms, band, held
+local fresh = group.channels == nil
+group.channels = group.channels or {}
+group.nextChannel = group.nextChannel or 1
+
+
+
+if fresh and fields.auto ~= false then
+for _, choice in ipairs(resources.channelChoices(group)) do
+group.channels[#group.channels + 1] = {id = group.nextChannel, enabled = true,
+mode = "demand", kind = choice.kind, recipe = choice.recipe, type = choice.type}
+group.nextChannel = group.nextChannel + 1
+end
+end
+if fields.enabled ~= nil then group.enabled = fields.enabled and true or false end
+group.by, group.at = by, os.epoch("utc")
+if not fields.id then data.nextId = data.nextId + 1 end
+data.groups[group.id] = group
+save(data)
+return group
+end
+
+function resources.forget(id)
+local data = load()
+local group = data.groups[id]
+if not group then return nil, "no resource group " .. tostring(id) end
+data.groups[id] = nil
+save(data)
+alarms.clear("resource." .. group.name)
+strikes[id], said[id] = nil, nil
+return group
+end
+
+function resources.clear()
+state.clear(STORE)
+strikes, said = {}, {}
+resources.reset()
+end
+
+
+
+
+function resources.count(group, available)
+available = available or {}
+local out = {loose = 0, packed = 0, pending = 0, forms = {}}
+for _, form in ipairs(group.forms) do
+local n = math.floor(available[form.item] or 0)
+out.forms[form.item] = n
+if form.role == "unit" then out.loose = n
+elseif form.role == "store" then out.packed = out.packed + n * form.per
+else out.pending = out.pending + n * form.per end
+end
+out.packed, out.pending = math.floor(out.packed), math.floor(out.pending)
+out.held = out.loose + out.packed
+
+
+
+
+out.total = out.held + out.pending
+return out
+end
+
+
+
+resources.SWEEP_RESERVE = 64
+
+local function formOf(group, item)
+for _, form in ipairs(group.forms) do
+if form.item == item then return form end
+end
+return nil
+end
+
+function resources.channel(group, id)
+for index, ch in ipairs(group.channels or {}) do
+if ch.id == id then return ch, index end
+end
+return nil
+end
+
+
+
+local function channelRecipe(group, recipeId)
+local def = recipes.get(recipeId)
+if not def then return nil, "no such recipe: " .. tostring(recipeId) end
+local form = formOf(group, def.output.item)
+if not form or (form.role ~= "unit" and form.role ~= "store") then
+return nil, ("%s does not make %s or a packed form of it"):format(def.label or def.id,
+group.unit)
+end
+for item in pairs(def.inputs or {}) do
+local input = formOf(group, item)
+if input and (input.role == "unit" or input.role == "store") then
+return nil, ("%s is packing, not gathering"):format(def.label or def.id)
+end
+end
+return def, form
+end
+
+
+
+
+
+function resources.setChannel(fields, by)
+local data = load()
+local group = data.groups[fields.group]
+if not group then return nil, "no resource group " .. tostring(fields.group) end
+group.channels = group.channels or {}
+local ch, index
+if fields.id then
+ch, index = resources.channel(group, fields.id)
+if not ch then
+return nil, ("%s has no channel %s"):format(group.name, tostring(fields.id))
+end
+if fields.remove then
+table.remove(group.channels, index)
+group.by, group.at = by, os.epoch("utc")
+save(data)
+return ch
+end
+else
+ch = {id = group.nextChannel or 1, enabled = true, mode = "demand"}
+end
+
+if fields.recipe and fields.type then
+return nil, "a channel is a recipe or a source, not both"
+end
+if fields.type then
+local why = resources.sourceProblem(group, fields.type)
+if why then return nil, why end
+ch.kind, ch.type, ch.recipe = "source", fields.type, nil
+elseif fields.recipe then
+local def, why = channelRecipe(group, fields.recipe)
+if not def then return nil, why end
+ch.kind, ch.recipe, ch.type = def.process and "process" or "craft", fields.recipe, nil
+elseif not ch.kind then
+return nil, "a channel needs a recipe or a source"
+end
+for _, other in ipairs(group.channels) do
+if other.id ~= ch.id and ((ch.recipe and other.recipe == ch.recipe)
+or (ch.type and other.type == ch.type)) then
+return nil, ("%s already has that channel, as %d"):format(group.name, other.id)
+end
+end
+
+if fields.mode ~= nil then
+if fields.mode ~= "demand" and fields.mode ~= "sweep" then
+return nil, "a channel's mode is demand or sweep"
+end
+
+if fields.mode == "sweep" and fields.reserve == nil and ch.reserve == nil then
+ch.reserve = resources.SWEEP_RESERVE
+end
+ch.mode = fields.mode
+end
+if fields.reserve ~= nil then
+if fields.reserve < 0 or fields.reserve > resources.MAX then
+return nil, ("a reserve is 0 to %d"):format(resources.MAX)
+end
+ch.reserve = fields.reserve
+end
+if fields.enabled ~= nil then ch.enabled = fields.enabled and true or false end
+
+if not index then
+group.nextChannel = (group.nextChannel or 1) + 1
+group.channels[#group.channels + 1] = ch
+index = #group.channels
+end
+if fields.position then
+local to = math.max(1, math.min(#group.channels, fields.position))
+table.remove(group.channels, index)
+table.insert(group.channels, to, ch)
+end
+group.by, group.at = by, os.epoch("utc")
+save(data)
+return ch
+end
+
+
+
+
+
+function resources.channelChoices(group)
+local have = {}
+for _, ch in ipairs(group.channels or {}) do have[ch.recipe or ch.type or ""] = true end
+local out = {}
+for _, def in ipairs(recipes.all()) do
+if channelRecipe(group, def.id) then
+out[#out + 1] = {kind = def.process and "process" or "craft", recipe = def.id,
+label = def.label, inputs = def.inputs, have = have[def.id] or nil}
+end
+end
+table.sort(out, function(a, b)
+if a.kind ~= b.kind then return a.kind == "process" end
+return a.recipe < b.recipe
+end)
+for _, t in ipairs(require("mfg.controller.scripts").all()) do
+if t.yields and not resources.sourceProblem(group, t.name) then
+out[#out + 1] = {kind = "source", type = t.name, label = t.name,
+have = have[t.name] or nil}
+end
+end
+return out
+end
+
+
+local function yieldsOf(group, typeName)
+local record = require("mfg.controller.scripts").get(typeName)
+local out = {}
+for _, y in ipairs(record and record.yields or {}) do
+local form = formOf(group, y.item)
+if form then out[#out + 1] = form end
+end
+return out, record
+end
+
+
+
+function resources.sourceProblem(group, typeName)
+local forms, record = yieldsOf(group, typeName)
+if not record then return "no machine type " .. tostring(typeName) end
+if not record.yields then
+return ("%s yields nothing -- add a `yields` line to its script"):format(typeName)
+end
+if #forms == 0 then
+return ("%s yields nothing of %s"):format(typeName, group.name)
+end
+return nil
+end
+
+
+
+local function policy(group) return "resource:" .. group.id end
+local function channelPolicy(group, ch) return ("resource:%d.%d"):format(group.id, ch.id) end
+
+
+local function openBy(by)
+local found = nil
+for _, job in ipairs(dispatch.jobs()) do
+if job.by == by and dispatch.isOpen(job) then found = job end
+end
+return found
+end
+
+local function openJob(group) return openBy(policy(group)) end
+
+
+
+function resources.compacting(group, counted)
+local form = storeForm(group)
+if not form or not group.band then return nil end
+local loose = counted.loose
+if loose > group.band.keep then
+local blocks = math.floor((loose - group.band.keep) / form.per)
+if blocks >= resources.STACK then
+blocks = math.floor(blocks / resources.STACK) * resources.STACK
+end
+if blocks >= resources.PACK_MIN then
+return "pack", math.min(blocks, resources.MAKE_MAX), form
+end
+elseif loose < group.band.low then
+local have = counted.forms[form.item] or 0
+local blocks = math.min(have, math.ceil((group.band.keep - loose) / form.per))
+local units = math.min(math.floor(blocks * form.per), resources.MAKE_MAX)
+if units > 0 then return "unpack", units, form end
+end
+return nil
+end
+
+
+
+local function possibleSets(ch, def, available)
+local sets = nil
+for item, n in pairs(def.inputs or {}) do
+local free = math.floor(available[item] or 0) - (ch.reserve or 0)
+local here = math.floor(math.max(0, free) / n)
+sets = sets and math.min(sets, here) or here
+end
+return sets or 0
+end
+
+
+
+local function owed(group, job)
+local def = recipes.get(job.recipe)
+local form = def and formOf(group, def.output.item)
+return (job.yield or job.requested or 0) * (form and form.per or 1)
+end
+
+
+
+local function sourceRate(group, ch, now)
+local flows = require("mfg.controller.flows")
+local scripts = require("mfg.controller.scripts")
+local names = {}
+for _, m in ipairs(scripts.machines(ch.type)) do names["machine:" .. m.name] = true end
+local rate = 0
+for _, form in ipairs((yieldsOf(group, ch.type))) do
+for _, src in ipairs(flows.report(form.item, now).sources) do
+if names[src.source] then rate = rate + src.in15 * form.per end
+end
+end
+return rate
+end
+
+
+local function enabledOf(typeName)
+local n = 0
+for _, m in ipairs(require("mfg.controller.scripts").machines(typeName)) do
+if m.enabled then n = n + 1 end
+end
+return n
+end
+
+
+
+
+
+
+local function isDeep(group, ch, def)
+if ch.mode == "sweep" then return false end
+for item in pairs(def.inputs or {}) do
+if formOf(group, item) then return false end
+end
+return true
+end
+
+
+
+
+local function look(group, ch, available)
+local out = {job = openBy(channelPolicy(group, ch))}
+if ch.kind == "source" then out.machines = enabledOf(ch.type) end
+if ch.kind == "craft" or ch.kind == "process" then
+out.def, out.form = channelRecipe(group, ch.recipe)
+if out.def then
+out.deep = isDeep(group, ch, out.def)
+if not out.deep then
+out.sets = possibleSets(ch, out.def, available)
+out.units = out.sets * out.def.output.count * out.form.per
+end
+end
+end
+return out
+end
+
+
+
+local function ask(group, ch, seen, units)
+if not seen.def then return "starved" end
+if not seen.deep and seen.sets < 1 then return "starved" end
+local perSet = seen.def.output.count * seen.form.per
+local sets = seen.sets
+if seen.deep then sets = math.ceil((units or 0) / perSet)
+elseif units then sets = math.min(sets, math.ceil(units / perSet)) end
+local quantity = math.min(sets * seen.def.output.count, resources.MAKE_MAX)
+if quantity < 1 then return "starved" end
+local status, fields = actions.invoke("make", {recipe = ch.recipe, quantity = quantity,
+priority = ch.mode == "sweep" and "sweep" or "demand"},
+{by = channelPolicy(group, ch), policy = channelPolicy(group, ch)})
+if status == rpc.COMPLETED then
+return "asked", fields.job, (fields.yield or quantity) * seen.form.per
+end
+return "short", tostring(fields and fields.reason)
+end
+
+
+
+
+
+local function rateOf(group, ch, seen, now)
+if ch.kind == "source" then
+local rate = sourceRate(group, ch, now)
+local key = group.id .. "." .. ch.id
+return rate, rate > 0
+or (since[key] ~= nil and now - since[key] >= resources.NOTHING_AFTER * 1000)
+elseif ch.kind == "process" and seen.def then
+local rate = require("mfg.controller.throughput").rate(ch.recipe, now)
+if not rate then return 0, false end
+return rate * (seen.def.machines or 0) * seen.form.per, true
+end
+return nil, true
+end
+
+
+
+
+local function brings(group, ch, seen, now, horizon)
+local rate, measured = rateOf(group, ch, seen, now)
+
+if seen.deep and ch.kind == "craft" then return math.huge, true end
+if ch.kind == "craft" then return seen.units or 0, true end
+if not measured then return 0, false end
+if ch.kind == "process" then
+return seen.deep and rate * horizon or math.min(seen.units or 0, rate * horizon), true
+end
+return rate * horizon, true
+end
+
+
+
+
+
+
+
+local function gather(group, counted, available, now, problems)
+local out = {}
+local held = group.goal
+if held then
+if counted.held < held.low then gathering[group.id] = true
+elseif counted.held >= held.target then gathering[group.id] = nil end
+else
+gathering[group.id] = nil
+end
+local horizon = group.horizon or resources.HORIZON
+
+local remaining = held and math.max(0, held.target - counted.held) or nil
+local looks = {}
+for _, ch in ipairs(group.channels or {}) do
+looks[ch.id] = look(group, ch, available)
+if remaining and looks[ch.id].job then
+remaining = remaining - owed(group, looks[ch.id].job)
+end
+end
+
+
+local demand = {}
+for _, ch in ipairs(group.channels or {}) do
+if ch.enabled and ch.mode ~= "sweep" then demand[#demand + 1] = ch end
+end
+local engaged, figures = {}, {brings = 0, measured = true, rates = {}}
+if gathering[group.id] then
+local want, sum = 0, 0
+for index, ch in ipairs(demand) do
+want = index
+local n, measured = brings(group, ch, looks[ch.id], now, horizon)
+sum = sum + n
+if sum >= remaining then break end
+end
+local keep = kept[group.id] or {k = 0, lower = 0}
+if want >= keep.k then
+keep.k, keep.lower = want, 0
+else
+keep.lower = keep.lower + 1
+if keep.lower >= resources.DOWN_AFTER then keep.k, keep.lower = keep.k - 1, 0 end
+end
+kept[group.id] = keep
+for index = 1, math.min(keep.k, #demand) do engaged[demand[index].id] = true end
+for index, ch in ipairs(demand) do
+if engaged[ch.id] then
+local n, measured = brings(group, ch, looks[ch.id], now, horizon)
+local rate = rateOf(group, ch, looks[ch.id], now)
+figures.brings = figures.brings + n
+figures.measured = figures.measured and measured
+figures.rates[#figures.rates + 1] = {name = ch.type or (looks[ch.id].def
+and looks[ch.id].def.label) or tostring(ch.recipe), rate = rate,
+units = ch.kind == "craft" and n or nil}
+end
+end
+figures.all = keep.k >= #demand
+else
+kept[group.id] = nil
+end
+figures.remaining = remaining
+engagedNow[group.id] = engaged
+
+local anyInput, anyJob = false, false
+local hungry = {}
+local function starve(seen)
+for item in pairs(seen.def and seen.def.inputs or {}) do hungry[item] = true end
+end
+local function asking(ch, seen)
+local before = remaining
+local what, a, b = ask(group, ch, seen, remaining)
+if what == "asked" then
+anyJob = true
+if remaining then remaining = remaining - b end
+if before and b < before then starve(seen) end
+return what, a
+elseif what == "starved" then
+starve(seen)
+elseif what == "short" then
+problems[#problems + 1] = ("%s: channel %d short -- %s"):format(group.name,
+ch.id, a)
+end
+return what
+end
+
+
+for _, ch in ipairs(group.channels or {}) do
+if ch.kind ~= "source" then
+local seen = looks[ch.id]
+local did, job
+if not ch.enabled then
+did = "off"
+elseif seen.job and held and counted.held >= held.target then
+
+
+
+require("mfg.controller.dispatch").cancel(seen.job.id,
+("%s holds its target, %d"):format(group.name, held.target))
+require("mfg.controller.runs").dropJob(seen.job.id)
+did = "met"
+elseif seen.job then
+did, job, anyJob = "waiting", seen.job.id, true
+elseif ch.mode == "sweep" then
+if remaining and remaining <= 0 then did = "met"
+else did, job = asking(ch, seen) end
+elseif not engaged[ch.id] then
+did = gathering[group.id] and "spare" or "idle"
+elseif remaining <= 0 then
+did = "covered"
+else
+did, job = asking(ch, seen)
+end
+if ch.enabled and (seen.deep or (seen.units and seen.units > 0)) then
+anyInput = true
+end
+out[ch.id] = {did = did, job = job}
+end
+end
+
+
+local function source(ch, seen, on)
+local key = group.id .. "." .. ch.id
+local entry = sources[ch.type] or {}
+sources[ch.type] = entry
+if on then
+entry.wanted = true
+since[key] = since[key] or now
+anyJob = true
+engaged[ch.id] = true
+if seen.machines == 0 then
+problems[#problems + 1] = ("%s: no %s enabled"):format(group.name, ch.type)
+elseif now - since[key] >= resources.NOTHING_AFTER * 1000
+and sourceRate(group, ch, now) <= 0 then
+problems[#problems + 1] = ("%s: %s ran %d min and brought nothing of it")
+:format(group.name, ch.type, math.floor((now - since[key]) / 60000))
+end
+return "on"
+end
+since[key] = nil
+entry.why = entry.why or (held and (counted.pending > 0
+and ("%s: %d held, %d more unworked, target %d"):format(group.name,
+counted.held, counted.pending, held.target)
+or ("%s: %d held, target %d"):format(group.name, counted.held, held.target))
+or ("%s: not needed"):format(group.name))
+return "held"
+end
+local scripts = require("mfg.controller.scripts")
+for _, ch in ipairs(group.channels or {}) do
+if ch.kind == "source" then
+local seen = looks[ch.id]
+local on, chained = false, false
+if ch.mode == "sweep" then
+on = not (remaining and remaining <= 0)
+else
+on = engaged[ch.id] or false
+end
+
+if not on and gathering[group.id] then
+local record = scripts.get(ch.type)
+for _, y in ipairs(record and record.yields or {}) do
+if hungry[y.item] then chained = true end
+end
+on = chained
+end
+
+
+if held and counted.total >= held.target then on, chained = false, false end
+
+local did = ch.enabled and source(ch, seen, on) or "off"
+if chained and did == "on" then did = "chained" end
+out[ch.id] = {did = did}
+end
+end
+
+if gathering[group.id] and not anyJob and not anyInput then
+local enabled = 0
+for _, ch in ipairs(group.channels or {}) do
+if ch.enabled then enabled = enabled + 1 end
+end
+problems[#problems + 1] = ("%s: %d held, gather below %d -- %s"):format(group.name,
+counted.held, held.low, enabled == 0 and "no channel" or "no channel has input")
+elseif gathering[group.id] and figures.all and figures.measured and #demand > 0
+and figures.brings < (remaining or 0) then
+
+local parts = {}
+for _, r in ipairs(figures.rates) do
+parts[#parts + 1] = r.units and ("%s %d"):format(r.name, math.floor(r.units))
+or ("%s %.1f/min"):format(r.name, r.rate or 0)
+end
+problems[#problems + 1] = ("%s: %d to target, channels bring ~%d in %d min -- %s")
+:format(group.name, math.floor(remaining), math.floor(figures.brings), horizon,
+table.concat(parts, ", "))
+end
+return out
+end
+
+
+
+function resources.channels(group, available)
+local throughput = require("mfg.controller.throughput")
+local out = {}
+for _, ch in ipairs(group.channels or {}) do
+local seen = look(group, ch, available or {})
+local entry = {}
+for k, v in pairs(ch) do entry[k] = v end
+entry.label = seen.def and seen.def.label or ch.type or ch.recipe
+entry.units = seen.units and math.floor(seen.units) or nil
+entry.deep = seen.deep or nil
+if seen.job then
+entry.job = {id = seen.job.id, state = seen.job.state, reason = seen.job.lastError,
+requested = seen.job.requested}
+end
+entry.engaged = (engagedNow[group.id] or {})[ch.id] or false
+if ch.kind == "source" then
+entry.machines = seen.machines
+entry.rate = sourceRate(group, ch, os.epoch("utc"))
+end
+if ch.kind == "process" and seen.def then
+local rate, rateState = throughput.rate(ch.recipe)
+entry.machines = seen.def.machines
+entry.rateState = rateState
+if rate then entry.rate = rate * (seen.def.machines or 0) * seen.form.per end
+end
+if not ch.enabled then entry.state = "off"
+elseif ch.kind == "source" then
+local key = group.id .. "." .. ch.id
+entry.state = seen.machines == 0 and "starved" or (since[key] and "engaged" or "held")
+elseif seen.job then entry.state = "engaged"
+elseif seen.def and not seen.deep and (seen.units or 0) <= 0 then
+entry.state = "starved"
+else entry.state = "idle" end
+out[#out + 1] = entry
+end
+return out
+end
+
+
+
+function resources.status(group, available)
+local counted = resources.count(group, available)
+local job = openJob(group)
+local status = {loose = counted.loose, packed = counted.packed, held = counted.held,
+pending = counted.pending, total = counted.total, counts = counted.forms, advice = said[group.id],
+gathering = gathering[group.id] or false}
+if job then
+status.request = {job = job.id, state = job.state, reason = job.lastError,
+recipe = job.recipe, requested = job.requested}
+end
+local engaged = false
+for _, ch in ipairs(group.channels or {}) do
+if openBy(channelPolicy(group, ch)) or since[group.id .. "." .. ch.id] then
+engaged = true
+end
+end
+
+
+
+local flows = require("mfg.controller.flows")
+local inn, out = 0, 0
+for _, form in ipairs(group.forms) do
+local f = flows.report(form.item)
+inn, out = inn + f.in15 * form.per, out + f.out15 * form.per
+end
+status.inflow, status.outflow, status.net = inn, out, inn - out
+if group.goal and counted.held < group.goal.target and inn - out > 0 then
+status.eta = (group.goal.target - counted.held) / (inn - out)
+end
+local want = resources.compacting(group, counted)
+local short = group.goal and counted.held < group.goal.low
+if not group.enabled then status.state = resources.OFF
+elseif said[group.id] then status.state = resources.ADVICE
+elseif job then
+local form = storeForm(group)
+status.state = (form and job.recipe == form.unpack) and resources.UNPACKING
+or resources.PACKING
+elseif engaged then status.state = resources.GATHERING
+elseif want or short then status.state = resources.LOWSTATE
+else status.state = resources.MET end
+return status
+end
+
+
+
+local function shortName(item) return (tostring(item):match("[^:]+$") or item):gsub("_", " ") end
+
+local function advise(group, text)
+strikes[group.id] = (strikes[group.id] or 0) + 1
+if strikes[group.id] >= resources.ADVISE_AFTER then
+said[group.id] = text
+alarms.raise("resource." .. group.name, text, {source = "resource", severity = "advice"})
+end
+end
+
+local function fine(group)
+strikes[group.id] = 0
+if said[group.id] then
+said[group.id] = nil
+alarms.clear("resource." .. group.name)
+end
+end
+
+
+local function compact(group, counted, problems)
+local want, n, form = resources.compacting(group, counted)
+if not want then return "met" end
+if openJob(group) then return "waiting" end
+
+local recipe = want == "pack" and form.pack or form.unpack
+local status, fields = actions.invoke("make", {recipe = recipe, quantity = n,
+priority = want == "pack" and "compact" or "unpack"},
+{by = policy(group), policy = policy(group)})
+if status == rpc.COMPLETED then
+return want == "pack" and "packing" or "unpacking", fields.job
+end
+problems[#problems + 1] = ("%s: %d loose, keep %d -- can't %s %s: %s"):format(group.name,
+counted.loose, group.band.keep, want, shortName(form.item),
+tostring(fields and fields.reason))
+return "short"
+end
+
+
+
+local function turn(group, available, now)
+local counted = resources.count(group, available)
+local problems = {}
+local did, job = compact(group, counted, problems)
+local channels = gather(group, counted, available, now, problems)
+if problems[1] then advise(group, problems[1]) else fine(group) end
+return {did = did, job = job, channels = channels}
+end
+
+
+function resources.cycle(now, opts)
+opts = opts or {}
+now = now or os.epoch("utc")
+local groups = resources.all()
+sources = {}
+lastCycle = now
+if #groups == 0 then return {} end
+local out = {}
+for _, group in ipairs(groups) do
+if group.enabled then
+
+local available = opts.available
+or require("mfg.controller.supervisor").available() or {}
+local ok, result = pcall(turn, group, available, now)
+out[group.id] = ok and result or {did = "error", why = result}
+if not ok then printError(("resource %d: %s"):format(group.id, tostring(result))) end
+else
+gathering[group.id], kept[group.id], engagedNow[group.id] = nil, nil, nil
+for _, ch in ipairs(group.channels or {}) do since[group.id .. "." .. ch.id] = nil end
+if said[group.id] then fine(group) end
+end
+end
+
+for _, entry in pairs(sources) do
+if entry.wanted then entry.why = nil end
+end
+return out
+end
+
+
+
+
+
+
+
+migrated = false
+function resources.migrate(by)
+if migrated then return 0 end
+migrated = true
+local stored = state.read("stock", nil)
+if type(stored) ~= "table" or type(stored.rules) ~= "table" then return 0 end
+local rules = {}
+for _, rule in pairs(stored.rules) do rules[#rules + 1] = rule end
+table.sort(rules, function(a, b) return (a.id or 0) < (b.id or 0) end)
+local made = 0
+for _, rule in ipairs(rules) do
+if type(rule.item) == "string" and not resources.groupFor(rule.item) then
+local name = (rule.item:match("[^:]+$") or rule.item)
+local taken = false
+for _, other in ipairs(resources.all()) do taken = taken or other.name == name end
+if taken then name = name .. "-" .. tostring(rule.id) end
+local group = resources.set({unit = rule.item, forms = {}, name = name,
+target = rule.target, gather = rule.low, enabled = rule.enabled ~= false,
+auto = false}, by or "migration")
+if group then
+made = made + 1
+local route = rule.via and recipes.get(rule.via) or recipes.producing(rule.item)
+if route then resources.setChannel({group = group.id, recipe = route.id}, by) end
+end
+end
+end
+state.clear("stock")
+return made
+end
+
+
+
+
+function resources.held(machine, now)
+local entry = machine and sources[machine.script]
+if not entry or entry.wanted or not lastCycle then return nil end
+if (now or os.epoch("utc")) - lastCycle > resources.FALLBACK * 1000 then return nil end
+return entry.why
+end
+
+
+function resources.holds() return sources end
+
+return resources
