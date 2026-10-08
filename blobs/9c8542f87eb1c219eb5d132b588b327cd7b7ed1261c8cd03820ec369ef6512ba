@@ -1,0 +1,138 @@
+
+
+
+
+
+
+
+local leases = require("mfg.controller.leases")
+local mount = require("mfg.storage.mount")
+local hal = require("mfg.common.hal")
+
+local pockets = {}
+
+
+
+pockets.REUSE = 2000
+
+local answers = {}
+
+function pockets.clock() return os.epoch("utc") end
+
+function pockets._reset() answers = {} end
+
+
+function pockets.segment(owner)
+return (tostring(owner):lower():gsub("[^a-z0-9_%-]", "_"))
+end
+
+
+function pockets.inventoryPath(owner)
+return "/players/" .. pockets.segment(owner) .. "/inv"
+end
+
+
+
+
+local function numeric(address)
+if type(address) == "string" then
+local ok, ip = pcall(require, "ip")
+return ok and ip.parse(address) or tonumber(address)
+end
+return address
+end
+
+
+
+
+
+local function addressNow(lease, book)
+local held = lease.publicKey and book[lease.publicKey]
+return numeric(held or lease.address)
+end
+
+
+function pockets.lease(address)
+address = numeric(address)
+if address == nil then return nil end
+local ok, netkeys = pcall(require, "netkeys")
+local book = ok and netkeys.addresses() or {}
+for _, lease in pairs(leases.all()) do
+if lease.consumed and lease.address ~= nil
+and addressNow(lease, book) == address then
+return lease
+end
+end
+return nil
+end
+
+
+
+function pockets.held(owner, computer)
+local record = mount.get(pockets.inventoryPath(owner))
+local manager = record and record.devices and record.devices[1]
+if not manager then
+return false, ("no Inventory Manager is bound for %s"):format(owner)
+end
+local items, why = hal.player().list(manager)
+if not items then return false, ("%s is not reachable: %s"):format(owner, tostring(why)) end
+for _, stack in pairs(items) do
+local tag = stack.nbt
+if type(tag) == "table" and tonumber(tag.ComputerId) == tonumber(computer)
+and tostring(stack.name):find("^computercraft:pocket_computer") then
+return true
+end
+end
+return false, ("this pocket isn't in %s's inventory"):format(owner)
+end
+
+
+
+function pockets.check(address)
+local lease = pockets.lease(address)
+if not lease or not lease.owner then return nil end
+if not lease.computer then
+return lease.owner, false, "this pocket never said which computer it is"
+end
+local now = pockets.clock()
+local last = answers[lease.computer]
+if last and now - last.at < pockets.REUSE then
+return lease.owner, last.held, last.why
+end
+local held, why = pockets.held(lease.owner, lease.computer)
+answers[lease.computer] = {at = now, held = held, why = why}
+return lease.owner, held, why
+end
+
+
+function pockets.anyHeld(owner)
+for _, lease in pairs(leases.all()) do
+if lease.consumed and lease.owner == owner and lease.computer then
+if pockets.held(owner, lease.computer) then return true end
+end
+end
+return false
+end
+
+
+pockets.OPEN = {pocket_held = true}
+
+
+
+function pockets.gate(packet, body)
+if type(body) == "table" and pockets.OPEN[body.command] then return true end
+local owner, held, why = pockets.check(packet and packet.src)
+if owner and not held then return false, why end
+return true
+end
+
+
+
+function pockets.caller(ctx)
+local owner, held, why = pockets.check(ctx and ctx.by)
+if not owner then return nil, "only a player's own pocket computer can do that" end
+if not held then return nil, why end
+return owner
+end
+
+return pockets
