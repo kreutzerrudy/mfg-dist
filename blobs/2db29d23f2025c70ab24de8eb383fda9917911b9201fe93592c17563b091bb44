@@ -1,0 +1,27 @@
+local rpc = require("mfg.common.rpc")
+local pockets = require("mfg.controller.pockets")
+
+
+
+
+return {
+name        = "pocket_held",
+label       = "Is this pocket in its owner's inventory",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {},
+
+returns = {owner = "text", held = "flag", reason = "text", mismatch = "flag"},
+
+run = function(_, ctx)
+local owner, held, why, mismatch = pockets.check(ctx and ctx.by)
+if not owner then
+return rpc.COMPLETED, {held = false,
+reason = "this computer isn't a pocket that belongs to a player"}
+end
+return rpc.COMPLETED, {owner = owner, held = held == true, reason = why,
+mismatch = mismatch == true}
+end,
+}

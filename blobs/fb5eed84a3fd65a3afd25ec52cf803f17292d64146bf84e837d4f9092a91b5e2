@@ -1,0 +1,125 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local rpc = require("mfg.common.rpc")
+local net = require("net")
+
+
+
+local function library()
+return require("mfg.common.actions")
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function dispatch(body, packet, legacy)
+local actions = library()
+local command = body.command
+
+
+
+
+
+if actions.gate and packet then
+local ok, why, mismatch = actions.gate(packet, body)
+if not ok then
+return rpc.REJECTED, {reason = tostring(why), locked = mismatch or nil}
+end
+end
+
+if actions.get(command) then
+return actions.invoke(command, body, {
+by = packet and packet.src,
+packet = packet,
+operator = body.operator == true or nil,
+policy = type(body.policy) == "string" and body.policy or nil,
+})
+end
+
+
+
+
+if type(legacy) == "function" then
+return legacy(body, packet)
+end
+
+
+
+print(("receive: rejected unknown command %s from %s"):format(
+tostring(command), tostring(packet and packet.src)))
+return rpc.REJECTED, {reason = "unknown command: " .. tostring(command)}
+end
+
+return {
+name        = "receive",
+label       = "Receive",
+tier        = "service",
+base        = true,
+quiet       = true,
+destructive = false,
+
+parameters = {
+{name = "protocol", label = "Protocol", type = "choice", required = true,
+choices = {"mfg-control", "mfg-scada", "mfg-order", "mfg-report"},
+help = "Which service to listen on. A wrapper fills this; an operator "
+.. "never picks it."},
+
+{name = "once", label = "Serve once", type = "flag", default = false,
+help = "Serve at most one request and return. The shape an operating loop "
+.. "wants; without it, loop until stopped."},
+
+{name = "timeout", label = "Timeout", type = "number", min = 0.1, max = 60,
+default = 1,
+help = "Seconds to wait for a request before giving the loop back."},
+},
+
+returns = {served = "number"},
+
+run = function(params, ctx)
+
+
+
+local bound, why = net.serve(params.protocol)
+if not bound and not tostring(why):find("already bound") then
+return rpc.REJECTED, {reason = tostring(why)}
+end
+
+local served = 0
+repeat
+local handled = rpc.serveOnce(params.protocol, function(body, packet)
+return dispatch(body, packet, ctx.legacy)
+end, params.timeout)
+if handled then served = served + 1 end
+until params.once
+
+return rpc.COMPLETED, {served = served}
+end,
+}
