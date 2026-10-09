@@ -1,0 +1,213 @@
+
+
+
+
+
+
+
+
+
+
+
+local format = {}
+
+local PRECEDENCE = {["or"] = 1, ["and"] = 2, ["not"] = 3, cmp = 4}
+
+local function dur(d)
+return tostring(d.n) .. d.unit
+end
+
+local expr
+
+local function wrapped(e, above)
+local text = expr(e)
+local mine = PRECEDENCE[e.kind]
+if mine and mine < above then return "(" .. text .. ")" end
+return text
+end
+
+expr = function(e)
+local k = e.kind
+if k == "num" then return tostring(e.value)
+elseif k == "onoff" then return e.value and "on" or "off"
+elseif k == "dur" then return dur(e)
+elseif k == "item" then return e.value
+elseif k == "text" then return '"' .. e.value .. '"'
+elseif k == "name" then return e.name
+elseif k == "count" then return ("count %s in %s"):format(e.item, e.port)
+elseif k == "free" then return "free " .. e.item
+elseif k == "countout" then return ("count output %s in %s"):format(e.recipe, e.port)
+elseif k == "countall" then return "count in " .. e.port
+elseif k == "amount" then return "amount " .. e.recipe
+elseif k == "paren" then return "(" .. expr(e.expr) .. ")"
+elseif k == "not" then return "not " .. wrapped(e.expr, PRECEDENCE.cmp)
+elseif k == "cmp" then
+return ("%s %s %s"):format(wrapped(e.left, 5), e.op, wrapped(e.right, 5))
+elseif k == "and" then
+return wrapped(e.left, 2) .. " and " .. wrapped(e.right, 3)
+elseif k == "or" then
+return wrapped(e.left, 1) .. " or " .. wrapped(e.right, 2)
+end
+error("format: not an expression: " .. tostring(k), 0)
+end
+
+format.expr = expr
+
+
+function format.slots(list)
+local parts, i = {}, 1
+while i <= #list do
+local j = i
+while j < #list and list[j + 1] == list[j] + 1 do j = j + 1 end
+if j > i then
+parts[#parts + 1] = list[i] .. "-" .. list[j]
+else
+parts[#parts + 1] = tostring(list[i])
+end
+i = j + 1
+end
+return table.concat(parts, ",")
+end
+
+
+function format.amount(a)
+local text = ("%d %s"):format(a.n, a.item)
+if a.port then text = text .. " in " .. a.port end
+return text
+end
+
+
+function format.inputs(list)
+local parts = {}
+for i, a in ipairs(list) do parts[i] = format.amount(a) end
+return table.concat(parts, ", ")
+end
+
+
+function format.makes(m)
+return ("makes %s from %s"):format(format.amount(m), format.inputs(m.inputs))
+end
+
+
+function format.runs(r)
+if r.batch then return ("runs %s batch %d"):format(r.type, r.batch) end
+return "runs " .. r.type
+end
+
+
+function format.yields(y)
+local text = "yields " .. y.item
+if y.port then text = text .. " in " .. y.port end
+return text
+end
+
+
+local function head(s)
+local k = s.kind
+if k == "if" then return "if " .. expr(s.cond)
+elseif k == "repeat" then return "repeat " .. tostring(s.n)
+elseif k == "repeatuntil" then
+return ("repeat until %s max %d"):format(expr(s.cond), s.max)
+elseif k == "supply" then return ("supply %d %s to %s"):format(s.n, s.item, s.port)
+elseif k == "supplyrecipe" then
+
+if s.n == nil then return ("supply %s to %s"):format(s.recipe, s.port) end
+return ("supply %d %s to %s"):format(s.n, s.recipe, s.port)
+elseif k == "stock" then return ("stock %s with %d %s"):format(s.port, s.n, s.item)
+elseif k == "collect" then return "collect " .. s.port
+elseif k == "trash" then return ("trash %s from %s"):format(s.item, s.port)
+elseif k == "move" then
+return ("move %d %s from %s to %s"):format(s.n, s.item, s.from, s.to)
+elseif k == "set" then return ("set %s to %s"):format(s.port, expr(s.value))
+elseif k == "pulse" then return ("pulse %s for %s"):format(s.port, dur(s.length))
+elseif k == "wait" then return "wait " .. dur(s.length)
+elseif k == "waituntil" then
+return ("wait until %s within %s"):format(expr(s.cond), dur(s.within))
+elseif k == "let" then return ("let %s = %s"):format(s.name, expr(s.value))
+elseif k == "alarm" then return ('alarm "%s"'):format(s.text)
+elseif k == "clearalarm" then return "clear alarm"
+elseif k == "stop" then return "stop"
+elseif k == "do" then return "do " .. s.name
+elseif k == "fail" then return "fail"
+elseif k == "fault" then return ('fault "%s"'):format(s.text)
+elseif k == "every" then return "every " .. dur(s.every)
+elseif k == "when" then return "when " .. expr(s.cond)
+elseif k == "on" then return "on " .. s.event
+elseif k == "onrun" then return "on run " .. s.name
+elseif k == "onfail" then return s.name and ("on fail " .. s.name) or "on fail"
+elseif k == "to" then return "to " .. s.name
+elseif k == "runs" then return format.runs(s)
+end
+error("format: not a statement: " .. tostring(k), 0)
+end
+
+local function emit(out, indent, text, comment, notes)
+local pad = string.rep("\t", indent)
+for _, note in ipairs(notes or {}) do out[#out + 1] = pad .. "--" .. note end
+if comment then text = text .. "  --" .. comment end
+out[#out + 1] = pad .. text
+end
+
+local block
+
+block = function(out, list, indent)
+for _, s in ipairs(list) do
+emit(out, indent, head(s), s.comment, s.notes)
+if s.body then block(out, s.body, indent + 1) end
+if s.orelse then
+emit(out, indent, "else", s.elseComment, s.elseNotes)
+block(out, s.orelse, indent + 1)
+end
+end
+end
+
+function format.format(script)
+local out = {}
+emit(out, 0, "machine " .. tostring(script.machine), script.comment, script.notes)
+
+local nameWidth = 0
+for _, port in ipairs(script.ports or {}) do
+nameWidth = math.max(nameWidth, #port.name)
+end
+for _, port in ipairs(script.ports or {}) do
+local text = ("%-6s %-" .. nameWidth .. "s : %s"):format(port.direction,
+port.name, port.type)
+if port.slots then text = text .. " slots " .. format.slots(port.slots) end
+if port.safe then text = text .. " safe " .. expr(port.safe) end
+emit(out, 1, text, port.comment, port.notes)
+end
+for _, r in ipairs(script.runs or {}) do
+emit(out, 1, format.runs(r), r.comment, r.notes)
+end
+for _, m in ipairs(script.makes or {}) do
+emit(out, 1, m.kind == "yields" and format.yields(m) or format.makes(m), m.comment,
+m.notes)
+end
+
+for _, h in ipairs(script.handlers or {}) do
+out[#out + 1] = ""
+emit(out, 0, head(h), h.comment, h.notes)
+block(out, h.body or {}, 1)
+end
+
+if script.trailing then
+out[#out + 1] = ""
+for _, note in ipairs(script.trailing) do out[#out + 1] = "--" .. note end
+end
+return table.concat(out, "\n") .. "\n"
+end
+
+
+function format.same(a, b)
+if type(a) ~= type(b) then return false end
+if type(a) ~= "table" then return a == b end
+for key, value in pairs(a) do
+if key ~= "span" and not format.same(value, b[key]) then return false end
+end
+for key in pairs(b) do
+if key ~= "span" and a[key] == nil then return false end
+end
+return true
+end
+
+return format

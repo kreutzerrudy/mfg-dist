@@ -1,0 +1,1546 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local app = require("mfg.hmi.app")
+local schema = require("mfg.common.script.schema")
+local edit = require("mfg.common.script.edit")
+local parse = require("mfg.common.script.parse")
+local format = require("mfg.common.script.format")
+local check = require("mfg.common.script.check")
+local lex = require("mfg.common.script.lex")
+local clauses = require("mfg.common.script.clauses")
+
+local editor = {}
+
+editor.DRAFTS = "/mfg/drafts"
+editor.READ = {timeout = 3, attempts = 2}
+editor.SAVE = {timeout = 10, attempts = 1}
+editor.INDENT = 2
+editor.MARGIN = 2
+editor.READING_MAX = 22
+editor.WIDTH = 51
+editor.READING_MIN = 6
+
+
+local VERB_ACTIONS = {}
+for _, action in pairs(check.VERBS) do VERB_ACTIONS[action] = true end
+
+
+
+local function draftPath(name)
+return fs.combine(editor.DRAFTS, (name or "_new") .. ".tree")
+end
+
+function editor.loadDraft(name)
+local path = draftPath(name)
+if not fs.exists(path) then return nil end
+local handle = fs.open(path, "r")
+if not handle then return nil end
+local data = textutils.unserialize(handle.readAll())
+handle.close()
+return type(data) == "table" and data.tree and data or nil
+end
+
+
+
+
+
+local function saveDraft(ed)
+if not ed.state.dirty then return end
+local path = draftPath(ed.state.tree.machine)
+local handle = fs.open(path, "w")
+if not handle then return end
+handle.write(textutils.serialize({tree = ed.state.tree, rev = ed.rev}))
+handle.close()
+if ed.draftPath and ed.draftPath ~= path and fs.exists(ed.draftPath) then
+fs.delete(ed.draftPath)
+end
+ed.draftPath = path
+end
+
+
+
+
+function editor.drafts()
+local out = {}
+if not fs.isDir(editor.DRAFTS) then return out end
+for _, file in ipairs(fs.list(editor.DRAFTS)) do
+local name = file:match("^(.+)%.tree$")
+if name then out[#out + 1] = {name = name ~= "_new" and name or nil} end
+end
+table.sort(out, function(a, b) return (a.name or "") < (b.name or "") end)
+return out
+end
+
+function editor.dropDraft(name)
+local path = draftPath(name)
+if fs.exists(path) then fs.delete(path) end
+end
+
+
+
+
+
+function editor.new(view, name)
+local ed = {
+view = view,
+name = name,
+rev = name and nil or 0,
+state = nil,
+cursor = 1, slot = 1,
+lines = app.newList(),
+chooser = nil,
+decls = {}, items = nil,
+queue = {},
+result = nil,
+confirm = nil,
+stale = nil,
+machines = {},
+draft = false,
+version = 0,
+}
+local draft = editor.loadDraft(name)
+if draft then ed.draftPath = draftPath(name) end
+if draft then
+ed.state = edit.open(draft.tree)
+ed.state.dirty = true
+ed.rev = draft.rev or ed.rev
+ed.draft = true
+ed.result = {text = "your unsaved draft -- discard it with the button above",
+colour = "warn"}
+elseif not name then
+ed.state = edit.blank(nil)
+end
+if name then ed.queue[#ed.queue + 1] = {kind = "script"} end
+for action in pairs(VERB_ACTIONS) do
+ed.queue[#ed.queue + 1] = {kind = "offer", name = action}
+end
+ed.queue[#ed.queue + 1] = {kind = "items"}
+return ed
+end
+
+function editor.title(ed)
+local name = ed.state and ed.state.tree and ed.state.tree.machine or ed.name
+return ("EDIT %s%s%s"):format(name or "new script",
+(ed.rev and ed.rev > 0) and (" rev " .. ed.rev) or "",
+(ed.state and ed.state.dirty) and " *" or "")
+end
+
+
+
+local function rows(ed)
+return ed.state and edit.rows(ed.state) or {}
+end
+
+local function currentRow(ed)
+local list = rows(ed)
+ed.cursor = math.max(1, math.min(ed.cursor, #list))
+return list[ed.cursor], list
+end
+
+
+local function report(ed)
+if not ed.state then return nil end
+if ed.checked ~= ed.version then
+local complete = true
+for action in pairs(VERB_ACTIONS) do
+if not ed.decls[action] then complete = false end
+end
+local itemSet = nil
+if ed.items then
+itemSet = {}
+for item in pairs(ed.items) do itemSet[item] = true end
+end
+
+
+local ok, result = pcall(check.check, ed.state.tree, {decls = complete and ed.decls
+or nil, items = itemSet})
+ed.report = ok and result or {ok = false, warnings = {}, errors = {{line = 1,
+col = 1, message = "the checker failed: " .. tostring(result)}}}
+ed.marks = edit.marks(ed.report)
+ed.checked = ed.version
+end
+return ed.report
+end
+
+local function itemName(ed)
+return function(item)
+local known = ed.view.names and ed.view.names[item]
+return (known and known.name) or app.shortName(item)
+end
+end
+
+
+
+local NAME_PIECE = {field = "machine", type = "name"}
+local function parts(ed, row)
+if row.kind == "machine" then
+return {{text = "machine"}, {text = row.node.machine or schema.HOLE, piece = NAME_PIECE}}
+elseif row.kind == "else" then
+return {{text = "else"}}
+end
+return schema.parts(row.node, {itemName = itemName(ed), offer = true})
+end
+
+local function slotsOf(ed, row)
+local out = {}
+for _, part in ipairs(parts(ed, row)) do
+if part.piece then out[#out + 1] = part end
+end
+return out
+end
+
+
+local function changed(ed)
+ed.version = ed.version + 1
+ed.stale = nil
+saveDraft(ed)
+currentRow(ed)
+end
+
+
+
+function editor.nextJob(ed)
+return table.remove(ed.queue, 1)
+end
+
+function editor.exchange(ed, job)
+local body, opts = nil, editor.READ
+if job.kind == "script" then
+body = {command = "scripts", script = ed.name, brief = true}
+elseif job.kind == "offer" then
+body = {command = "offer", name = job.name}
+elseif job.kind == "items" then
+body = {command = "available"}
+elseif job.kind == "check" then
+body = {command = "check_script", source = format.format(ed.state.tree)}
+elseif job.kind == "save" then
+body = {command = "register_script", source = format.format(ed.state.tree),
+expect = job.expect, operator = true}
+opts = editor.SAVE
+ed.sending = job
+elseif job.kind == "add" then
+body = {command = "add_machine", machine = job.machine,
+script = ed.state.tree.machine, operator = true}
+opts = editor.SAVE
+ed.sending = job
+else
+return false
+end
+editor.apply(ed, job, ed.view.transport.request(body, opts) or {})
+return true
+end
+
+
+
+
+local function translate(ed, errors)
+local reparsed = parse.parse(format.format(ed.state.tree))
+local theirs, mine = {[0] = 0}, {}
+schema.each(reparsed, function(n) theirs[#theirs + 1] = n.id end)
+schema.each(ed.state.tree, function(n) mine[#mine + 1] = n.id end)
+local map = {[0] = 0}
+for i, id in ipairs(theirs) do map[id] = mine[i] end
+local out = {}
+for _, e in ipairs(errors or {}) do
+out[#out + 1] = {node = map[e.node] or 0, message = e.message, line = e.line}
+end
+return out
+end
+
+local function say(ed, text, colour)
+ed.result = {text = text, colour = colour or "text"}
+end
+
+function editor.apply(ed, job, answer)
+app.noteLink(ed.view, answer)
+
+ed.version = ed.version + 1
+local ok = answer.status == app.COMPLETED
+if job.kind == "script" then
+if not ok then
+say(ed, "the controller refused: " .. tostring(answer.reason or answer.status), "bad")
+return
+end
+for _, t in ipairs(answer.scripts or {}) do
+if t.script == ed.name then
+ed.machines = t.machines or {}
+if not ed.draft or ed.reload then
+ed.state = edit.open(t.tree)
+ed.rev = t.rev
+ed.reload, ed.draft = nil, false
+elseif ed.rev ~= t.rev then
+say(ed, ("your draft is from rev %s; the controller has rev %d")
+:format(tostring(ed.rev), t.rev), "warn")
+end
+end
+end
+if not ed.state then say(ed, "no script called " .. tostring(ed.name), "bad") end
+elseif job.kind == "offer" then
+local decl = ok and answer.actions and answer.actions[1]
+if decl then ed.decls[job.name] = decl end
+elseif job.kind == "items" then
+if ok and type(answer.items) == "table" then
+ed.items = answer.items
+for item, known in pairs(answer.names or {}) do ed.view.names[item] = known end
+end
+elseif job.kind == "check" then
+if not ok then
+say(ed, "the controller could not check it: " .. tostring(answer.reason), "bad")
+elseif answer.ok then
+local f = answer.footprint or {}
+say(ed, ("the controller agrees: no errors. It supplies %s; collects %s")
+:format(#(f.supplies or {}) > 0 and table.concat(f.supplies, ", ") or "nothing",
+#(f.collects or {}) > 0 and table.concat(f.collects, ", ") or "nothing"),
+"good")
+else
+local errs = translate(ed, answer.errors)
+ed.remoteErrors = errs
+say(ed, ("the controller finds %d error%s: %s"):format(#errs,
+#errs == 1 and "" or "s", errs[1] and errs[1].message or "?"), "bad")
+end
+elseif job.kind == "save" then
+ed.sending = nil
+if ok then
+ed.rev = answer.rev
+ed.state.dirty = false
+editor.dropDraft(ed.state.tree.machine)
+if ed.name == nil then editor.dropDraft(nil) end
+ed.name = answer.script
+ed.machines = answer.machines or {}
+local follow = #ed.machines > 0 and ("; " .. table.concat(ed.machines, ", ")
+.. " take it between runs") or ""
+say(ed, ("saved %s rev %d%s"):format(answer.script, answer.rev, follow), "good")
+ed.madeNew = job.expect == 0
+ed.view.readAt = nil
+app.sound(ed.view, "done")
+elseif answer.stale then
+ed.stale = {rev = answer.rev}
+say(ed, tostring(answer.reason), "bad")
+app.sound(ed.view, "refused")
+elseif answer.status == app.TIMED_OUT then
+say(ed, "no answer -- look in the Types list before saving again", "warn")
+else
+if answer.errors then ed.remoteErrors = translate(ed, answer.errors) end
+say(ed, "refused: " .. tostring(answer.reason), "bad")
+app.sound(ed.view, "refused")
+end
+elseif job.kind == "add" then
+ed.sending = nil
+if ok then
+say(ed, ("made %s from %s -- bind it on its page in Machines, then enable it"):format(
+job.machine, ed.state.tree.machine), "good")
+ed.madeNew = false
+ed.view.readAt = nil
+else
+say(ed, "refused: " .. tostring(answer.reason), "bad")
+end
+end
+end
+
+
+
+local function portEntries(ed, piece)
+local out = {}
+for _, port in ipairs(ed.state.tree.ports) do
+local kindOk = not piece.kind or (piece.kind == "volume" and port.type == "volume")
+or (piece.kind == "signal" and port.type and port.type ~= "volume")
+local dirOk = not piece.direction or port.direction == piece.direction
+if port.name and kindOk and dirOk then
+out[#out + 1] = {value = port.name, label = port.name,
+note = ("%s %s"):format(port.direction or "?", port.type or "?")}
+end
+end
+return out
+end
+
+local function itemEntries(ed)
+local out = {}
+for item, entry in pairs(ed.items or {}) do
+out[#out + 1] = {value = item, label = itemName(ed)(item),
+note = tostring(entry.free or entry.held or ""), chip = app.chipFor(item)}
+end
+table.sort(out, function(a, b)
+if a.label:lower() ~= b.label:lower() then return a.label:lower() < b.label:lower() end
+return a.value < b.value
+end)
+return out
+end
+
+
+local function portNamed(ed, name)
+for _, port in ipairs(ed.state.tree.ports) do
+if port.name == name then return port end
+end
+return nil
+end
+
+
+local openClauses
+
+
+
+local function openSlot(ed, row, part)
+local piece = part.piece
+local t = piece.type
+local chooser = {row = ed.cursor, node = row.node, piece = piece, list = app.newList()}
+local current = row.node[piece.field]
+local function field(hint, text)
+chooser.mode, chooser.hint = "field", hint
+chooser.text = text or ""
+end
+if t == "port" then
+chooser.mode, chooser.entries = "list", portEntries(ed, piece)
+chooser.hint = #chooser.entries > 0 and "choose the port"
+or "no port fits here -- add one to the header first"
+elseif t == "item" then
+chooser.mode, chooser.entries = "list", itemEntries(ed)
+chooser.hint = "choose an item, or type an id like minecraft:coal and Enter"
+chooser.typed = true
+elseif schema.CHOICES[t] then
+chooser.mode, chooser.entries = "list", {}
+for _, choice in ipairs(schema.CHOICES[t]) do
+chooser.entries[#chooser.entries + 1] = {value = choice, label = choice}
+end
+chooser.hint = "choose one"
+elseif t == "value" then
+local port = portNamed(ed, row.node.port)
+if port and port.type == "flag" then
+chooser.mode, chooser.hint = "list", "on or off"
+chooser.entries = {{value = "on", label = "on"}, {value = "off", label = "off"}}
+else
+field("a level, 0-15", current and schema.expr(current) or "")
+end
+elseif t == "count" then
+field(("how many, %d-%d"):format(piece.min or 1, piece.max or 64),
+current and tostring(current) or "")
+elseif t == "duration" then
+field("a duration: 4t, 5s or 2m", current and schema.value(piece, current) or "")
+elseif t == "cond" and row.node.kind ~= "let" then
+
+chooser.clauses = true
+elseif t == "cond" then
+
+field("a reading, like count minecraft:coal in fuel",
+current and schema.expr(current) or "")
+elseif t == "text" then
+field(row.node.kind == "fault" and "why the machine faults" or "the alarm's text",
+current or "")
+elseif t == "block" then
+
+chooser.mode, chooser.entries = "list", {}
+for _, h in ipairs(ed.state.tree.handlers or {}) do
+if h.kind == "to" and h.name then
+chooser.entries[#chooser.entries + 1] = {value = h.name, label = h.name}
+end
+end
+chooser.hint = #chooser.entries > 0 and "choose the block"
+or "no block yet -- add a `to` block at the top level first"
+elseif t == "name" then
+field("a name: lowercase letters, digits and _", current or "")
+elseif t == "slots" then
+field("slots: 2, 1-9 or 1,3", current and format.slots(current) or "")
+elseif t == "safe" then
+field("safe at: on, off or 0-15", current and schema.expr(current) or "")
+elseif t == "inputs" then
+field("what it is made from: 1 minecraft:raw_iron, or 2 a:b in left, 1 c:d",
+current and format.inputs(current) or "")
+else
+return false
+end
+ed.chooser = chooser
+if chooser.clauses then openClauses(ed, chooser, current) end
+return true
+end
+
+local function openPalette(ed)
+local row = currentRow(ed)
+if not row then return false end
+local entries = {}
+for _, kind in ipairs(edit.palette(row)) do
+local k = schema.KINDS[kind]
+entries[#entries + 1] = {value = kind, label = k and k.label or kind,
+note = k and (k.place == "top" and "handler"
+or kind == "makes" and "recipe" or kind == "yields" and "source"
+or k.place == "header" and "port"
+or (k.block and "block" or "")) or "block"}
+end
+ed.chooser = {mode = "list", palette = true, row = ed.cursor, entries = entries,
+list = app.newList(), hint = "add a line: choose what it is"}
+return true
+end
+
+local function openLine(ed)
+local row = currentRow(ed)
+if not row or row.kind == "else" then return false end
+local text = row.kind == "machine" and ("machine " .. (row.node.machine or ""))
+or schema.text(row.node)
+if row.node.comment then text = text .. "  --" .. row.node.comment end
+ed.chooser = {mode = "field", line = true, row = ed.cursor, node = row.node,
+text = text, hint = "type the line; Enter keeps it"}
+return true
+end
+
+
+local function typed(ed, piece, text, node)
+local t = piece.type
+if t == "count" then
+local n = tonumber(text)
+if not n or n % 1 ~= 0 then return nil, "a whole number" end
+if n < (piece.min or 1) or n > (piece.max or math.huge) then
+return nil, ("%d-%d"):format(piece.min or 1, piece.max or 64)
+end
+return n
+elseif t == "duration" then
+local n, unit = text:match("^%s*(%d+)([tsm])%s*$")
+if not n then return nil, "a number then t, s or m: 4t, 5s, 2m" end
+local d = {n = tonumber(n), unit = unit}
+local ticks = parse.ticks(d)
+if ticks < (piece.min or 1) or ticks > (piece.max or math.huge) then
+return nil, "out of range for this"
+end
+return d
+elseif t == "cond" then
+local n, top, errors = parse.line("if " .. text, "block", ed.state.top)
+if not n then return nil, errors[1] and errors[1].message or "not a condition" end
+ed.state.top = top
+return n.cond
+elseif t == "value" or t == "safe" then
+local n, top, errors = parse.line("set x to " .. text, "block", ed.state.top)
+if not n then return nil, "on, off or a level 0-15" end
+ed.state.top = top
+return n.value
+elseif t == "text" then
+if text == "" or text:find('"', 1, true) then return nil, "some text, without \"" end
+if #text > check.LIMITS.textMax then
+return nil, ("at most %d characters"):format(check.LIMITS.textMax)
+end
+return text
+elseif t == "name" then
+if not text:match("^[a-z_][a-z0-9_]*$") then
+return nil, "lowercase letters, digits and _, not starting with a digit"
+end
+if lex.KEYWORDS[text] then return nil, ("`%s` is a keyword"):format(text) end
+return text
+elseif t == "slots" then
+if text == "" then return false end
+local n, _, errors = parse.line("input x : volume slots " .. text, "header", 0)
+if not n then return nil, errors[1] and errors[1].message or "slots like 1-3" end
+return n.slots
+elseif t == "inputs" then
+local n, _, errors = parse.line("makes 1 x:y from " .. text, "header", 0)
+if not n then return nil, errors[1] and errors[1].message or "like 1 minecraft:raw_iron" end
+return n.inputs
+elseif t == "item" then
+if not text:match("^[a-z0-9_.%-]+:[a-z0-9_./%-]+$") then
+return nil, "an item id: namespace:path"
+end
+return text
+end
+return nil, "not typed"
+end
+
+
+local function fill(ed, chooser, value)
+local node, piece = chooser.node, chooser.piece
+if piece.field == "machine" then
+edit.set(ed.state, ed.state.tree, "machine", value)
+elseif piece.type == "value" and (value == "on" or value == "off") then
+edit.set(ed.state, node, piece.field, {kind = "onoff", value = value == "on",
+id = edit.nextId(ed.state), span = {}})
+else
+edit.set(ed.state, node, piece.field, value or nil)
+end
+ed.chooser = nil
+
+local row = currentRow(ed)
+for i, part in ipairs(slotsOf(ed, row)) do
+if part.text == schema.HOLE then ed.slot = i; break end
+end
+changed(ed)
+end
+
+
+local function commit(ed, entry)
+local chooser = ed.chooser
+if not chooser then return false end
+if chooser.palette then
+local row = currentRow(ed)
+local n, why = edit.insert(ed.state, row, entry.value)
+ed.chooser = nil
+if not n then say(ed, why, "bad"); return true end
+
+for i, r in ipairs(rows(ed)) do
+if (entry.value == "else" and r.kind == "else" and r.node == n)
+or (entry.value ~= "else" and r.node == n and r.kind ~= "else") then
+ed.cursor = i
+end
+end
+ed.slot = 1
+changed(ed)
+local new = currentRow(ed)
+local first = slotsOf(ed, new)[1]
+if first and first.text == schema.HOLE then openSlot(ed, new, first) end
+return true
+end
+if chooser.mode == "list" then
+if entry then fill(ed, chooser, entry.value); return true end
+if chooser.typed and chooser.list.query ~= "" then
+local value, why = typed(ed, chooser.piece, chooser.list.query, chooser.node)
+if value == nil then chooser.why = why; return true end
+fill(ed, chooser, value)
+end
+return true
+end
+
+if chooser.line then
+local row = rows(ed)[chooser.row]
+local n, errors = edit.replace(ed.state, row, chooser.text)
+if not n then
+chooser.why = errors and errors[1] and errors[1].message or "does not parse"
+return true
+end
+ed.chooser = nil
+changed(ed)
+return true
+end
+if chooser.name then
+local value, why = typed(ed, NAME_PIECE, chooser.text)
+if not value then chooser.why = why; return true end
+ed.chooser = nil
+app.ask(ed, {kind = "add", machine = value})
+return true
+end
+local value, why = typed(ed, chooser.piece, chooser.text, chooser.node)
+if value == nil then chooser.why = why; return true end
+fill(ed, chooser, value ~= false and value or nil)
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function nextPart(clause)
+if not clause.left then return "left" end
+if (clause.left.kind == "count" or clause.left.kind == "free") and not clause.left.item then
+return "item"
+end
+if not clause.op then return "op" end
+if clause.right == nil then return "right" end
+return nil
+end
+
+
+
+local function readingEntries(ed)
+local out = {}
+local recipe = ed.chooser and ed.chooser.recipe
+if recipe then
+for _, port in ipairs(ed.state.tree.ports) do
+if port.name and port.type == "volume" then
+out[#out + 1] = {value = "out:" .. port.name,
+label = ("how many of what %s makes are in %s"):format(recipe, port.name),
+note = "count"}
+end
+end
+end
+for _, port in ipairs(ed.state.tree.ports) do
+if port.name and (port.type == "level" or port.type == "flag") then
+out[#out + 1] = {value = "port:" .. port.name, label = port.name,
+note = ("%s %s"):format(port.direction or "?", port.type)}
+end
+end
+for _, port in ipairs(ed.state.tree.ports) do
+if port.name and port.type == "volume" then
+out[#out + 1] = {value = "count:" .. port.name,
+label = "how many of an item are in " .. port.name, note = "count"}
+
+out[#out + 1] = {value = "all:" .. port.name,
+label = "how many items of any kind are in " .. port.name, note = "count"}
+end
+end
+out[#out + 1] = {value = "free", label = "how many of an item are free in the pool",
+note = "count"}
+return out
+end
+
+local function portsOf(ed) return ed.state.tree.ports end
+
+
+local function openPart(ed, i, part)
+local chooser = ed.chooser
+local clause = chooser.cond.list[i]
+local sub = {clause = i, part = part, list = app.newList()}
+local t = clauses.typeOf(clause.left, portsOf(ed))
+if part == "left" then
+sub.mode, sub.entries, sub.hint = "list", readingEntries(ed), "what should it look at?"
+elseif part == "item" then
+sub.mode, sub.entries, sub.typed = "list", itemEntries(ed), true
+sub.hint = "which item? (or type an id like minecraft:coal, Enter)"
+elseif part == "op" then
+sub.mode, sub.entries, sub.hint = "list", {}, "how should it compare?"
+for _, o in ipairs(clauses.opsFor(t)) do
+sub.entries[#sub.entries + 1] = {value = o.op, label = o.words}
+end
+elseif part == "right" then
+if t == "flag" then
+sub.mode, sub.hint = "list", "on or off?"
+sub.entries = {{value = "on", label = "on"}, {value = "off", label = "off"}}
+elseif t == "count" and chooser.recipe then
+
+sub.mode = "list"
+sub.entries = {{value = "amount", label = ("what one %s makes (amount %s)")
+:format(chooser.recipe, chooser.recipe)},
+{value = "#number", label = "a number.."}}
+sub.hint = "what should it be compared with?"
+else
+sub.mode = "field"
+sub.text = type(clause.right) == "number" and tostring(clause.right) or ""
+sub.hint = t == "level" and "what level? 0-15, then Enter" or "how many? then Enter"
+end
+end
+chooser.sub = sub
+end
+
+
+local function chooseClause(ed, value)
+local chooser = ed.chooser
+local sub = chooser and chooser.sub
+if not sub then return false end
+local clause = chooser.cond.list[sub.clause]
+if sub.part == "left" then
+local before = clauses.typeOf(clause.left, portsOf(ed))
+local kind, name = tostring(value):match("^(%a+):(.+)$")
+if value == "free" then
+clause.left = {kind = "free"}
+elseif kind == "count" then
+clause.left = {kind = "count", port = name}
+elseif kind == "out" then
+clause.left = {kind = "countout", recipe = chooser.recipe, port = name}
+elseif kind == "all" then
+clause.left = {kind = "countall", port = name}
+elseif kind == "port" then
+clause.left = {kind = "name", name = name}
+else
+return false
+end
+
+local after = clauses.typeOf(clause.left, portsOf(ed))
+if after ~= before then
+clause.right = nil
+if after == "flag" and clause.op ~= "=" and clause.op ~= "!=" then clause.op = nil end
+end
+elseif sub.part == "item" then
+clause.left.item = value
+elseif sub.part == "op" then
+clause.op = value
+elseif sub.part == "right" then
+if value == "on" or value == "off" then
+clause.right = value == "on"
+elseif value == "amount" and chooser.recipe then
+clause.right = {kind = "amount", recipe = chooser.recipe}
+elseif value == "#number" then
+
+sub.mode, sub.text, sub.hint = "field", "", "how many? then Enter"
+return true
+else
+local n = tonumber(value)
+local t = clauses.typeOf(clause.left, portsOf(ed))
+local max = t == "level" and check.LIMITS.level or math.huge
+if not n or n % 1 ~= 0 or n < 0 or n > max then
+sub.why = t == "level" and "a level is 0 to 15" or "a whole number, 0 or more"
+return true
+end
+clause.right = n
+end
+end
+chooser.sub = nil
+local part = nextPart(clause)
+if part then openPart(ed, sub.clause, part) end
+return true
+end
+
+openClauses = function(ed, chooser, current)
+
+local row = edit.rows(ed.state)[chooser.row]
+local h = row and edit.handlerOf(ed.state, row)
+chooser.recipe = h and (h.kind == "onrun" or h.kind == "onfail") and h.name or nil
+local c = clauses.fromTree(current)
+if not c then
+
+
+chooser.mode, chooser.text = "field", schema.expr(current)
+chooser.hint = "this condition is more than clauses: edit it as text"
+chooser.canClauses = true
+return
+end
+if #c.list == 0 then c.list[1] = {} end
+chooser.mode, chooser.cond = "clauses", c
+chooser.hint = "when is it true?"
+local part = nextPart(c.list[1])
+if #c.list == 1 and part then openPart(ed, 1, part) end
+end
+
+local function clausesTree(ed)
+return clauses.toTree(ed.chooser.cond, function() return edit.nextId(ed.state) end)
+end
+
+
+
+local function toolbar(ed)
+local busy = ed.sending ~= nil
+local children = {
+doc.gap(1),
+doc.button("+ add", {key = "+", action = {kind = "ed-palette"}, keep = doc.REQUIRED,
+name = "ed-add"}),
+doc.gap(1),
+doc.button("type", {key = "t", action = {kind = "ed-type"}, keep = 8, name = "ed-type"}),
+doc.gap(1),
+doc.button("del", {key = "delete", keyLabel = "del", colour = "bad",
+action = {kind = "ed-delete"}, keep = 7, name = "ed-delete"}),
+doc.gap(1),
+doc.button("undo", {key = "u", colour = #ed.state.undo > 0 and "action" or "dim",
+action = #ed.state.undo > 0 and {kind = "ed-undo"} or nil, keep = 6,
+name = "ed-undo"}),
+doc.spacer({min = 1}),
+doc.button("Check", {key = "c", action = (not busy) and {kind = "ed-check"} or nil,
+colour = busy and "dim" or "action", keep = 9, name = "ed-check"}),
+doc.gap(1),
+doc.button("Save", {key = "s", colour = busy and "dim" or "good",
+action = (not busy) and {kind = "ed-save"} or nil, keep = doc.REQUIRED,
+name = "ed-save"}),
+doc.gap(1),
+}
+if ed.draft then
+table.insert(children, 2, doc.button("discard draft", {colour = "bad",
+action = {kind = "ed-discard"}, keep = 10, name = "ed-discard"}))
+table.insert(children, 3, doc.gap(1))
+end
+return doc.row(children, {keep = doc.REQUIRED, name = "ed-toolbar"})
+end
+
+
+
+
+
+local function lineRow(ed, index, row, total, width)
+local marks = ed.marks and ed.marks[row.node.id]
+local remote = nil
+for _, e in ipairs(ed.remoteErrors or {}) do
+if e.node == row.node.id and row.kind ~= "else" then remote = e end
+end
+local mark, markColour = " ", "dim"
+if (marks and marks[1].level == "error") or remote then
+mark, markColour = "!", "bad"
+elseif marks then
+mark, markColour = "~", "warn"
+end
+local current = index == ed.cursor
+local grip = {kind = "ed-line", row = index, drag = {row = index},
+drop = {row = index}}
+local indent = editor.MARGIN - 1 + row.depth * editor.INDENT
+local children = {
+doc.text(mark, {colour = markColour, keep = doc.REQUIRED,
+name = "mark:" .. index, action = grip}),
+doc.text(string.rep(" ", indent),
+{keep = doc.REQUIRED, name = "indent:" .. index, action = grip}),
+}
+local rowsOfLine = {children}
+local used = 1 + indent
+local slotIndex = 0
+for i, part in ipairs(parts(ed, row)) do
+local need = #part.text + ((i > 1) and 1 or 0)
+if width and i > 1 and used + need > width - 1 then
+
+children = {
+doc.text(" ", {keep = doc.REQUIRED, name = ("mark:%d:%d"):format(index,
+#rowsOfLine + 1), action = grip}),
+doc.text(string.rep(" ", indent) .. "..", {colour = "dim",
+keep = doc.REQUIRED, name = ("wrap:%d:%d"):format(index,
+#rowsOfLine + 1), action = grip}),
+}
+rowsOfLine[#rowsOfLine + 1] = children
+used = 1 + indent + 2
+need = #part.text + 1
+end
+used = used + need
+if i > 1 or #rowsOfLine > 1 then children[#children + 1] = doc.gap(1) end
+if part.piece then
+slotIndex = slotIndex + 1
+local hole = part.text == schema.HOLE
+local chosen = current and slotIndex == ed.slot
+
+children[#children + 1] = doc.text(part.text, {
+colour = hole and "bad" or (part.offer and "dim" or "text"),
+bg = chosen and "selected" or "field", truncate = doc.TRUNCATED,
+keep = 60 - i, name = ("slot:%d:%d"):format(index, slotIndex),
+action = {kind = "ed-slot", row = index, slot = slotIndex,
+drag = {row = index}, drop = {row = index}}})
+else
+children[#children + 1] = doc.text(part.text, {
+colour = (row.kind == "machine" or row.place == "top") and "title" or "label",
+keep = 60 - i, name = ("word:%d:%d"):format(index, i), action = grip})
+end
+end
+if row.node.comment and row.kind ~= "else" then
+children[#children + 1] = doc.text("  --" .. row.node.comment, {colour = "dim",
+truncate = doc.TRUNCATED, keep = 1, name = "comment:" .. index})
+end
+children[#children + 1] = doc.text(" ", {width = "fill", keep = doc.REQUIRED,
+name = "rest:" .. index, action = grip})
+local over = ed.carry and ed.carry.over and ed.carry.over.row == index
+local bg = over and "selected" or (current and "zebra" or nil)
+if #rowsOfLine == 1 then
+return doc.row(children, {keep = 20 + (total - index), name = "line:" .. index,
+bg = bg})
+end
+local built = {}
+for k, kids in ipairs(rowsOfLine) do
+if k < #rowsOfLine then
+kids[#kids + 1] = doc.text(" ", {width = "fill", keep = doc.REQUIRED,
+name = ("rest:%d:%d"):format(index, k), action = grip})
+end
+built[k] = doc.row(kids, {keep = doc.REQUIRED, name = ("line-row:%d:%d"):format(
+index, k), bg = bg})
+end
+return doc.stack(built, {keep = 20 + (total - index), name = "line:" .. index, bg = bg})
+end
+
+
+local function boxRows(box, rowsOut, height)
+if box.mode == "field" then
+rowsOut[#rowsOut + 1] = doc.text(" " .. (box.text or "") .. "_", {bg = "field",
+colour = "title", width = "fill", truncate = doc.TRUNCATED,
+keep = doc.REQUIRED, name = "ed-field"})
+else
+local entries = box.entries or {}
+local rowsBuilt = app.listRows(box.list, entries, "choice",
+function(entry) return {kind = "ed-choose", value = entry.value} end,
+{pickKeys = false, arrows = true, limit = math.max(3, math.floor(height / 2))})
+for _, r in ipairs(rowsBuilt) do
+
+r.keep = (type(r.keep) == "number") and (r.keep + 200) or r.keep
+rowsOut[#rowsOut + 1] = r
+end
+if #entries == 0 then
+rowsOut[#rowsOut + 1] = doc.text(" nothing to choose from", {colour = "dim",
+keep = 250, name = "ed-none"})
+end
+end
+if box.why then
+rowsOut[#rowsOut + 1] = doc.text(" " .. box.why, {colour = "bad", wrap = true,
+keep = 400, name = "ed-why"})
+end
+end
+
+
+
+
+function editor.clauseFixed(i, op, value)
+return #(" %d."):format(i) + 5 + 10 + 1 + 3 + 1 + #op + #value
+end
+
+
+
+local function clauseRow(ed, i, clause, choosing)
+local function part(label, name, what, colour)
+local active = choosing and choosing.part == what
+or (what == "left" and choosing and choosing.part == "item")
+return doc.button(label, {colour = active and "selected" or (colour or "action"),
+action = {kind = "ed-clause", clause = i, part = what}, keep = doc.REQUIRED,
+name = ("clause-%s:%d"):format(name, i)})
+end
+local itemName = itemName(ed)
+
+
+
+
+local op = clauses.words(clause.op) or "?"
+local value = clauses.valueText(clause.right) or "?"
+
+
+local valueRoom = editor.WIDTH - editor.clauseFixed(i, op, "") - editor.READING_MIN
+if #value > valueRoom then
+value = value:sub(1, math.max(1, valueRoom - #doc.TRUNCATED)) .. doc.TRUNCATED
+end
+local reading = clauses.readingText(clause.left, itemName) or "choose.."
+local room = math.max(editor.READING_MIN, math.min(editor.READING_MAX,
+editor.WIDTH - editor.clauseFixed(i, op, value)))
+if #reading > room then
+reading = reading:sub(1, room - #doc.TRUNCATED) .. doc.TRUNCATED
+end
+return doc.row({
+doc.text((" %d."):format(i), {colour = "dim", keep = doc.REQUIRED,
+name = "clause-n:" .. i}),
+doc.gap(1),
+part(reading, "left", "left"),
+doc.gap(1),
+part(op, "op", "op"),
+doc.gap(1),
+part(value, "right", "right"),
+doc.spacer({min = 1}),
+part(clause.neg and "NOT" or "not", "not", "not", clause.neg and "bad" or "dim"),
+doc.gap(1),
+part("x", "remove", "remove", "bad"),
+doc.gap(1),
+}, {keep = 350 - i, name = "clause:" .. i})
+end
+
+local function clauseRows(ed, rowsOut, height)
+local chooser = ed.chooser
+local c = chooser.cond
+if #c.list > 1 then
+rowsOut[#rowsOut + 1] = doc.row({
+doc.gap(1),
+doc.button(c.join == "and" and "all" or "any", {colour = "selected",
+action = {kind = "ed-clause-join"}, keep = doc.REQUIRED, name = "clause-join"}),
+doc.text(" of these must be true (click to change)", {colour = "label",
+truncate = doc.TRUNCATED, keep = 5, name = "clause-join-text"}),
+}, {keep = 360, name = "clause-join-row"})
+end
+for i, clause in ipairs(c.list) do
+rowsOut[#rowsOut + 1] = clauseRow(ed, i, clause,
+chooser.sub and chooser.sub.clause == i and chooser.sub or nil)
+end
+if chooser.sub then
+rowsOut[#rowsOut + 1] = doc.text("   " .. (chooser.sub.hint or ""), {colour = "label",
+truncate = doc.TRUNCATED, keep = 340, name = "clause-hint"})
+boxRows(chooser.sub, rowsOut, height)
+end
+rowsOut[#rowsOut + 1] = doc.row({
+doc.gap(1),
+doc.button("+ another", {action = {kind = "ed-clause-add"}, keep = doc.REQUIRED,
+name = "clause-add"}),
+doc.gap(1),
+doc.button("Done", {colour = "good", action = {kind = "ed-clause-done"},
+keep = doc.REQUIRED, name = "clause-done"}),
+doc.gap(1),
+doc.button("type it", {action = {kind = "ed-clause-text"}, keep = 5,
+name = "clause-text"}),
+}, {keep = doc.REQUIRED, name = "clause-actions"})
+end
+
+local function chooserRows(ed, rowsOut, height)
+local chooser = ed.chooser
+rowsOut[#rowsOut + 1] = doc.rule({keep = 300, name = "ed-chooser-rule"})
+rowsOut[#rowsOut + 1] = doc.row({
+doc.text(" " .. (chooser.hint or ""), {colour = "label", width = "fill",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "ed-hint"}),
+doc.button("cancel", {action = {kind = "ed-cancel"}, keep = doc.REQUIRED,
+name = "ed-cancel"}),
+doc.gap(1),
+}, {keep = doc.REQUIRED, name = "ed-chooser-head"})
+if chooser.mode == "clauses" then return clauseRows(ed, rowsOut, height) end
+boxRows(chooser, rowsOut, height)
+if chooser.canClauses then
+rowsOut[#rowsOut + 1] = doc.row({doc.gap(1), doc.button("start over with clauses",
+{action = {kind = "ed-clause-start"}, keep = doc.REQUIRED, name = "clause-start"})},
+{keep = 330, name = "clause-start-row"})
+end
+end
+
+
+
+local function statusText(ed)
+if ed.sending then return ("asking %s.."):format(ed.view.host), "warn" end
+local row = currentRow(ed)
+local marks = row and ed.marks and ed.marks[row.node.id]
+if row and row.kind ~= "else" and marks then
+return marks[1].message, marks[1].level == "error" and "bad" or "warn"
+end
+if ed.result then return ed.result.text, ed.result.colour end
+local r = ed.report
+if r then
+if r.ok then
+return ("ok -- %d warning%s"):format(#r.warnings, #r.warnings == 1 and "" or "s"),
+"good"
+end
+return ("%d to fix before it can be saved"):format(#r.errors), "warn"
+end
+return "", "text"
+end
+
+local function confirmDocument(ed, rowsOut)
+local r = report(ed)
+local name = ed.state.tree.machine
+if ed.confirm == "delete" then
+rowsOut[#rowsOut + 1] = doc.text(" Remove this line and everything under it?",
+{colour = "title", wrap = true, keep = doc.REQUIRED, name = "ed-confirm"})
+else
+rowsOut[#rowsOut + 1] = doc.text((" Save %s as rev %d?"):format(name,
+(ed.rev or 0) + 1), {colour = "title", keep = doc.REQUIRED, name = "ed-confirm"})
+local f = r and r.footprint or {}
+local function line(label, list, keep)
+if list and #list > 0 then
+rowsOut[#rowsOut + 1] = doc.text(("  %s: %s"):format(label,
+table.concat(list, ", ")), {colour = "text", truncate = doc.TRUNCATED,
+keep = keep, name = "ed-foot-" .. label})
+end
+end
+line("supplies", f.supplies, 30)
+line("collects", f.collects, 29)
+line("drives", f.drives, 28)
+if #ed.machines > 0 then
+rowsOut[#rowsOut + 1] = doc.text(("  %s run this type, and take the change "
+.. "between runs"):format(table.concat(ed.machines, ", ")),
+{colour = "warn", wrap = true, keep = 40, name = "ed-follow"})
+end
+end
+rowsOut[#rowsOut + 1] = doc.text("", {keep = doc.REQUIRED, name = "ed-above"})
+rowsOut[#rowsOut + 1] = doc.row({
+doc.gap(1),
+doc.button("yes", {key = "y", colour = "good", action = {kind = "ed-yes"},
+keep = doc.REQUIRED, name = "ed-yes"}),
+doc.gap(1),
+doc.button("no", {key = "n", colour = "bad", action = {kind = "ed-no"},
+keep = doc.REQUIRED, name = "ed-no"}),
+}, {keep = doc.REQUIRED, name = "ed-confirm-actions"})
+rowsOut[#rowsOut + 1] = doc.spacer()
+end
+
+
+function editor.document(ed, rowsOut, height, width)
+if not ed.state then
+rowsOut[#rowsOut + 1] = doc.text(" reading the script..", {colour = "dim",
+keep = doc.REQUIRED, name = "ed-reading"})
+rowsOut[#rowsOut + 1] = doc.spacer()
+return
+end
+report(ed)
+if ed.confirm then return confirmDocument(ed, rowsOut) end
+rowsOut[#rowsOut + 1] = toolbar(ed)
+
+local list = rows(ed)
+local lines = ed.lines
+lines.total = #list
+
+
+if ed.cursor ~= lines.cursorSeen then
+lines.cursorSeen = ed.cursor
+if ed.cursor < lines.from then lines.from = ed.cursor end
+if lines.shown and lines.shown > 0 and ed.cursor > lines.from + lines.shown - 1 then
+lines.from = ed.cursor - lines.shown + 1
+end
+end
+lines.from = math.max(1, math.min(lines.from, #list))
+local upto = math.min(#list, lines.from + height - 1)
+lines.listed = upto - lines.from + 1
+for index = lines.from, upto do
+rowsOut[#rowsOut + 1] = lineRow(ed, index, list[index], #list, width)
+end
+rowsOut[#rowsOut + 1] = doc.spacer()
+if ed.chooser then chooserRows(ed, rowsOut, height) end
+if ed.stale then
+rowsOut[#rowsOut + 1] = doc.row({
+doc.gap(1),
+doc.button("reload theirs", {action = {kind = "ed-reload"}, keep = doc.REQUIRED,
+name = "ed-reload"}),
+doc.gap(1),
+doc.button("overwrite with mine", {colour = "bad",
+action = {kind = "ed-overwrite"}, keep = doc.REQUIRED, name = "ed-overwrite"}),
+}, {keep = 500, name = "ed-stale"})
+elseif ed.madeNew and not ed.chooser then
+rowsOut[#rowsOut + 1] = doc.row({doc.gap(1), doc.button("Make a machine from it",
+{action = {kind = "ed-make"}, keep = doc.REQUIRED, name = "ed-make"})},
+{keep = 500, name = "ed-make-row"})
+end
+local text, colour = statusText(ed)
+rowsOut[#rowsOut + 1] = doc.text(" " .. (text or ""), {colour = colour, wrap = true,
+keep = app.KEEP_STATUS, name = "status"})
+end
+
+
+local function activeList(ed)
+local chooser = ed.chooser
+local box = chooser and (chooser.sub or chooser)
+if box and box.mode == "list" then return box end
+return nil
+end
+
+function editor.settle(ed, rep)
+local box = activeList(ed)
+if box then app.settle(box.list, rep, "choice") end
+local lines = ed.lines
+local changed = app.settle(lines, rep, "line")
+
+
+
+
+
+local dropped = false
+for _, entry in ipairs(rep and rep.dropped or {}) do
+if type(entry.name) == "string" and entry.name:find("^line:") then dropped = true end
+end
+if not dropped and lines.from > 1 and lines.from + (lines.listed or 0) - 1 >= (lines.total or 0) then
+lines.from, lines.shown, lines.cursorSeen = 1, nil, nil
+return true
+end
+return changed
+end
+
+
+
+
+
+local function drop(ed, from, onto, x)
+local list = rows(ed)
+local moving, target = list[from], list[onto]
+if not moving or not target or from == onto or moving.kind == "machine"
+or moving.kind == "else" then return false end
+local depth = x and math.floor((x - 1 - editor.MARGIN) / editor.INDENT)
+or target.depth
+local ok, why = edit.dropAt(ed.state, moving, target, depth)
+if not ok then say(ed, why, "bad"); return true end
+for i, r in ipairs(rows(ed)) do
+if r.node == moving.node and r.kind ~= "else" then ed.cursor = i end
+end
+changed(ed)
+return true
+end
+
+local function removeLine(ed)
+local row = currentRow(ed)
+local ok, why = edit.remove(ed.state, row)
+if not ok then say(ed, why, "bad") else changed(ed) end
+end
+
+function editor.act(ed, action)
+local kind = action and action.kind
+if not ed.state then return false end
+local box = activeList(ed)
+if box and app.page(box.list, kind, action) then return true end
+if kind == "carry" then
+ed.carry = {drag = action.drag, over = action.over}
+return true
+elseif kind == "drop" then
+ed.carry = nil
+if action.drag and action.drag.row and action.over and action.over.row then
+return drop(ed, action.drag.row, action.over.row, action.x)
+end
+return true
+elseif kind == "ed-line" then
+ed.cursor, ed.slot = action.row, 1
+ed.chooser = nil
+return true
+elseif kind == "ed-slot" then
+local wasHere = ed.cursor == action.row and ed.slot == action.slot
+ed.cursor, ed.slot = action.row, action.slot
+local row = currentRow(ed)
+local part = slotsOf(ed, row)[action.slot]
+
+if part and (wasHere or part.text == schema.HOLE) then openSlot(ed, row, part) end
+return true
+elseif kind == "ed-choose" then
+if ed.chooser and ed.chooser.mode == "clauses" then return chooseClause(ed, action.value) end
+return commit(ed, {value = action.value})
+elseif kind == "ed-clause" then
+local chooser = ed.chooser
+if not chooser or chooser.mode ~= "clauses" then return false end
+local list = chooser.cond.list
+if action.part == "not" then
+list[action.clause].neg = not list[action.clause].neg
+elseif action.part == "remove" then
+table.remove(list, action.clause)
+chooser.sub = nil
+if #list == 0 then
+list[1] = {}
+openPart(ed, 1, "left")
+end
+else
+
+openPart(ed, action.clause, action.part)
+end
+return true
+elseif kind == "ed-clause-add" then
+local list = ed.chooser.cond.list
+list[#list + 1] = {}
+openPart(ed, #list, "left")
+return true
+elseif kind == "ed-clause-join" then
+local c = ed.chooser.cond
+c.join = c.join == "and" and "or" or "and"
+return true
+elseif kind == "ed-clause-done" then
+fill(ed, ed.chooser, clausesTree(ed))
+return true
+elseif kind == "ed-clause-text" then
+local text = schema.expr(clausesTree(ed))
+local chooser = ed.chooser
+chooser.mode, chooser.text, chooser.sub, chooser.cond = "field", text, nil, nil
+chooser.hint = "the condition as text; Enter keeps it"
+chooser.canClauses = true
+return true
+elseif kind == "ed-clause-start" then
+local chooser = ed.chooser
+chooser.mode, chooser.cond, chooser.canClauses, chooser.why = "clauses",
+{join = "and", list = {{}}}, nil, nil
+chooser.hint = "when is it true?"
+openPart(ed, 1, "left")
+return true
+elseif kind == "ed-cancel" then
+ed.chooser = nil
+return true
+elseif kind == "ed-palette" then
+return openPalette(ed)
+elseif kind == "ed-type" then
+return openLine(ed)
+elseif kind == "ed-delete" then
+local row = currentRow(ed)
+if row.kind == "machine" then say(ed, "the machine line stays", "bad"); return true end
+if edit.holdsLines(row) then ed.confirm = "delete"; return true end
+removeLine(ed)
+return true
+elseif kind == "ed-undo" then
+if edit.undo(ed.state) then changed(ed) end
+return true
+elseif kind == "ed-check" then
+ed.remoteErrors = nil
+app.ask(ed, {kind = "check"})
+return true
+elseif kind == "ed-save" then
+local r = report(ed)
+if not r.ok then
+say(ed, ("%d to fix first -- the lines marked !"):format(#r.errors), "bad")
+app.sound(ed.view, "refused")
+return true
+end
+ed.confirm = "save"
+return true
+elseif kind == "ed-yes" then
+local was = ed.confirm
+ed.confirm = nil
+if was == "delete" then
+removeLine(ed)
+else
+ed.remoteErrors = nil
+app.ask(ed, {kind = "save", expect = ed.rev or 0})
+end
+return true
+elseif kind == "ed-no" then
+ed.confirm = nil
+return true
+elseif kind == "ed-overwrite" then
+local rev = ed.stale and ed.stale.rev
+ed.stale = nil
+app.ask(ed, {kind = "save", expect = rev})
+return true
+elseif kind == "ed-reload" or kind == "ed-discard" then
+
+ed.stale = nil
+if kind == "ed-discard" then editor.dropDraft(ed.state.tree.machine) end
+
+if not ed.name or ed.rev == 0 then
+ed.name, ed.draftPath = nil, nil
+ed.state, ed.draft = edit.blank(nil), false
+ed.result = nil
+return true
+end
+ed.reload, ed.draft = true, false
+ed.result = nil
+app.ask(ed, {kind = "script"})
+return true
+elseif kind == "ed-make" then
+ed.chooser = {mode = "field", name = true, text = "",
+hint = "the new machine's name, like f1"}
+return true
+end
+return false
+end
+
+local function moveCursor(ed, step)
+local _, list = currentRow(ed)
+ed.cursor = math.max(1, math.min(ed.cursor + step, #list))
+ed.slot = 1
+end
+
+local function shiftLine(ed, fn, ...)
+local row = currentRow(ed)
+local node = row.node
+local ok, why = fn(ed.state, row, ...)
+if not ok then say(ed, why, "bad"); return end
+for i, r in ipairs(rows(ed)) do
+if r.node == node and r.kind ~= "else" then ed.cursor = i end
+end
+changed(ed)
+end
+
+
+
+local function fieldKeys(box, event, enter)
+if event.kind == "char" then
+box.text = (box.text or "") .. event.char
+box.why = nil
+return true
+elseif event.kind == "key" and keys then
+if event.key == keys.backspace then
+if (box.text or "") == "" then return "close" end
+box.text = box.text:sub(1, -2)
+return true
+elseif event.key == keys.delete then
+box.text = ""
+return true
+elseif event.key == keys.enter or event.key == keys.numPadEnter then
+enter()
+return true
+end
+end
+return false
+end
+
+
+
+
+local function listKeys(box, event, pick)
+if event.kind == "key" and keys and (event.key == keys.enter
+or event.key == keys.numPadEnter) then
+local chosen = nil
+for _, entry in ipairs(box.list.matched or {}) do
+if entry.selected then chosen = entry end
+end
+chosen = chosen or (box.list.matched or {})[box.list.from or 1]
+if box.typed and box.list.query:find(":", 1, true) then
+
+local exact = false
+for _, entry in ipairs(box.list.matched or {}) do
+if entry.value == box.list.query then exact = true end
+end
+if not exact then chosen = nil end
+end
+pick(chosen)
+return true
+end
+if event.kind == "key" and keys and event.key == keys.backspace and box.list.query == "" then
+return "close"
+end
+if box.typed and event.kind == "char" and event.char:match("^[%d%.%-/]$") then
+box.list.query = box.list.query .. event.char
+box.list.from = 1
+return true
+end
+local took, chose = app.type(box.list, event)
+if chose then
+for _, entry in ipairs(box.entries or {}) do
+entry.selected = (entry.value == chose.value)
+end
+end
+return took
+end
+
+
+
+function editor.keyboard(ed, event)
+if not ed.state or ed.confirm then return false end
+local chooser = ed.chooser
+if event.kind == "scroll" and not chooser then
+app.scroll(ed.lines, event.dir or 0)
+return true
+end
+if chooser and chooser.mode == "field" then
+local took = fieldKeys(chooser, event, function() commit(ed) end)
+if took == "close" then ed.chooser = nil; return true end
+return took
+end
+if chooser and chooser.mode == "list" then
+local took = listKeys(chooser, event, function(entry) commit(ed, entry) end)
+if took == "close" then ed.chooser = nil; return true end
+return took
+end
+if chooser and chooser.mode == "clauses" then
+local sub = chooser.sub
+local took
+if sub and sub.mode == "field" then
+took = fieldKeys(sub, event, function() chooseClause(ed, sub.text) end)
+elseif sub then
+took = listKeys(sub, event, function(entry)
+if entry then return chooseClause(ed, entry.value) end
+if sub.typed and sub.list.query ~= "" then
+local item, why = typed(ed, {type = "item"}, sub.list.query)
+if item then chooseClause(ed, item) else sub.why = why end
+end
+end)
+elseif event.kind == "key" and keys and (event.key == keys.enter
+or event.key == keys.numPadEnter) then
+fill(ed, chooser, clausesTree(ed))
+return true
+end
+if took == "close" then chooser.sub = nil; return true end
+if took then return true end
+
+
+return event.kind == "char"
+end
+
+if event.kind == "char" then
+local c = event.char
+if c == "k" then shiftLine(ed, edit.shift, -1); return true
+elseif c == "j" then shiftLine(ed, edit.shift, 1); return true
+elseif c == "[" then shiftLine(ed, edit.outdent); return true
+elseif c == "]" then shiftLine(ed, edit.indent); return true
+end
+return false
+end
+if event.kind ~= "key" or not keys then return false end
+local key = event.key
+if key == keys.up then moveCursor(ed, -1); return true
+elseif key == keys.down then moveCursor(ed, 1); return true
+elseif key == keys.left or key == keys.right then
+local row = currentRow(ed)
+local n = #slotsOf(ed, row)
+if n > 0 then
+ed.slot = ((ed.slot - 1 + (key == keys.right and 1 or -1)) % n) + 1
+end
+return true
+elseif key == keys.enter or key == keys.numPadEnter then
+local row = currentRow(ed)
+local part = slotsOf(ed, row)[ed.slot]
+if part then openSlot(ed, row, part) else openLine(ed) end
+return true
+elseif key == keys.pageUp or key == keys.pageDown then
+app.page(ed.lines, key == keys.pageDown and "next" or "prev")
+return true
+end
+return false
+end
+
+return editor

@@ -1,0 +1,35 @@
+local rpc = require("mfg.common.rpc")
+local tester = require("mfg.controller.tester")
+
+
+
+
+
+
+
+
+
+
+return {
+name        = "test_call",
+label       = "Call a peripheral's method",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "device", label = "Peripheral", type = "text", required = true},
+{name = "method", label = "Method", type = "text", required = true},
+{name = "args", label = "Arguments", type = "table", required = false,
+help = "Texts, one per argument; tester.parse reads each as a literal."},
+},
+
+returns = {ok = "flag", count = "number", values = "table", error = "text",
+took = "number"},
+
+run = function(params)
+local result, why = tester.call(params.device, params.method, params.args or {})
+if not result then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, result
+end,
+}

@@ -1,0 +1,413 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local app = require("mfg.hmi.app")
+
+local player = {}
+
+player.EVERY = 3
+player.READ = {timeout = 3, attempts = 2}
+player.ACT = {timeout = 15, attempts = 1}
+player.OVERS = {"deposit", "trash", "vault"}
+
+function player.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+
+offer = true,
+screen = "home",
+status = nil,
+readWhy = nil,
+readAt = nil,
+result = nil,
+list = app.newList(),
+confirming = nil,
+naming = nil,
+vault = {side = "vault", item = nil, amount = 1},
+rule = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+
+
+function player.refresh(view) view.readAt = nil end
+
+function player.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+if view.onScreen ~= false and (not view.readAt
+or app.clock(view) - view.readAt >= player.EVERY * 1000) then
+return {kind = "read"}
+end
+return nil
+end
+
+local function act(view, command, params)
+app.ask(view, {kind = "act", command = command, params = params})
+end
+
+function player.exchange(view, job)
+local body, opts
+if job.kind == "read" then
+view.readAt = app.clock(view)
+body, opts = {command = "player_status"}, player.READ
+elseif job.kind == "act" then
+body, opts = {command = job.command}, player.ACT
+for k, v in pairs(job.params or {}) do body[k] = v end
+view.result = {status = "sending", command = job.command}
+else
+return false
+end
+local answer = view.transport.request(body, opts) or {}
+app.noteLink(view, answer)
+if job.kind == "read" then
+if answer.status == app.COMPLETED then
+view.status, view.readWhy = answer, nil
+else
+view.readWhy = tostring(answer.reason or answer.status or "no answer")
+end
+else
+view.result = {status = answer.status or app.REJECTED, command = job.command,
+reason = answer.reason, fields = answer}
+app.sound(view, answer.status == app.COMPLETED and "done" or "refused")
+view.readAt = nil
+end
+return true
+end
+
+
+
+local function line(text, colour, name, keep)
+return doc.text(text, {colour = colour or "text", wrap = true, keep = keep or 5,
+name = name})
+end
+
+local function back()
+return doc.button("<", {key = "<", colour = "action", action = {kind = "show",
+screen = "home"}, keep = doc.REQUIRED, name = "back"})
+end
+
+local function resultRow(view)
+local r = view.result
+if not r then return doc.text("", {keep = 1, name = "result"}) end
+if r.status == "sending" then return line(" ..", "warn", "result", app.KEEP_STATUS) end
+if r.status == app.COMPLETED then
+local f = r.fields or {}
+local text = "done"
+if r.command == "loadout_swap" then
+text = ("wearing %s: %d out, %d in"):format(tostring(f.worn), f.out or 0, f.into or 0)
+elseif r.command == "vault_move" then
+text = ("moved %d"):format(f.moved or 0)
+end
+if f.reason then text = text .. " -- " .. tostring(f.reason) end
+return line(" " .. text, "good", "result", app.KEEP_STATUS)
+end
+return line(" refused: " .. tostring(r.reason), "bad", "result", app.KEEP_STATUS)
+end
+
+local function home(view, rows)
+local s = view.status
+rows[#rows + 1] = line(("%s -- wearing %s"):format(s.owner, s.worn or "nothing saved"),
+"text", "who", doc.REQUIRED)
+rows[#rows + 1] = doc.text("", {keep = 3, name = "gap1"})
+for i, entry in ipairs({{"loadouts", "Loadouts"}, {"vault", "Vault"}, {"rules", "Rules"}}) do
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button(entry[2], {key = tostring(i),
+colour = "action", action = {kind = "show", screen = entry[1]},
+keep = doc.REQUIRED, name = "go-" .. entry[1]})},
+{keep = doc.REQUIRED, name = "row-" .. entry[1]})
+end
+rows[#rows + 1] = doc.text("", {keep = 2, name = "gap2"})
+rows[#rows + 1] = line("Storage withdraws into your inventory from this pocket.",
+"dim", "hint", 2)
+end
+
+local function loadoutRows(view, rows, height)
+local s = view.status
+if view.confirming then
+rows[#rows + 1] = line(("Swap to %s?"):format(view.confirming), "title", "confirm",
+doc.REQUIRED)
+rows[#rows + 1] = line(("Everything you carry goes into %s, as it is."):format(
+s.worn or "?"), "text", "note", 4)
+rows[#rows + 1] = doc.row({
+doc.button("yes", {key = "y", colour = "good", action = {kind = "yes"},
+keep = doc.REQUIRED, name = "yes"}), doc.gap(1),
+doc.button("no", {key = "n", colour = "bad", action = {kind = "no"},
+keep = doc.REQUIRED, name = "no"})}, {keep = doc.REQUIRED, name = "yn"})
+return
+end
+if view.naming then
+rows[#rows + 1] = line("Save what you carry as:", "title", "ask", doc.REQUIRED)
+rows[#rows + 1] = doc.row({doc.gap(1), doc.text(view.naming .. "_", {colour = "text",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "name"})}, {keep = doc.REQUIRED, name = "name-row"})
+rows[#rows + 1] = line("Enter: then bind an empty chest for it, by New device.",
+"dim", "how", 3)
+return
+end
+local entries = {}
+for _, name in ipairs(s.loadouts or {}) do
+entries[#entries + 1] = {value = name,
+label = name .. (name == s.worn and "  (wearing)" or "")}
+end
+if #entries == 0 then
+rows[#rows + 1] = line("No loadouts yet: save what you carry as one.", "dim",
+"none", 4)
+else
+for _, row in ipairs(app.listRows(view.list, entries, "loadout",
+function(entry) return {kind = "swap", name = entry.value} end,
+{limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("+ save as", {key = "+",
+colour = "action", action = {kind = "name"}, keep = doc.REQUIRED, name = "save"})},
+{keep = doc.REQUIRED, name = "save-row"})
+end
+
+local function vaultRows(view, rows, height)
+local s = view.status
+if not s.vault or not s.vault.bound then
+rows[#rows + 1] = line("No vault yet: storage only you use.", "dim", "none", 4)
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("bind a vault", {key = "b",
+colour = "action", action = {kind = "bind", path = s.vault and s.vault.path},
+keep = doc.REQUIRED, name = "bind"})}, {keep = doc.REQUIRED, name = "bind-row"})
+return
+end
+local v = view.vault
+local inVault = v.side == "vault"
+rows[#rows + 1] = doc.row({
+doc.button(inVault and "[vault]" or "vault", {key = "v", colour = "action",
+action = {kind = "side", side = "vault"}, keep = doc.REQUIRED, name = "side-v"}),
+doc.gap(1),
+doc.button(inVault and "carried" or "[carried]", {key = "c", colour = "action",
+action = {kind = "side", side = "carried"}, keep = doc.REQUIRED, name = "side-c"}),
+}, {keep = doc.REQUIRED, name = "sides"})
+local items = inVault and s.vault.items or s.carried or {}
+local entries = {}
+for _, entry in ipairs(items) do
+entries[#entries + 1] = {value = entry.item, selected = v.item == entry.item,
+label = ("%s x%d"):format(entry.name, entry.count)}
+end
+if #entries == 0 then
+rows[#rows + 1] = line(inVault and "The vault is empty." or "You carry nothing it can take.",
+"dim", "empty", 3)
+else
+for _, row in ipairs(app.listRows(view.list, entries, "item",
+function(entry) return {kind = "item", item = entry.value} end,
+{arrows = true, limit = height})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = app.quantityRow(v.amount, v.item ~= nil, nil, 1)
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button(inVault and "Take out" or "Put in",
+{key = "enter", colour = v.item and "good" or "dim",
+action = v.item and {kind = "vault-move"} or nil, keep = doc.REQUIRED,
+name = "vault-go"})}, {keep = doc.REQUIRED, name = "vault-go-row"})
+end
+
+
+local function ruleText(rule)
+if rule.keep then return ("keep %d, rest to %s"):format(rule.keep, rule.over) end
+return ("top up to %d"):format(rule.min or 0)
+end
+
+local function ruleRows(view, rows)
+local s = view.status
+local r = view.rule
+if r then
+rows[#rows + 1] = line("Item (id or #tag):", "label", "item-label", doc.REQUIRED)
+rows[#rows + 1] = doc.row({doc.gap(1), doc.text(r.item .. "_", {colour = "text",
+keep = doc.REQUIRED, truncate = doc.TRUNCATED, name = "item"})},
+{keep = doc.REQUIRED, name = "item-row"})
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button(r.topUp and "top up to" or "keep",
+{key = "m", colour = "action", action = {kind = "rule-mode"}, keep = doc.REQUIRED,
+name = "mode"})}, {keep = doc.REQUIRED, name = "mode-row"})
+rows[#rows + 1] = app.quantityRow(r.n, true, nil, 1)
+if not r.topUp then
+rows[#rows + 1] = doc.row({doc.gap(1), doc.text("rest to ", {colour = "label",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "over-label"}),
+doc.button(r.over, {key = "o", colour = "action", action = {kind = "rule-over"},
+keep = doc.REQUIRED, name = "over"})}, {keep = doc.REQUIRED, name = "over-row"})
+end
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("Save", {key = "enter",
+colour = "good", action = {kind = "rule-save"}, keep = doc.REQUIRED, name = "rule-save"}),
+doc.gap(1), doc.button("cancel", {colour = "bad", action = {kind = "rule-cancel"},
+keep = doc.REQUIRED, name = "rule-cancel"})}, {keep = doc.REQUIRED, name = "rule-go"})
+return
+end
+if #(s.rules or {}) == 0 then
+rows[#rows + 1] = line("No rules yet.", "dim", "none", 3)
+end
+for i, rule in ipairs(s.rules or {}) do
+rows[#rows + 1] = doc.row({
+doc.text(app.shortName(rule.item), {width = "fill", truncate = doc.TRUNCATED,
+colour = "text", name = "rule:" .. i}),
+doc.gap(1),
+doc.button("x", {colour = "bad", action = {kind = "rule-remove", item = rule.item},
+name = "rule-x:" .. i}),
+}, {keep = 4, name = "rule-row:" .. i})
+rows[#rows + 1] = doc.text("  " .. ruleText(rule), {colour = "dim",
+truncate = doc.TRUNCATED, keep = 4, name = "rule-does:" .. i})
+end
+rows[#rows + 1] = doc.row({doc.gap(1), doc.button("+ rule", {key = "+", colour = "action",
+action = {kind = "rule-new"}, keep = doc.REQUIRED, name = "rule-new"})},
+{keep = doc.REQUIRED, name = "rule-new-row"})
+end
+
+local TITLES = {home = "ME", loadouts = "LOADOUTS", vault = "VAULT", rules = "RULES"}
+
+function player.document(view, width, height)
+local rows = {app.header(view, TITLES[view.screen] or "ME",
+view.screen ~= "home" and back() or nil), doc.rule({keep = 2})}
+if not view.status then
+rows[#rows + 1] = line(view.readWhy and ("refused: " .. view.readWhy) or "asking..",
+view.readWhy and "bad" or "dim", "state", doc.REQUIRED)
+elseif view.screen == "loadouts" then
+loadoutRows(view, rows, height)
+elseif view.screen == "vault" then
+vaultRows(view, rows, height)
+elseif view.screen == "rules" then
+ruleRows(view, rows)
+else
+home(view, rows)
+end
+rows[#rows + 1] = resultRow(view)
+rows[#rows + 1] = doc.spacer()
+return doc.stack(rows, {name = "player"})
+end
+
+function player.settle(view, report)
+if view.screen == "loadouts" then return app.settle(view.list, report, "loadout") end
+if view.screen == "vault" then return app.settle(view.list, report, "item") end
+return false
+end
+
+
+
+function player.act(view, action)
+local kind = action and action.kind
+if app.page(view.list, kind, action) then return true end
+if kind == "show" then
+view.screen, view.confirming, view.naming, view.rule = action.screen, nil, nil, nil
+view.list = app.newList()
+return true
+elseif kind == "swap" then
+view.confirming = action.name
+return true
+elseif kind == "yes" and view.confirming then
+act(view, "loadout_swap", {name = view.confirming})
+view.confirming = nil
+return true
+elseif kind == "no" then
+view.confirming = nil
+return true
+elseif kind == "name" then
+view.naming = ""
+return true
+elseif kind == "bind" and action.path then
+
+view.jump = {app = "bind", action = {kind = "bind-new", path = action.path}}
+return true
+elseif kind == "side" then
+view.vault.side, view.vault.item = action.side, nil
+view.list = app.newList()
+return true
+elseif kind == "item" then
+view.vault.item = action.item
+return true
+elseif kind == "delta" then
+if view.rule then
+view.rule.n = app.clamp(view.rule.n + (action.n or 0), 0, 3456)
+else
+view.vault.amount = app.clamp(view.vault.amount + (action.n or 0), 1, 3456)
+end
+return true
+elseif kind == "vault-move" and view.vault.item then
+act(view, "vault_move", {item = view.vault.item, count = view.vault.amount,
+direction = view.vault.side == "vault" and "out" or "in"})
+return true
+elseif kind == "rule-new" then
+view.rule = {item = "", n = 64, over = "deposit", topUp = false}
+return true
+elseif kind == "rule-mode" and view.rule then
+view.rule.topUp = not view.rule.topUp
+return true
+elseif kind == "rule-over" and view.rule then
+for i, over in ipairs(player.OVERS) do
+if over == view.rule.over then
+view.rule.over = player.OVERS[i % #player.OVERS + 1]
+break
+end
+end
+return true
+elseif kind == "rule-save" and view.rule then
+local r = view.rule
+local params = {item = r.item}
+if r.topUp then params.min = r.n else params.keep, params.over = r.n, r.over end
+act(view, "player_rule", params)
+view.rule = nil
+return true
+elseif kind == "rule-cancel" then
+view.rule = nil
+return true
+elseif kind == "rule-remove" then
+act(view, "player_rule", {item = action.item, remove = true})
+return true
+end
+return false
+end
+
+
+function player.keyboard(view, event)
+local field, pattern
+if view.naming then
+field, pattern = "naming", "^[a-z0-9_%-]$"
+elseif view.rule then
+field, pattern = "rule", "^[%w_%-:%./#]$"
+else
+if view.screen == "loadouts" or view.screen == "vault" then
+return app.type(view.list, event)
+end
+return false
+end
+local text = field == "naming" and view.naming or view.rule.item
+if event.kind == "char" and type(event.char) == "string" and event.char:match(pattern) then
+text = text .. (field == "naming" and event.char:lower() or event.char)
+elseif event.kind == "key" and keys and event.key == keys.backspace then
+text = text:sub(1, -2)
+elseif event.kind == "key" and keys and event.key == keys.enter then
+if field == "naming" then
+if text ~= "" and view.status then
+view.naming = nil
+local path = ("%s/loadouts/%s"):format(
+(view.status.inventory or ""):gsub("/inv$", ""), text)
+view.jump = {app = "bind", action = {kind = "bind-new", path = path}}
+end
+return true
+end
+return true, {kind = "rule-save"}
+else
+return false
+end
+if field == "naming" then view.naming = text else view.rule.item = text end
+return true
+end
+
+return player

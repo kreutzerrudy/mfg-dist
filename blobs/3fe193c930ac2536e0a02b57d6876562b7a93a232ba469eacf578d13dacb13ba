@@ -1,0 +1,216 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local wire = {}
+
+wire.CHANNEL = 65410
+wire.LOOKUP_TIMEOUT = 1
+wire.CACHE = 60
+
+local myName = nil
+local known = {}
+local cache = {}
+
+local function now() return os.epoch("utc") end
+
+
+
+function wire.isCable(side)
+if peripheral.getType(side) ~= "modem" then return false end
+local ok, wireless = pcall(peripheral.call, side, "isWireless")
+return ok and wireless == false
+end
+
+
+function wire.modems()
+local out = {}
+for _, side in ipairs(peripheral.getNames()) do
+if wire.isCable(side) then out[#out + 1] = side end
+end
+table.sort(out)
+return out
+end
+
+
+
+function wire.open()
+local sides = wire.modems()
+for _, side in ipairs(sides) do peripheral.call(side, "open", wire.CHANNEL) end
+return #sides
+end
+
+
+function wire.up()
+return #wire.modems() > 0
+end
+
+local function transmit(message)
+local sides = wire.modems()
+for _, side in ipairs(sides) do
+peripheral.call(side, "open", wire.CHANNEL)
+peripheral.call(side, "transmit", wire.CHANNEL, wire.CHANNEL, message)
+end
+return #sides > 0
+end
+
+
+
+
+function wire.name()
+return myName or os.getComputerLabel() or ("#" .. os.getComputerID())
+end
+
+
+
+function wire.bind(name, id)
+known[name] = id
+end
+
+function wire.known(name)
+return known[name]
+end
+
+
+
+function wire.lookup(name, timeout)
+if name == myName then return os.getComputerID() end
+local hit = cache[name]
+if hit and now() - hit.at < wire.CACHE * 1000 then return hit.id end
+if not transmit({wire = 1, kind = "lookup", from = os.getComputerID(), name = name}) then
+return nil
+end
+local timer = os.startTimer(timeout or wire.LOOKUP_TIMEOUT)
+while true do
+local event, side, channel, _, message = os.pullEvent()
+if event == "modem_message" and channel == wire.CHANNEL and wire.isCable(side)
+and type(message) == "table" and message.wire == 1 and message.kind == "here"
+and message.to == os.getComputerID() and message.name == name then
+os.cancelTimer(timer)
+cache[name] = {id = message.from, at = now()}
+return message.from
+elseif event == "timer" and side == timer then
+return nil
+end
+end
+end
+
+
+
+
+function wire.host(name)
+local other = wire.lookup(name)
+if other and other ~= os.getComputerID() then
+return nil, ("%s is already on the wire, as computer %d"):format(name, other)
+end
+myName = name
+return true
+end
+
+
+function wire.forget(name)
+if name then cache[name] = nil else cache = {} end
+end
+
+
+
+function wire.resolve(target)
+if type(target) == "number" then return target end
+if type(target) ~= "string" then return nil, "a target is a name or a computer id" end
+if known[target] then return known[target] end
+local id = wire.lookup(target)
+if id then return id end
+return nil, ("no computer called %s answers on the wire"):format(target)
+end
+
+
+
+
+
+function wire.send(target, service, body)
+local id, why = wire.resolve(target)
+if not id then return nil, why end
+if not transmit({wire = 1, kind = "msg", to = id, from = os.getComputerID(),
+name = wire.name(), service = service, body = body}) then
+return nil, "this computer has no cable modem"
+end
+return true
+end
+
+
+
+function wire.accept(side, channel, message)
+if channel ~= wire.CHANNEL or type(message) ~= "table" or message.wire ~= 1 then
+return nil
+end
+if message.kind ~= "msg" or message.to ~= os.getComputerID() then return nil end
+if not wire.isCable(side) then return nil end
+return {src = message.from, from = message.name, service = message.service,
+body = message.body, encrypted = false, via = "wire"}
+end
+
+
+
+function wire.receive(service, timeout)
+local timer = timeout and os.startTimer(timeout)
+while true do
+local event, side, channel, _, message = os.pullEvent()
+if event == "modem_message" then
+local packet = wire.accept(side, channel, message)
+if packet and (service == nil or packet.service == service) then
+if timer then os.cancelTimer(timer) end
+return packet
+end
+elseif event == "timer" and side == timer then
+return nil
+end
+end
+end
+
+
+
+function wire.serve(_)
+return true
+end
+
+
+
+
+function wire.run()
+wire.open()
+while true do
+local event, side, channel, _, message = os.pullEvent()
+if event == "modem_message" and channel == wire.CHANNEL and myName
+and type(message) == "table" and message.wire == 1
+and message.kind == "lookup" and message.name == myName
+and message.from ~= os.getComputerID() and wire.isCable(side) then
+transmit({wire = 1, kind = "here", to = message.from,
+from = os.getComputerID(), name = myName})
+elseif event == "peripheral" then
+wire.open()
+end
+end
+end
+
+return wire

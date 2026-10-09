@@ -1,0 +1,89 @@
+local rpc = require("mfg.common.rpc")
+local mint = require("mfg.controller.mint")
+
+
+
+
+
+
+
+
+
+
+local NAME = "^[%w_%-]+$"
+local NAME_LENGTH = 20
+
+return {
+name        = "mint_node",
+label       = "Mint a node",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "drive", label = "Drive", type = "text", required = true},
+{name = "role", label = "Role", type = "text", required = false},
+{name = "name", label = "Name", type = "text", required = false},
+{name = "owner", label = "A pocket for", type = "text", required = false},
+{name = "again", label = "Mint over a minted computer", type = "flag",
+required = false},
+},
+
+returns = {name = "text", role = "text", address = "text", fetch = "number"},
+
+run = function(params)
+local role, owner = mint.check(params.role, params.owner)
+if not role then return rpc.REJECTED, {reason = owner} end
+
+local drive
+for _, d in ipairs(mint.drives()) do
+if d.name == params.drive then drive = d end
+end
+if not drive then
+return rpc.REJECTED, {reason = "no such drive: " .. tostring(params.drive)}
+end
+local seen = mint.inspect(drive)
+if seen.state == "empty" then
+return rpc.REJECTED, {reason = "the drive is empty"}
+elseif seen.state == "no-disk" then
+return rpc.REJECTED, {reason = "it has no disk yet: place it and turn it on once"}
+end
+local old = mint.identityIn(drive.mount)
+if old and not params.again then
+return rpc.REJECTED, {reason = ("it is already minted, as %s"):format(
+tostring(old.name))}
+end
+
+local name = params.name
+if name == nil or name == "" then name = mint.suggestName(role, owner) end
+if #name > NAME_LENGTH or not name:match(NAME) then
+return rpc.REJECTED, {reason = "a name is letters, digits, _ and -, up to "
+.. NAME_LENGTH}
+end
+if mint.nameTaken(name, old and old.instance) then
+return rpc.REJECTED, {reason = ("%s is taken"):format(name)}
+end
+
+local subnet = require("netkeys").subnets()[1]
+if not subnet then return rpc.REJECTED, {reason = "this controller has no subnet"} end
+
+
+
+local published, why = require("mfg.controller.repository").published(role)
+if not published then
+return rpc.REJECTED, {reason = ("the %s firmware is not published (%s) -- run: "
+.. "mfgctl publish %s"):format(role, tostring(why), role)}
+end
+if old then mint.clear(drive.mount) end
+local lease, cfg = mint.node(drive.mount, {
+role = role,
+name = name,
+owner = owner,
+network = subnet.network, prefix = subnet.prefix,
+controller = os.getComputerID(),
+})
+if not lease then return rpc.REJECTED, {reason = tostring(cfg)} end
+return rpc.COMPLETED, {name = name, role = role, owner = owner,
+address = require("ip").format(lease.address), fetch = cfg.toFetch or 0}
+end,
+}

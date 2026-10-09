@@ -1,0 +1,483 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local enrollment = require("mfg.common.enrollment")
+local leases = require("mfg.controller.leases")
+
+local netkeys = require("netkeys")
+local ip = require("ip")
+local random = require("ccryptolib.random")
+local state = require("mfg.common.state")
+
+local mint = {}
+
+
+local writeFile = state.writeText
+
+
+
+
+
+
+
+function mint.nextAddress(network, prefix)
+local taken = {}
+for _, addr in pairs(netkeys.addresses()) do taken[addr] = true end
+for _, lease in pairs(leases.all()) do
+if lease.address and not lease.consumed then taken[lease.address] = true end
+if lease.consumed and lease.address then taken[lease.address] = true end
+end
+
+local base = ip.network(network, prefix)
+local hosts = 2 ^ (32 - prefix)
+
+
+for offset = 100, hosts - 2 do
+local candidate = base + offset
+if not taken[candidate] then return candidate end
+end
+return nil, "no free address in " .. ip.formatCidr(base, prefix)
+end
+
+
+function mint.writeIdentity(dest, cfg)
+local lines = {
+"instance " .. cfg.instance,
+"secret " .. cfg.secretHex,
+
+
+
+"controller " .. tostring(cfg.controller),
+"address " .. ip.format(cfg.address),
+"name " .. cfg.name,
+
+
+}
+
+
+if cfg.owner then lines[#lines + 1] = "owner " .. cfg.owner end
+return writeFile(fs.combine(dest, "mfg/enroll.cfg"),
+table.concat(lines, "\n") .. "\n")
+end
+
+
+
+
+
+function mint.writeTrust(dest)
+local exchange = netkeys.publicKey()
+local anchor = netkeys.signerKey() or netkeys.signingKey()
+if not exchange then return false, "this computer has no keypair" end
+if not anchor then return false, "this computer has no signing key to anchor to" end
+
+writeFile(fs.combine(dest, "net/server.key"), netkeys.toHex(exchange))
+writeFile(fs.combine(dest, "net/signer.key"), netkeys.toHex(anchor))
+return true
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function mint.writeImage(dest, role, name)
+local repository = require("mfg.controller.repository")
+local configs = require("mfg.controller.configs")
+local apply = require("mfg.boot.apply")
+
+local carried = repository.carries(role)
+local m, why = repository.published(role)
+if not m then
+return false, ("the %s firmware is not published (%s) -- run: mfgctl publish %s")
+:format(role, tostring(why), role)
+end
+
+local intent = configs.get(name)
+if not intent or intent.role ~= role then
+local assigned, assignErr = configs.assign(name, role)
+if not assigned then return false, assignErr end
+end
+local envelope, doc = configs.issue(name)
+if not envelope then return false, doc end
+
+local result, installErr = apply.install(dest, m, envelope, apply.localSource("/"),
+{origin = "mint", signer = netkeys.signingKey(), startup = false,
+partial = not carried})
+if not result then return false, installErr end
+if result.missing > 0 then
+apply.loader().writeTable(fs.combine(dest, "boot/source"), {dist = repository.dist()})
+end
+return true, result.files - result.missing, result.missing
+end
+
+
+
+
+
+
+
+function mint.writeStartup(dest)
+local zero, why = require("mfg.boot.apply").stageZero()
+if not zero then return false, why end
+return writeFile(fs.combine(dest, "startup.lua"), zero)
+end
+
+function mint.writeSettings(dest, cfg)
+writeFile(fs.combine(dest, "net/role"), "client")
+writeFile(fs.combine(dest, "net/hostname"), cfg.name)
+writeFile(fs.combine(dest, "net/substrate"), netkeys.substrate() or "hopnet")
+
+
+
+
+
+
+
+
+
+
+
+
+
+local policy = state.readText("/net/ports")
+if policy then writeFile(fs.combine(dest, "net/ports"), policy) end
+
+return true
+end
+
+
+
+
+
+
+
+
+function mint.node(dest, opts)
+opts = opts or {}
+local role = opts.role or "turtle"
+local network, prefix = opts.network, opts.prefix
+if not network then return nil, "mint needs the subnet to allocate from" end
+
+local address, addrErr = opts.address, nil
+if not address then
+address, addrErr = mint.nextAddress(network, prefix)
+if not address then return nil, addrErr end
+end
+
+local instance = opts.instance or
+("%d-%d"):format(os.getComputerID(), os.epoch("utc"))
+
+
+
+
+
+
+
+
+if not random.isInit() then random.initWithTiming() end
+
+local secret = random.random(enrollment.SECRET_BYTES)
+local name = opts.name or "craft_turtle"
+
+local lease, leaseErr = leases.issue(instance, secret, address, name, role,
+opts.ttl, opts.owner)
+if not lease then return nil, leaseErr end
+
+local cfg = {
+instance = instance,
+secretHex = enrollment.toHex(secret),
+controller = opts.controller or os.getComputerID(),
+address = address,
+name = name,
+role = role,
+owner = opts.owner,
+}
+
+
+
+
+
+
+local imaged, imageErr, toFetch = mint.writeImage(dest, role, name)
+if not imaged then return nil, imageErr end
+cfg.toFetch = toFetch
+
+if not mint.writeIdentity(dest, cfg) then
+return nil, "could not write the enrollment config"
+end
+local trusted, trustErr = mint.writeTrust(dest)
+if not trusted then return nil, trustErr end
+mint.writeSettings(dest, cfg)
+
+
+local started, startErr = mint.writeStartup(dest)
+if not started then return nil, startErr end
+
+return lease, cfg
+end
+
+
+
+
+mint.BASE_NAME = {
+turtle = "craft_turtle",
+builder = "builder",
+station = "station",
+hmi = "hmi",
+controller = "mfg",
+}
+
+
+
+
+
+
+
+function mint.check(role, owner)
+role = role or "turtle"
+if owner then
+local pockets = require("mfg.controller.pockets")
+local record = require("mfg.storage.mount").get(pockets.inventoryPath(owner))
+if not record or not record.owner then
+return nil, ("no memory card for %s: bind their Inventory Manager as %s first")
+:format(owner, pockets.inventoryPath(owner))
+end
+owner = record.owner
+if role == "turtle" then role = "hmi" end
+if role ~= "hmi" then return nil, "a pocket for a player is an hmi" end
+end
+if not require("mfg.common.roles")[role] then
+return nil, ("unknown role: %s"):format(tostring(role))
+end
+return role, owner
+end
+
+
+
+function mint.players()
+local pockets = require("mfg.controller.pockets")
+local out = {}
+for path, record in pairs(require("mfg.storage.mount").all()) do
+if type(record) == "table" and record.owner
+and path == pockets.inventoryPath(record.owner) then
+out[#out + 1] = record.owner
+end
+end
+table.sort(out)
+return out
+end
+
+
+
+function mint.nameTaken(name, except)
+local now = os.epoch("utc")
+for id, lease in pairs(leases.all()) do
+if lease.name == name and id ~= except and not lease.revoked
+and (lease.consumed or not leases.isExpired(lease, now)) then
+return true
+end
+end
+return false
+end
+
+
+function mint.suggestName(role, owner)
+if owner then return "pocket_" .. require("mfg.controller.pockets").segment(owner) end
+local base = mint.BASE_NAME[role] or role
+if not mint.nameTaken(base) then return base end
+for n = 2, 999 do
+local name = base .. n
+if not mint.nameTaken(name) then return name end
+end
+return base
+end
+
+
+function mint.identityIn(dest)
+local text = state.readText(fs.combine(dest, "mfg/enroll.cfg"))
+if not text then return nil end
+local out = {}
+for line in text:gmatch("[^\r\n]+") do
+local key, value = line:match("^(%S+) (.*)$")
+if key then out[key] = value end
+end
+if not out.instance then return nil end
+out.secret = nil
+return out
+end
+
+
+
+
+
+
+
+
+
+
+function mint.drives()
+local out = {}
+for _, name in ipairs(peripheral.getNames()) do
+if peripheral.getType(name) == "drive" then
+local present = peripheral.call(name, "isDiskPresent") == true
+local item = nil
+if present then
+local ok, list = pcall(peripheral.call, name, "list")
+local first = ok and type(list) == "table" and list[1]
+item = first and first.name or nil
+end
+out[#out + 1] = {name = name, present = present, item = item,
+mount = present and peripheral.call(name, "getMountPath") or nil}
+end
+end
+table.sort(out, function(a, b) return a.name < b.name end)
+return out
+end
+
+
+
+function mint.platformOf(item)
+if type(item) ~= "string" then return nil end
+if item:find("^computercraft:turtle") then return "turtle" end
+if item:find("^computercraft:pocket_computer") then return "pocket" end
+if item:find("^computercraft:computer") then return "computer" end
+return nil
+end
+
+
+
+function mint.platformFor(role, owner)
+if owner then return "pocket" end
+local profile = require("mfg.common.roles")[role]
+return profile and profile.platform or nil
+end
+
+
+
+
+function mint.listing()
+local drives = {}
+for _, drive in ipairs(mint.drives()) do drives[#drives + 1] = mint.inspect(drive) end
+local roles, names, platforms = {}, {}, {}
+for role, profile in pairs(require("mfg.common.roles")) do
+roles[#roles + 1] = role
+names[role] = mint.suggestName(role)
+platforms[role] = profile.platform
+end
+table.sort(roles)
+local players = mint.players()
+for _, player in ipairs(players) do
+names["pocket:" .. player] = mint.suggestName("hmi", player)
+end
+return {drives = drives, players = players, roles = roles, names = names,
+platforms = platforms}
+end
+
+
+function mint.eject(name)
+return pcall(peripheral.call, name, "ejectDisk")
+end
+
+
+
+function mint.inspect(drive)
+local out = {name = drive.name, platform = mint.platformOf(drive.item)}
+if not drive.present then
+out.state = "empty"
+elseif not drive.mount then
+out.state = "no-disk"
+else
+local identity = mint.identityIn(drive.mount)
+if identity then
+out.state, out.minted = "minted", {name = identity.name,
+address = identity.address, owner = identity.owner}
+local lease = leases.get(identity.instance)
+out.minted.role = lease and lease.role or nil
+out.minted.ours = lease ~= nil
+else
+out.state = "ready"
+end
+end
+return out
+end
+
+
+
+
+
+
+function mint.clear(dest)
+local identity = mint.identityIn(dest)
+if identity then
+local all = leases.all()
+local lease = all[identity.instance]
+if lease and lease.consumed then
+if lease.publicKey then netkeys.revoke(lease.publicKey) end
+leases.revoke(identity.instance)
+elseif lease then
+leases.drop(identity.instance)
+end
+end
+for _, entry in ipairs(fs.list(dest)) do
+fs.delete(fs.combine(dest, entry))
+end
+return identity
+end
+
+return mint

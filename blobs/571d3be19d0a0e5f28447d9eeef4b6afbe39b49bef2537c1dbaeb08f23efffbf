@@ -1,0 +1,27 @@
+local rpc = require("mfg.common.rpc")
+local mint = require("mfg.controller.mint")
+
+
+
+
+
+
+
+
+
+return {
+name        = "drives",
+label       = "The minting drives",
+tier        = "node",
+manual      = false,
+destructive = false,
+
+parameters = {},
+
+returns = {drives = "table", players = "table", roles = "table", names = "table",
+platforms = "table"},
+
+run = function()
+return rpc.COMPLETED, mint.listing()
+end,
+}

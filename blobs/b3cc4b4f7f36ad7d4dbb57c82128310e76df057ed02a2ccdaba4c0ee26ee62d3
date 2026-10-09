@@ -1,0 +1,501 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+local panel = require("mfg.hmi.panel")
+
+local register = {}
+
+register.EVERY = 5
+register.BACKGROUND = 30
+register.POLL = 2
+register.READ = {timeout = 3, attempts = 2}
+register.ACT = {timeout = 10, attempts = 1}
+register.CRAFTING = "crafting"
+register.BOOK = "book"
+
+
+
+local OWN = {grid = true, kind = true, types = true, typesAt = true, machine = true,
+inputs = true, learnList = true, learning = true, learnResult = true,
+learnQueue = true, book = true, bookList = true, picked = true, forgetting = true}
+
+function register.new(opts)
+local grid = panel.new(opts)
+local own = {
+grid = grid,
+kind = register.CRAFTING,
+types = nil,
+typesAt = nil,
+machine = nil,
+inputs = {},
+learnList = app.newList(),
+learning = nil,
+learnResult = nil,
+learnQueue = {},
+book = nil,
+bookList = app.newList(),
+picked = nil,
+forgetting = false,
+}
+local view = setmetatable({}, {
+__index = function(_, key)
+if OWN[key] then return own[key] end
+return grid[key]
+end,
+__newindex = function(_, key, value)
+if OWN[key] then own[key] = value else grid[key] = value end
+end,
+})
+
+grid.above = function(width) return register.typeRow(view, width) end
+return view
+end
+
+local function crafting(view) return view.kind == register.CRAFTING end
+
+local function typeInfo(view)
+for _, rt in ipairs(view.types or {}) do
+if rt.name == view.kind then return rt end
+end
+end
+
+
+
+function register.refresh(view)
+view.typesAt = nil
+panel.refresh(view.grid)
+end
+
+function register.nextJob(view)
+local job = table.remove(view.learnQueue, 1)
+if job then return job end
+local now = app.clock(view)
+if view.learning and view.learning.state ~= "done" and (not view.learning.at
+or now - view.learning.at >= register.POLL * 1000) then
+return {kind = "poll"}
+end
+local every = (view.grid.onScreen == false) and register.BACKGROUND or register.EVERY
+if not view.typesAt or now - view.typesAt >= every * 1000 then return {kind = "types"} end
+return panel.nextJob(view.grid)
+end
+
+function register.exchange(view, job)
+local body, opts = nil, register.READ
+if job.kind == "types" then
+view.typesAt = app.clock(view)
+body = {command = "recipe_types"}
+elseif job.kind == "learn" then
+body = {command = "learn_recipe", operator = true, type = job.type,
+machine = job.machine, inputs = job.inputs}
+opts = register.ACT
+elseif job.kind == "poll" then
+body = {command = "learn_recipe", operator = true, id = view.learning.id}
+elseif job.kind == "forget" then
+body = {command = "forget_recipe", operator = true, recipe = job.id}
+opts = register.ACT
+else
+return panel.exchange(view.grid, job)
+end
+register.apply(view, job, view.transport.request(body, opts) or {})
+return true
+end
+
+function register.apply(view, job, answer)
+app.noteLink(view.grid, answer)
+local ok = answer.status == app.COMPLETED
+if job.kind == "types" then
+if ok and type(answer.types) == "table" then
+view.types = answer.types
+view.book = type(answer.book) == "table" and answer.book or view.book
+local info = typeInfo(view)
+if not info and view.kind ~= register.BOOK then view.kind = register.CRAFTING end
+
+local still = false
+for _, m in ipairs(info and info.machines or {}) do
+if m.name == view.machine then still = true end
+end
+if not still then
+view.machine = info and info.machines[1] and info.machines[1].name or nil
+end
+end
+return
+end
+if job.kind == "forget" then
+if ok then
+view.learnResult = {text = "forgot " .. tostring(job.id), colour = "good"}
+view.picked = nil
+app.sound(view, "done")
+else
+view.learnResult = {text = "not forgotten: "
+.. tostring(answer.reason or answer.status), colour = "bad"}
+app.sound(view, "refused")
+end
+view.forgetting = false
+view.typesAt = nil
+return
+end
+if job.kind == "learn" then
+if ok then
+view.learning = {id = answer.id, state = answer.state, at = app.clock(view)}
+view.learnResult = {text = "running it on " .. tostring(view.machine) .. "..",
+colour = "dim"}
+else
+view.learnResult = {text = "not learned: "
+.. tostring(answer.reason or answer.status), colour = "bad"}
+app.sound(view, "refused")
+end
+return
+end
+if job.kind == "poll" then
+if not ok then return end
+view.learning.state, view.learning.at = answer.state, app.clock(view)
+if answer.state ~= "done" then return end
+if answer.status == "completed" and answer.recipe then
+local r = answer.recipe
+view.learnResult = {text = ("learned %s: makes %d %s"):format(tostring(r.id),
+r.output and r.output.count or 0, tostring(r.output and r.output.item)),
+colour = "good"}
+view.inputs = {}
+app.sound(view, "done")
+else
+view.learnResult = {text = "not learned: "
+.. tostring(answer.reason or answer.status), colour = "bad"}
+app.sound(view, "refused")
+end
+view.learning = nil
+view.typesAt = nil
+panel.ask(view.grid, {kind = "stock"})
+end
+end
+
+
+
+
+
+function register.typeRow(view, width)
+local rows, row, used = {}, {doc.gap(1)}, 1
+for _, rt in ipairs(view.types or {{name = register.CRAFTING}}) do
+local cells = #rt.name + 2
+if used > 1 and used + cells + 1 > width then
+rows[#rows + 1] = doc.row(row, {keep = doc.REQUIRED, name = "rtypes" .. #rows})
+row, used = {doc.gap(1)}, 1
+end
+row[#row + 1] = doc.button(rt.name, {
+colour = view.kind == rt.name and "selected" or "action",
+action = {kind = "rtype", name = rt.name}, keep = doc.REQUIRED,
+name = "rtype-" .. rt.name})
+row[#row + 1] = doc.gap(1)
+used = used + cells + 1
+end
+if used > 1 and used + #register.BOOK + 3 > width then
+rows[#rows + 1] = doc.row(row, {keep = doc.REQUIRED, name = "rtypes" .. #rows})
+row = {doc.gap(1)}
+end
+row[#row + 1] = doc.button(register.BOOK, {
+colour = view.kind == register.BOOK and "selected" or "label",
+action = {kind = "rtype", name = register.BOOK}, keep = doc.REQUIRED,
+name = "rtype-book"})
+rows[#rows + 1] = doc.row(row, {keep = doc.REQUIRED, name = "rtypes" .. #rows})
+return doc.stack(rows, {keep = doc.REQUIRED, name = "rtypes"})
+end
+
+local function machineRows(view)
+local info = typeInfo(view)
+local machines = info and info.machines or {}
+if #machines == 0 then
+return {doc.text((" no machine runs %s -- its script needs `runs %s` and an "
+.. "`on run` handler"):format(view.kind, view.kind), {colour = "warn",
+wrap = true, keep = doc.REQUIRED, name = "no-machine"})}
+end
+local children = {doc.text(" On", {colour = "label", truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+name = "on-label"}), doc.gap(1)}
+
+
+
+local at = 0
+for index, m in ipairs(machines) do
+local chosen = view.machine == m.name
+if chosen then at = index end
+children[#children + 1] = doc.button(m.name, {
+colour = chosen and "selected" or (m.enabled and "action" or "dim"),
+action = {kind = "learn-machine", machine = m.name},
+keep = chosen and doc.REQUIRED or 4, identity = 8,
+elsewhere = (not chosen) and "next cycles to it" or nil,
+name = "machine-" .. m.name})
+children[#children + 1] = doc.gap(1)
+end
+if #machines > 1 then
+children[#children + 1] = doc.spacer()
+children[#children + 1] = doc.button("next", {colour = "dim", keep = doc.REQUIRED,
+action = {kind = "learn-machine", machine = machines[at % #machines + 1].name},
+name = "machine-next"})
+end
+return {doc.row(children, {keep = doc.REQUIRED, name = "machines"})}
+end
+
+local function inputRows(view)
+local items = {}
+for item in pairs(view.inputs) do items[#items + 1] = item end
+table.sort(items)
+if #items == 0 then
+return {doc.text(" pick the inputs from the list below", {colour = "dim",
+keep = 6, name = "no-inputs"})}
+end
+local rows = {}
+for _, item in ipairs(items) do
+rows[#rows + 1] = doc.row({
+doc.gap(1),
+doc.button("-", {action = {kind = "learn-less", item = item}, keep = doc.REQUIRED,
+name = "less-" .. item}),
+doc.text((" %d "):format(view.inputs[item]), {keep = doc.REQUIRED,
+truncate = doc.TRUNCATED, name = "n-" .. item}),
+doc.button("+", {action = {kind = "learn-more", item = item}, keep = doc.REQUIRED,
+name = "more-" .. item}),
+doc.gap(1),
+doc.text(panel.nameOf(view.grid, item), {width = "fill",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "item-" .. item}),
+doc.button("x", {action = {kind = "learn-drop", item = item},
+keep = doc.REQUIRED, name = "drop-" .. item}),
+doc.gap(1),
+}, {keep = 5, name = "input-" .. item})
+end
+return rows
+end
+
+local function canLearn(view)
+return view.machine ~= nil and next(view.inputs) ~= nil and not view.learning
+end
+
+local function learnRows(view, width, height)
+local rows = {app.header(view.grid, "REGISTER"), register.typeRow(view, width)}
+for _, row in ipairs(machineRows(view)) do rows[#rows + 1] = row end
+rows[#rows + 1] = doc.text(" Inputs", {colour = "label", truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+name = "inputs-label"})
+for _, row in ipairs(inputRows(view)) do rows[#rows + 1] = row end
+rows[#rows + 1] = doc.row({
+doc.spacer(),
+doc.button(view.learning and "learning.." or "Learn", {
+colour = canLearn(view) and "good" or "dim",
+action = {kind = "learn"}, keep = doc.REQUIRED, name = "learn"}),
+doc.gap(1),
+}, {keep = doc.REQUIRED, name = "learn-row"})
+if view.learnResult then
+rows[#rows + 1] = doc.text(" " .. view.learnResult.text,
+{colour = view.learnResult.colour, wrap = true, keep = 7, name = "result"})
+end
+rows[#rows + 1] = doc.rule({keep = 2, name = "list-rule"})
+
+local stock = view.grid.stock
+if not stock then
+rows[#rows + 1] = doc.text(" reading the pool..", {colour = "dim", keep = 3,
+name = "list-state"})
+else
+local items = {}
+for item in pairs(stock) do items[#items + 1] = item end
+table.sort(items, function(a, b)
+return panel.nameOf(view.grid, a):lower() < panel.nameOf(view.grid, b):lower()
+end)
+local entries = {}
+for _, item in ipairs(items) do
+entries[#entries + 1] = {value = item, label = panel.nameOf(view.grid, item),
+note = tostring(stock[item]), chip = app.chipFor(item)}
+end
+for _, row in ipairs(app.listRows(view.learnList, entries, "learn-pick",
+function(entry) return {kind = "learn-add", item = entry.value} end,
+{limit = height, pickKeys = false})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.spacer()
+return doc.stack(rows, {name = "register-learn"})
+end
+
+local function pickedRecipe(view)
+for _, r in ipairs(view.book or {}) do
+if r.id == view.picked then return r end
+end
+end
+
+local function sides(view, map)
+local parts = {}
+for item, n in pairs(map or {}) do
+parts[#parts + 1] = ("%d %s"):format(n, panel.nameOf(view.grid, item))
+end
+table.sort(parts)
+return table.concat(parts, ", ")
+end
+
+
+
+local function bookRows(view, width, height)
+local rows = {app.header(view.grid, "RECIPES"), register.typeRow(view, width)}
+local r = view.picked and pickedRecipe(view)
+if r then
+local function line(text, colour, name, keep)
+rows[#rows + 1] = doc.text(" " .. text, {colour = colour or "text", wrap = true,
+keep = keep or doc.REQUIRED, name = name})
+end
+line(("%s  [%s]"):format(tostring(r.label), tostring(r.type)), "title", "book-label")
+line(("makes %d %s"):format(r.output and r.output.count or 0,
+panel.nameOf(view.grid, r.output and r.output.item)), nil, "book-makes")
+line("from " .. sides(view, r.inputs), nil, "book-from")
+line("id " .. tostring(r.id), "dim", "book-id", 5)
+if r.learned then line("learned on " .. r.learned, "dim", "book-learned", 4) end
+if r.script then
+line(("a `makes` line in the %s script: remove it there"):format(r.script),
+"warn", "book-script")
+end
+if view.forgetting then
+line("forget it? A job that needs it waits until it is in the book again",
+"warn", "book-ask")
+end
+rows[#rows + 1] = doc.spacer()
+local buttons = {doc.gap(1), doc.button("back", {action = {kind = "book-back"},
+keep = doc.REQUIRED, name = "book-back"}), doc.spacer()}
+if view.forgetting then
+buttons[#buttons + 1] = doc.button("Forget it", {colour = "bad",
+action = {kind = "book-yes"}, keep = doc.REQUIRED, name = "book-yes"})
+buttons[#buttons + 1] = doc.gap(1)
+buttons[#buttons + 1] = doc.button("No", {action = {kind = "book-no"},
+keep = doc.REQUIRED, name = "book-no"})
+elseif not r.script then
+buttons[#buttons + 1] = doc.button("Forget", {colour = "bad",
+action = {kind = "book-forget"}, keep = doc.REQUIRED, name = "book-forget"})
+end
+buttons[#buttons + 1] = doc.gap(1)
+rows[#rows + 1] = doc.row(buttons, {keep = doc.REQUIRED, name = "book-actions"})
+return doc.stack(rows, {name = "register-book"})
+end
+
+if view.learnResult then
+rows[#rows + 1] = doc.text(" " .. view.learnResult.text,
+{colour = view.learnResult.colour, wrap = true, keep = 7, name = "result"})
+end
+if not view.book then
+rows[#rows + 1] = doc.text(" reading the book..", {colour = "dim", keep = 3,
+name = "book-state"})
+elseif #view.book == 0 then
+rows[#rows + 1] = doc.text(" the book is empty", {colour = "dim", keep = 3,
+name = "book-empty"})
+else
+local entries = {}
+for _, rec in ipairs(view.book) do
+entries[#entries + 1] = {value = rec.id, label = ("%s  %s"):format(
+tostring(rec.label), tostring(rec.type)),
+note = tostring(rec.output and rec.output.count or ""),
+chip = app.chipFor(rec.output and rec.output.item)}
+end
+for _, row in ipairs(app.listRows(view.bookList, entries, "book-pick",
+function(entry) return {kind = "book-pick", id = entry.value} end,
+{limit = height, pickKeys = false})) do
+rows[#rows + 1] = row
+end
+end
+rows[#rows + 1] = doc.spacer()
+return doc.stack(rows, {name = "register-book"})
+end
+
+function register.document(view, width, height)
+if crafting(view) then return panel.document(view.grid, width, height) end
+if view.kind == register.BOOK then return bookRows(view, width, height) end
+return learnRows(view, width, height)
+end
+
+function register.settle(view, report)
+if crafting(view) then return panel.settle(view.grid, report) end
+if view.kind == register.BOOK then
+if view.picked then return false end
+return app.settle(view.bookList, report, "book-pick")
+end
+return app.settle(view.learnList, report, "learn-pick")
+end
+
+
+
+function register.act(view, action)
+local kind = action and action.kind
+if kind == "rtype" then
+view.kind, view.learnResult = action.name, nil
+view.picked, view.forgetting = nil, false
+local info = typeInfo(view)
+view.machine = info and info.machines[1] and info.machines[1].name or nil
+return true
+end
+if crafting(view) then return panel.act(view.grid, action) end
+if view.kind == register.BOOK then
+if app.page(view.bookList, kind, action) then return true end
+if kind == "book-pick" then
+view.picked, view.forgetting, view.learnResult = action.id, false, nil
+elseif kind == "book-back" then
+view.picked, view.forgetting = nil, false
+elseif kind == "book-forget" then
+view.forgetting = true
+elseif kind == "book-no" then
+view.forgetting = false
+elseif kind == "book-yes" and view.picked then
+view.learnQueue[#view.learnQueue + 1] = {kind = "forget", id = view.picked}
+else
+return false
+end
+return true
+end
+if app.page(view.learnList, kind, action) then return true end
+if kind == "learn-machine" then
+view.machine = action.machine
+elseif kind == "learn-add" then
+view.inputs[action.item] = (view.inputs[action.item] or 0) + 1
+elseif kind == "learn-more" then
+view.inputs[action.item] = math.min(64, (view.inputs[action.item] or 0) + 1)
+elseif kind == "learn-less" then
+local n = (view.inputs[action.item] or 1) - 1
+view.inputs[action.item] = n > 0 and n or nil
+elseif kind == "learn-drop" then
+view.inputs[action.item] = nil
+elseif kind == "learn" then
+if not canLearn(view) then
+app.sound(view, "refused")
+return true
+end
+local inputs = {}
+for item, n in pairs(view.inputs) do inputs[item] = n end
+view.learnResult = nil
+view.learnQueue[#view.learnQueue + 1] = {kind = "learn", type = view.kind,
+machine = view.machine, inputs = inputs}
+else
+return false
+end
+return true
+end
+
+function register.searching(view)
+if crafting(view) then return panel.searching(view.grid) end
+if view.kind == register.BOOK then
+return (view.book and not view.picked) and view.bookList or nil
+end
+return view.grid.stock and view.learnList or nil
+end
+
+function register.handle(view, event, grid)
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return register.act(view, action)
+end
+
+return register

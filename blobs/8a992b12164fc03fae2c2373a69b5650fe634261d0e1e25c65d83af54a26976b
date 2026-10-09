@@ -1,0 +1,95 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local wire = require("mfg.common.wire")
+
+local link = {}
+
+
+local net, ip = nil, nil
+do
+local ok, mod = pcall(require, "net")
+if ok then net = mod end
+local okIp, modIp = pcall(require, "ip")
+if okIp then ip = modIp end
+end
+
+function link.net() return net end
+
+
+
+function link.send(target, service, body)
+if type(target) == "number" or wire.known(target) then
+return wire.send(target, service, body)
+end
+
+
+if net and net.ready() then
+local sent, why = net.send(target, service, body)
+if sent then return true end
+if wire.up() and wire.lookup(target) then return wire.send(target, service, body) end
+return nil, why
+end
+return wire.send(target, service, body)
+end
+
+
+function link.reply(packet, service, body)
+if packet.via == "wire" or not net then return wire.send(packet.src, service, body) end
+return net.send(packet.src, service, body)
+end
+
+
+
+function link.serve(service)
+if net then return net.serve(service) end
+return wire.serve(service)
+end
+
+
+
+
+function link.receive(service, timeout)
+local port = (net and service) and net.port(service) or nil
+local timer = timeout and os.startTimer(timeout)
+while true do
+local event, a, b, c, d, e, f = os.pullEvent()
+if event == "modem_message" then
+
+local packet = wire.accept(a, b, d)
+if packet and (service == nil or packet.service == service) then
+if timer then os.cancelTimer(timer) end
+return packet
+end
+elseif event == "net_data" and net then
+
+
+if service == nil or (port ~= nil and c == port) then
+if timer then os.cancelTimer(timer) end
+return {src = ip and ip.format(a) or a, service = net.nameOf(c) or c,
+body = d, encrypted = e, from = f, via = "net"}
+end
+elseif event == "timer" and a == timer then
+return nil
+end
+end
+end
+
+return link

@@ -1,0 +1,1360 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+
+local test = {}
+
+test.EVERY = 5
+test.BACKGROUND = 30
+test.FIND_EVERY = 1
+test.FIND_FOR = 60
+test.TRY_EVERY = 1
+test.WATCH_EVERY = {1, 2, 5}
+test.WATCH_MAX = 4
+test.LOG_MAX = 40
+test.HISTORY = 16
+test.ARG_LENGTH = 80
+test.SLOT_BUTTONS = 12
+test.READ = {timeout = 3, attempts = 2}
+
+test.LOOK = {timeout = 15, attempts = 1}
+test.ACT = {timeout = 10, attempts = 1}
+
+function test.new(opts)
+opts = opts or {}
+return {
+host = opts.host or "mfg",
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+
+data = nil,
+readAt = nil, readWhy = nil,
+offer = nil,
+known = nil,
+
+screen = "list",
+list = app.newList(),
+find = nil,
+
+device = nil,
+look = nil, lookWhy = nil,
+lookList = app.newList(),
+confirmed = {},
+histories = {},
+historyList = app.newList(),
+
+call = nil,
+result = nil,
+previous = nil,
+resultList = app.newList(),
+
+watch = {reads = {}, every = 2, at = nil, values = {}, log = {}},
+watchList = app.newList(),
+
+try = nil,
+itemList = app.newList(),
+put = {},
+leaving = false,
+
+sending = nil,
+said = nil,
+link = {state = "unknown"},
+queue = {},
+}
+end
+
+function test.refresh(view) view.readAt = nil end
+
+
+
+local function itemWords(id)
+return (app.shortName(id):gsub("_", " "))
+end
+
+
+local function brief(value, depth)
+depth = depth or 0
+local kind = type(value)
+if kind == "nil" then return "nil" end
+if kind == "string" then return ("%q"):format(value) end
+if kind ~= "table" then return tostring(value) end
+if type(value.name) == "string" and type(value.count) == "number" then
+return ("%s x%d"):format(itemWords(value.name), value.count)
+end
+if depth >= 1 then return "{..}" end
+local keys = {}
+for k in pairs(value) do keys[#keys + 1] = k end
+table.sort(keys, function(a, b)
+if type(a) == type(b) and type(a) == "number" then return a < b end
+if type(a) == "number" then return true end
+if type(b) == "number" then return false end
+return tostring(a) < tostring(b)
+end)
+if #keys == 0 then return "{}" end
+local parts = {}
+for _, k in ipairs(keys) do
+local inner = brief(value[k], depth + 1)
+parts[#parts + 1] = type(k) == "number" and (k .. ": " .. inner)
+or (tostring(k) .. " = " .. inner)
+if #table.concat(parts, ", ") > 120 then break end
+end
+return "{" .. table.concat(parts, ", ") .. "}"
+end
+test.brief = brief
+
+
+local function briefResult(result)
+if not result then return "" end
+if result.ok == false then
+return "error: " .. tostring(result.hint and result.hint.text or result.error)
+end
+local parts = {}
+for i = 1, result.count or 0 do parts[i] = brief((result.values or {})[i]) end
+if #parts == 0 then return "nothing" end
+return table.concat(parts, ", ")
+end
+test.briefResult = briefResult
+
+
+
+local function sortedKeys(t)
+local keys = {}
+for k in pairs(t) do if k ~= "..." then keys[#keys + 1] = k end end
+table.sort(keys, function(a, b)
+if type(a) == "number" and type(b) == "number" then return a < b end
+if type(a) == "number" then return true end
+if type(b) == "number" then return false end
+return tostring(a) < tostring(b)
+end)
+return keys
+end
+
+local function linesOf(value, path, label, indent, out)
+local pad = (" "):rep(indent)
+if type(value) ~= "table" then
+out[#out + 1] = {path = path, text = pad .. label .. brief(value)}
+return out
+end
+local keys = sortedKeys(value)
+if #keys == 0 and value["..."] == nil then
+out[#out + 1] = {path = path, text = pad .. label .. "{}"}
+return out
+end
+out[#out + 1] = {path = path, text = pad .. label}
+for _, k in ipairs(keys) do
+linesOf(value[k], path .. "." .. tostring(k), tostring(k) .. " = ", indent + 2, out)
+end
+if value["..."] ~= nil then
+out[#out + 1] = {path = path .. "...", text = pad .. "  ... " .. tostring(value["..."])}
+end
+return out
+end
+
+function test.lines(result)
+local out = {}
+if not result then return out end
+if result.ok == false then
+out[1] = {path = "error", text = "error: " .. tostring(result.error)}
+if result.hint then out[2] = {path = "hint", text = result.hint.text} end
+return out
+end
+if (result.count or 0) == 0 then
+out[1] = {path = "none", text = "it returned nothing"}
+return out
+end
+for i = 1, result.count do
+linesOf((result.values or {})[i], tostring(i), ("%d: "):format(i), 0, out)
+end
+return out
+end
+
+
+local function changed(view)
+local moved = {}
+if not view.previous or not view.result then return moved end
+local before = {}
+for _, line in ipairs(test.lines(view.previous)) do before[line.path] = line.text end
+for _, line in ipairs(test.lines(view.result)) do
+if before[line.path] ~= line.text then moved[line.path] = true end
+end
+return moved
+end
+
+local function timeOf(view, at)
+local seconds = math.floor((at or app.clock(view)) / 1000)
+local ok, text = pcall(os.date, "%H:%M:%S", seconds)
+return ok and text or tostring(seconds)
+end
+
+
+
+local function device(view)
+for _, d in ipairs(view.data and view.data.devices or {}) do
+if d.device == view.device then return d end
+end
+return nil
+end
+
+local function label(view)
+local look = view.look
+if look and look.device == view.device then return look.label end
+local d = device(view)
+return d and d.label or tostring(view.device)
+end
+
+function test.nextJob(view)
+local job = table.remove(view.queue, 1)
+if job then return job end
+local now = app.clock(view)
+
+
+local watching = view.onScreen ~= false
+if not watching and (view.screen == "watch" or view.screen == "try") then return nil end
+if view.screen == "watch" and view.device and #view.watch.reads > 0 then
+if not view.watch.at or now - view.watch.at >= view.watch.every * 1000 then
+return {kind = "watch"}
+end
+return nil
+end
+if view.screen == "try" and view.device then
+if not view.try.at or now - view.try.at >= test.TRY_EVERY * 1000 then
+return {kind = "slots"}
+end
+return nil
+end
+local every = test.EVERY
+if view.onScreen == false then
+every = test.BACKGROUND
+elseif view.screen == "find" then
+every = test.FIND_EVERY
+elseif view.screen ~= "list" and view.data then
+return nil
+end
+if not view.readAt or now - view.readAt >= every * 1000 then
+return {kind = "read"}
+end
+return nil
+end
+
+function test.exchange(view, job)
+local body, opts = nil, test.READ
+if job.kind == "read" then
+view.readAt = app.clock(view)
+body = {command = "test_devices"}
+elseif job.kind == "look" then
+body, opts = {command = "test_look", device = job.device}, test.LOOK
+elseif job.kind == "rest" then
+local reads = {}
+for _, method in ipairs(job.methods) do reads[#reads + 1] = {method = method} end
+body = {command = "test_read", device = job.device, reads = reads}
+opts = test.LOOK
+elseif job.kind == "watch" then
+view.watch.at = app.clock(view)
+local reads = {}
+for i, read in ipairs(view.watch.reads) do
+reads[i] = {method = read.method, args = read.args}
+end
+body = {command = "test_read", device = view.device, reads = reads}
+elseif job.kind == "slots" then
+view.try.at = app.clock(view)
+body = {command = "test_read", device = view.device, reads = {{method = "list"}}}
+elseif job.kind == "items" then
+body = {command = "available"}
+elseif job.kind == "call" then
+body = {command = "test_call", device = job.device, method = job.method,
+args = job.args, operator = true}
+opts = test.ACT
+view.sending = job
+elseif job.kind == "put" then
+body = {command = "test_put", device = job.device, item = job.item,
+count = job.count, slot = job.slot, operator = true}
+opts = test.ACT
+view.sending = job
+elseif job.kind == "take" then
+body = {command = "test_take", device = job.device, operator = true}
+opts = test.ACT
+view.sending = job
+else
+return false
+end
+test.apply(view, job, view.transport.request(body, opts) or {})
+return true
+end
+
+local function say(view, text, colour, sound)
+view.said = {text = text, colour = colour or "text"}
+if sound then app.sound(view, sound) end
+end
+
+local function rejected(answer)
+return tostring(answer.reason or answer.status or "no answer")
+end
+
+
+
+local function lost(view, why)
+view.screen, view.device, view.look, view.call = "list", nil, nil, nil
+view.find, view.leaving = nil, false
+view.readAt = nil
+say(view, "can't test it: " .. why, "bad", "refused")
+end
+
+local function noteFind(view, devices)
+local find = view.find
+if not find then return end
+local now = app.clock(view)
+local current = {}
+for _, d in ipairs(devices) do current[d.device] = d end
+if not find.base then
+find.base = current
+return
+end
+local added = {}
+for name, d in pairs(current) do
+if not find.base[name] then added[#added + 1] = d end
+end
+
+for name, d in pairs(find.base) do
+if not current[name] then
+find.base[name] = nil
+find.note = ("%s went away: turn its modem on again to test it"):format(d.label)
+end
+end
+if #added == 1 then
+view.find = nil
+app.sound(view, "found")
+test.act(view, {kind = "open", device = added[1].device})
+elseif #added > 1 then
+view.find, view.screen = nil, "list"
+say(view, ("%d appeared at once: turn on one modem at a time, and make sure "
+.. "each modem touches only one block"):format(#added), "bad", "refused")
+elseif now - find.started >= test.FIND_FOR * 1000 then
+view.find, view.screen = nil, "list"
+say(view, ("nothing appeared in %d seconds"):format(test.FIND_FOR), "warn")
+end
+end
+
+local function noteWatch(view, results)
+local watch = view.watch
+for i, read in ipairs(watch.reads) do
+local result = results[i]
+if result then
+local text = briefResult(result)
+local before = watch.values[i]
+if before ~= nil and before ~= text then
+table.insert(watch.log, 1, {at = app.clock(view), label = read.label,
+from = before, to = text})
+while #watch.log > test.LOG_MAX do table.remove(watch.log) end
+end
+watch.values[i] = text
+end
+end
+end
+
+function test.apply(view, job, answer)
+app.noteLink(view, answer)
+local ok = answer.status == app.COMPLETED
+if job.kind == "read" then
+if ok and type(answer.devices) == "table" then
+view.data, view.readWhy = answer, nil
+view.offer = view.offer or {name = "test_call"}
+if not view.known then
+view.known = {}
+for _, d in ipairs(answer.devices) do view.known[d.device] = true end
+end
+noteFind(view, answer.devices)
+else
+view.readWhy = rejected(answer)
+end
+return
+end
+if job.kind == "items" then
+if ok and view.try then
+view.try.items, view.try.names = answer.items or {}, answer.names or {}
+end
+return
+end
+
+if job.device and job.device ~= view.device then return end
+if job.kind == "look" then
+if ok then
+view.look, view.lookWhy = answer, nil
+elseif answer.status == app.REJECTED then
+lost(view, rejected(answer))
+else
+view.lookWhy = rejected(answer)
+end
+elseif job.kind == "rest" then
+if ok and view.look then
+local done = {}
+for _, result in ipairs(answer.results or {}) do
+view.look.readings[#view.look.readings + 1] = result
+done[result.method or ""] = true
+end
+local rest = {}
+for _, method in ipairs(view.look.rest or {}) do
+if not done[method] then rest[#rest + 1] = method end
+end
+view.look.rest = rest
+elseif answer.status == app.REJECTED then
+lost(view, rejected(answer))
+end
+elseif job.kind == "watch" then
+if ok then
+noteWatch(view, answer.results or {})
+elseif answer.status == app.REJECTED then
+lost(view, rejected(answer))
+end
+elseif job.kind == "slots" then
+local result = ok and (answer.results or {})[1]
+if result and result.ok and view.try then
+view.try.slots = (result.values or {})[1] or {}
+elseif answer.status == app.REJECTED then
+lost(view, rejected(answer))
+end
+elseif job.kind == "call" then
+view.sending = nil
+if ok then
+local same = view.result and view.result.method == job.method
+and view.result.argsKey == job.argsKey
+view.previous = same and view.result or nil
+answer.method, answer.argsKey, answer.args = job.method, job.argsKey, job.args
+view.result = answer
+view.resultList = app.newList()
+local history = view.histories[job.device] or {}
+table.insert(history, 1, {method = job.method, args = job.args,
+text = briefResult(answer), at = app.clock(view), took = answer.took})
+while #history > test.HISTORY do table.remove(history) end
+view.histories[job.device] = history
+app.sound(view, answer.ok and "done" or "refused")
+else
+view.result, view.previous = nil, nil
+say(view, "not called: " .. rejected(answer), "bad", "refused")
+if answer.reason and tostring(answer.reason):find("bound to", 1, true) then
+lost(view, rejected(answer))
+end
+end
+elseif job.kind == "put" then
+view.sending = nil
+if ok then
+local moved = tonumber(answer.moved) or 0
+view.put[job.device] = (view.put[job.device] or 0) + moved
+local text = ("put %d %s in %s"):format(moved, itemWords(job.item),
+job.slot and ("slot " .. job.slot) or "it")
+if answer.reason then text = text .. " -- " .. tostring(answer.reason) end
+say(view, text, moved > 0 and "good" or "warn", moved > 0 and "done" or "refused")
+view.try.at, view.try.items = nil, nil
+app.ask(view, {kind = "items"})
+else
+say(view, "not put: " .. rejected(answer), "bad", "refused")
+end
+elseif job.kind == "take" then
+view.sending = nil
+if ok then
+view.put[job.device] = nil
+local left = tonumber(answer.left) or 0
+say(view, ("took back %d%s"):format(tonumber(answer.moved) or 0,
+left > 0 and ("; %d stayed: %s"):format(left, tostring(answer.reason)) or ""),
+left > 0 and "warn" or "good", "done")
+if view.try then view.try.at, view.try.items = nil, nil end
+if view.leaving then
+view.leaving = false
+test.act(view, {kind = "close"})
+end
+else
+say(view, "not taken back: " .. rejected(answer), "bad", "refused")
+end
+end
+end
+
+
+
+local function argsKey(args)
+return table.concat(args or {}, "\0")
+end
+
+
+local function argsOf(call)
+local out = {}
+for i, text in ipairs(call.args) do out[i] = text end
+while #out > 0 and out[#out]:match("^%s*$") do out[#out] = nil end
+return out
+end
+
+local function isRead(view, method)
+for _, m in ipairs(view.look and view.look.reads or {}) do
+if m == method then return true end
+end
+return false
+end
+
+local function openCall(view, method, args, expects)
+local rows = {}
+for i, text in ipairs(args or {}) do rows[i] = text end
+if #rows == 0 and expects then rows[1] = "" end
+view.call = {method = method, args = rows, field = #rows > 0 and 1 or nil,
+read = isRead(view, method), confirm = false, expects = expects}
+if not (view.result and view.result.method == method) then
+view.result, view.previous = nil, nil
+end
+view.screen = "call"
+end
+
+local function callNow(view, confirmed)
+local call = view.call
+if not call or view.sending then return true end
+if not call.read and not view.confirmed[call.method] and not confirmed then
+call.confirm = true
+return true
+end
+if confirmed then view.confirmed[call.method] = true end
+call.confirm = false
+local args = argsOf(call)
+view.said = nil
+app.ask(view, {kind = "call", device = view.device, method = call.method,
+args = args, argsKey = call.method .. "\0" .. argsKey(args)})
+return true
+end
+
+local function addWatch(view, method, args, text)
+local watch = view.watch
+local key = method .. "\0" .. argsKey(args)
+for _, read in ipairs(watch.reads) do
+if read.key == key then view.screen = "watch" return true end
+end
+if #watch.reads >= test.WATCH_MAX then
+say(view, ("a watch holds %d reads: take one off first"):format(test.WATCH_MAX),
+"warn", "refused")
+view.screen = "watch"
+return true
+end
+local shown = text or method
+if not text and args and #args > 0 then
+shown = ("%s(%s)"):format(method, table.concat(args, ", "))
+end
+watch.reads[#watch.reads + 1] = {method = method, args = args, key = key,
+label = shown}
+watch.values[#watch.reads] = nil
+watch.at = nil
+view.screen = "watch"
+return true
+end
+
+local function listOf(view)
+local screen = view.screen
+if screen == "list" then return view.list, "dev" end
+if screen == "look" then return view.lookList, "line" end
+if screen == "result" then return view.resultList, "res" end
+if screen == "history" then return view.historyList, "hist" end
+if screen == "watch" then return view.watchList, "log" end
+if screen == "try" then return view.itemList, "item" end
+return nil
+end
+
+function test.searching(view)
+if view.screen == "call" or view.screen == "find" or view.leaving then return nil end
+return (listOf(view))
+end
+
+function test.settle(view, report)
+local list, prefix = listOf(view)
+if not list then return false end
+return app.settle(list, report, prefix)
+end
+
+
+local function close(view)
+if (view.put[view.device] or 0) > 0 and not view.leaving then
+view.leaving = true
+return true
+end
+view.leaving = false
+view.screen, view.device, view.look, view.call = "list", nil, nil, nil
+view.result, view.previous, view.try = nil, nil, nil
+view.watch = {reads = {}, every = view.watch.every, at = nil, values = {}, log = {}}
+view.confirmed = {}
+view.readAt = nil
+return true
+end
+
+function test.act(view, action)
+local kind = action and action.kind
+if not kind then return false end
+local list = listOf(view)
+if list and app.page(list, kind, action) then return true end
+if kind == "focus" then return true end
+
+if kind == "open" then
+view.device, view.look, view.lookWhy = action.device, nil, nil
+view.lookList = app.newList()
+view.screen, view.said, view.call = "look", nil, nil
+view.result, view.previous = nil, nil
+view.confirmed = {}
+app.ask(view, {kind = "look", device = action.device})
+return true
+elseif kind == "find" then
+view.find = {started = app.clock(view), base = nil}
+view.screen, view.said, view.readAt = "find", nil, nil
+return true
+elseif kind == "stop-find" then
+view.find, view.screen = nil, "list"
+return true
+elseif kind == "back" then
+local screen = view.screen
+if screen == "result" then
+view.screen = "call"
+elseif screen == "call" or screen == "history" or screen == "watch"
+or screen == "try" then
+view.screen = "look"
+elseif screen == "look" then
+return close(view)
+else
+view.screen = "list"
+end
+return true
+elseif kind == "close" then
+return close(view)
+elseif kind == "leave-take" then
+if view.device then app.ask(view, {kind = "take", device = view.device}) end
+return true
+elseif kind == "leave-keep" then
+view.put[view.device] = nil
+view.leaving = false
+return close(view)
+elseif kind == "relook" then
+view.look = nil
+app.ask(view, {kind = "look", device = view.device})
+return true
+elseif kind == "rest" then
+if view.look and #(view.look.rest or {}) > 0 then
+app.ask(view, {kind = "rest", device = view.device, methods = view.look.rest})
+end
+return true
+elseif kind == "method" then
+openCall(view, action.method, action.args, action.expects)
+return true
+elseif kind == "field" then
+if view.call then view.call.field = action.field end
+return true
+elseif kind == "add-arg" then
+local call = view.call
+if call and #call.args < 8 then
+call.args[#call.args + 1] = ""
+call.field, call.confirm = #call.args, false
+end
+return true
+elseif kind == "drop-arg" then
+local call = view.call
+if call and call.args[action.field] then
+call.confirm = false
+table.remove(call.args, action.field)
+call.field = #call.args > 0 and math.min(call.field or 1, #call.args) or nil
+end
+return true
+elseif kind == "call" then
+return callNow(view, false)
+elseif kind == "call-yes" then
+return callNow(view, true)
+elseif kind == "call-no" then
+if view.call then view.call.confirm = false end
+return true
+elseif kind == "result" then
+if view.result then view.screen = "result" end
+return true
+elseif kind == "history" then
+view.screen = "history"
+return true
+elseif kind == "again" then
+local entry = (view.histories[view.device] or {})[action.index]
+if not entry then return true end
+openCall(view, entry.method, entry.args)
+return callNow(view, view.confirmed[entry.method] or nil)
+elseif kind == "watch" then
+view.screen = "watch"
+return true
+elseif kind == "watch-add" then
+return addWatch(view, action.method, action.args or {}, action.label)
+elseif kind == "watch-this" then
+if view.call then
+return addWatch(view, view.call.method, argsOf(view.call))
+end
+return true
+elseif kind == "watch-drop" then
+local watch = view.watch
+table.remove(watch.reads, action.index)
+table.remove(watch.values, action.index)
+return true
+elseif kind == "watch-every" then
+view.watch.every, view.watch.at = action.every, nil
+return true
+elseif kind == "watch-clear" then
+view.watch.log = {}
+return true
+elseif kind == "try" then
+local size = view.look and view.look.inventory and view.look.inventory.size or 0
+view.try = view.try or {count = 1, slot = size > 0 and 1 or nil}
+view.try.at, view.try.items = nil, nil
+view.screen = "try"
+app.ask(view, {kind = "items"})
+return true
+elseif kind == "item" then
+if view.try then view.try.item = action.item end
+return true
+elseif kind == "slot" then
+if view.try then view.try.slot = action.slot end
+return true
+elseif kind == "slot-step" then
+local try = view.try
+local size = view.look and view.look.inventory and view.look.inventory.size or 1
+if try then try.slot = app.clamp((try.slot or 0) + action.n, 1, math.max(size, 1)) end
+return true
+elseif kind == "delta" then
+if view.try then view.try.count = app.clamp(view.try.count + action.n, 1, 64) end
+return true
+elseif kind == "put" then
+local try = view.try
+if not try or not try.item or view.sending then
+if try and not try.item then say(view, "pick an item below first", "warn", "refused") end
+return true
+end
+view.said = nil
+app.ask(view, {kind = "put", device = view.device, item = try.item,
+count = try.count, slot = try.slot})
+return true
+elseif kind == "take" then
+if view.device and not view.sending then
+view.said = nil
+app.ask(view, {kind = "take", device = view.device})
+end
+return true
+end
+return false
+end
+
+
+
+
+
+function test.keyboard(view, event)
+if not event then return false end
+local call = view.screen == "call" and view.call
+if call then
+if event.kind == "char" and type(event.char) == "string" then
+if not call.field then
+call.args[#call.args + 1] = ""
+call.field = #call.args
+end
+local text = call.args[call.field] or ""
+if #text < test.ARG_LENGTH then call.args[call.field] = text .. event.char end
+call.confirm = false
+return true
+end
+if event.kind ~= "key" or not keys then return false end
+local key = event.key
+if key == keys.backspace and call.field then
+call.args[call.field] = (call.args[call.field] or ""):sub(1, -2)
+call.confirm = false
+return true
+elseif key == keys.delete and call.field then
+call.args[call.field] = ""
+call.confirm = false
+return true
+elseif key == keys.up and call.field and call.field > 1 then
+call.field = call.field - 1
+return true
+elseif key == keys.down and call.field and call.field < #call.args then
+call.field = call.field + 1
+return true
+elseif key == keys.enter then
+return true, {kind = call.confirm and "call-yes" or "call"}
+end
+return false
+end
+if view.leaving then return false end
+local list = test.searching(view)
+if not list then return false end
+if event.kind == "key" and keys and event.key == keys.enter and list.top then
+return true, list.top
+end
+return app.type(list, event)
+end
+
+function test.handle(view, event, grid)
+local took, chose = test.keyboard(view, event)
+if took then
+if chose then test.act(view, chose) end
+return true
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return test.act(view, action)
+end
+
+
+
+local function backRow(view, title, extra)
+local children = {
+doc.button("< back", {key = "backspace", keyLabel = "bksp", colour = "action",
+action = {kind = "back"}, keep = doc.REQUIRED, name = "back"}),
+doc.gap(1),
+doc.text(title, {colour = "title", truncate = doc.TRUNCATED, width = "fill",
+keep = doc.REQUIRED, name = "title-row"}),
+}
+for _, element in ipairs(extra or {}) do
+children[#children + 1] = doc.gap(1)
+children[#children + 1] = element
+end
+return doc.row(children, {keep = doc.REQUIRED, name = "back-row"})
+end
+
+local function saidRow(view)
+if not view.said then return nil end
+return doc.text(" " .. view.said.text, {colour = view.said.colour, wrap = true,
+keep = app.KEEP_STATUS, name = "said"})
+end
+
+local function listing(view, rows, list, entries, prefix, height, empty)
+local built = app.listRows(list, entries, prefix,
+function(entry) return entry.act end, {limit = height})
+if #built == 0 and empty then
+rows[#rows + 1] = doc.text(empty, {colour = "dim", wrap = true, keep = 5,
+name = prefix .. "-empty"})
+end
+for _, row in ipairs(built) do rows[#rows + 1] = row end
+end
+
+
+
+
+
+
+local function nameNote(name, isNew, room)
+local text = (isNew and "new " or "") .. name
+if #text <= room then return text end
+if room < 6 then return isNew and "new" or nil end
+return ".." .. text:sub(-(room - 2))
+end
+
+local function listScreen(view, width, height)
+local rows = {app.header(view, "TEST")}
+if not view.data then
+rows[#rows + 1] = doc.text(view.readWhy and ("the controller refused: "
+.. view.readWhy) or "reading..", {colour = view.readWhy and "bad" or "dim",
+wrap = true, keep = doc.REQUIRED, name = "read-state"})
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+rows[#rows + 1] = doc.row({
+doc.text(" Pick a block nobody has bound", {colour = "label",
+truncate = doc.TRUNCATED, width = "fill", keep = 4, name = "intro"}),
+doc.gap(1),
+doc.button("Find by modem", {colour = "selected", action = {kind = "find"},
+keep = doc.REQUIRED, name = "find"}),
+}, {keep = doc.REQUIRED, name = "list-top"})
+local said = saidRow(view)
+if said then rows[#rows + 1] = said end
+local entries = {}
+for _, d in ipairs(view.data.devices or {}) do
+local surfaces = table.concat(d.surfaces or {}, ", ")
+local text = d.label
+if surfaces ~= "" and surfaces ~= "inventory" then
+text = ("%s (%s)"):format(text, surfaces)
+end
+local isNew = view.known and not view.known[d.device]
+entries[#entries + 1] = {value = d.device, label = text,
+note = nameNote(d.device, isNew, width - #text - 4),
+act = {kind = "open", device = d.device}}
+end
+listing(view, rows, view.list, entries, "dev", height,
+" nothing to test: every block on the network is bound, or is the system's own")
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+
+
+local function findScreen(view)
+local find = view.find or {}
+local left = math.max(0, test.FIND_FOR
+- math.floor((app.clock(view) - (find.started or app.clock(view))) / 1000))
+local rows = {app.header(view, "TEST"), backRow(view, "Find by modem")}
+rows[#rows + 1] = doc.text(" Turn on the modem of the block to test (right-click "
+.. "it). If it is on already, turn it off, wait for this screen to say so, then "
+.. "turn it on.", {wrap = true, keep = doc.REQUIRED, name = "find-says"})
+rows[#rows + 1] = doc.text(find.base and (" watching, %d s left"):format(left)
+or " looking at what is there first..", {colour = "dim", keep = 5,
+name = "find-time"})
+if find.note then
+rows[#rows + 1] = doc.text(" " .. find.note, {colour = "warn", wrap = true,
+keep = 6, name = "find-note"})
+end
+rows[#rows + 1] = doc.spacer()
+rows[#rows + 1] = doc.row({doc.spacer(), doc.button("Stop", {colour = "bad",
+action = {kind = "stop-find"}, keep = doc.REQUIRED, name = "stop-find"}),
+doc.gap(1)}, {keep = doc.REQUIRED, name = "find-actions"})
+return rows
+end
+
+
+
+local function lookEntries(view)
+local look = view.look
+local out = {}
+local function add(text, act, value)
+out[#out + 1] = {label = text, value = value or text, act = act}
+end
+if look.inventory then
+add(("Slots: %d   (watch them)"):format(look.inventory.size or 0),
+{kind = "watch-add", method = "list", label = "the slots"}, "slots")
+for _, slot in ipairs(look.inventory.slots or {}) do
+local holds = slot.item and ("%s x%d"):format(itemWords(slot.item),
+slot.count or 0) or "empty"
+add(("  %d  %s%s"):format(slot.slot, holds,
+slot.limit and ("   limit %d"):format(slot.limit) or ""),
+{kind = "method", method = "getItemDetail", args = {tostring(slot.slot)}},
+"slot " .. slot.slot .. " " .. (slot.item or ""))
+end
+end
+if look.tanks then
+add("Tanks   (watch them)", {kind = "watch-add", method = "tanks",
+label = "the tanks"}, "tanks")
+for i, tank in pairs(look.tanks) do
+if type(tank) == "table" then
+add(("  %s  %s %s"):format(tostring(i), itemWords(tank.name or "empty"),
+tostring(tank.amount or 0)), nil, "tank " .. tostring(tank.name))
+end
+end
+end
+if look.energy then
+add(("Energy  %s / %s   (watch it)"):format(tostring(look.energy.stored),
+tostring(look.energy.capacity)), {kind = "watch-add", method = "getEnergy",
+label = "energy"}, "energy")
+end
+if look.faces then
+add("Faces   in / out", nil, "faces")
+local faces = {}
+for face in pairs(look.faces) do faces[#faces + 1] = face end
+table.sort(faces)
+for _, face in ipairs(faces) do
+local f = look.faces[face]
+add(("  %-6s in %s  out %s"):format(face, tostring(f.input or "-"),
+tostring(f.output or "-")),
+{kind = "method", method = "getAnalogInput", args = {face}}, "face " .. face)
+end
+end
+add(("Reads, by name (a guess): %d"):format(#(look.reads or {})), nil, "reads")
+for _, reading in ipairs(look.readings or {}) do
+local act = {kind = "method", method = reading.method}
+local text
+if reading.ok then
+text = ("  %s = %s"):format(reading.method, briefResult(reading))
+elseif reading.hint then
+local expects = reading.hint.expects
+text = expects and ("  %s  needs: %s"):format(reading.method,
+tostring(reading.hint.text):match("the (.+)$") or expects)
+or ("  %s  %s"):format(reading.method, reading.hint.text)
+act.expects = expects or true
+else
+text = ("  %s  error: %s"):format(reading.method, tostring(reading.error))
+end
+add(text, act, reading.method)
+end
+for _, method in ipairs(look.reads or {}) do
+local shown = false
+for _, reading in ipairs(look.readings or {}) do
+if reading.method == method then shown = true end
+end
+local surface = ({size = true, list = true, tanks = true, getEnergy = true,
+getEnergyCapacity = true})[method]
+if not shown and surface then
+add(("  %s   (above)"):format(method), {kind = "method", method = method}, method)
+end
+end
+if #(look.rest or {}) > 0 then
+add(("  read the rest (%d)"):format(#look.rest), {kind = "rest"}, "rest")
+end
+add(("Others, may change it: %d"):format(#(look.others or {})), nil, "others")
+for _, method in ipairs(look.others or {}) do
+add("  " .. method, {kind = "method", method = method}, method)
+end
+return out
+end
+
+local function leavingRows(view, rows)
+rows[#rows + 1] = doc.text((" Try items left %d in it. Take them back into the "
+.. "pool?"):format(view.put[view.device] or 0), {colour = "warn", wrap = true,
+keep = doc.REQUIRED, name = "leaving"})
+rows[#rows + 1] = doc.row({doc.gap(1),
+doc.button("Take back", {colour = "good", action = {kind = "leave-take"},
+keep = doc.REQUIRED, name = "leave-take"}),
+doc.gap(1),
+doc.button("Leave them", {colour = "action", action = {kind = "leave-keep"},
+keep = doc.REQUIRED, name = "leave-keep"}),
+}, {keep = doc.REQUIRED, name = "leaving-actions"})
+end
+
+local function lookScreen(view, width, height)
+local look = view.look
+local rows = {app.header(view, "TEST"), backRow(view, label(view))}
+rows[#rows + 1] = doc.text(" " .. tostring(view.device) .. (look and ("  "
+.. table.concat(look.types or {}, " ")) or ""), {colour = "dim",
+truncate = doc.TRUNCATED, keep = 8, name = "device"})
+if view.leaving then
+leavingRows(view, rows)
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+if not look then
+rows[#rows + 1] = doc.text(view.lookWhy and (" no answer: " .. view.lookWhy)
+or " looking.. (each read is called once)", {colour = view.lookWhy and "bad"
+or "dim", wrap = true, keep = doc.REQUIRED, name = "looking"})
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+for i, line in ipairs(look.can or {}) do
+rows[#rows + 1] = doc.text((i == 1 and " Can be  " or "         ") .. line.text,
+{colour = line.ok and "good" or "dim", wrap = true,
+keep = 900 - i, name = "can:" .. i})
+end
+local said = saidRow(view)
+if said then rows[#rows + 1] = said end
+listing(view, rows, view.lookList, lookEntries(view), "line", height)
+rows[#rows + 1] = doc.spacer()
+local actions = {doc.gap(1)}
+local function button(text, kind, colour)
+actions[#actions + 1] = doc.button(text, {colour = colour or "action",
+action = {kind = kind}, keep = doc.REQUIRED, name = kind})
+actions[#actions + 1] = doc.gap(1)
+end
+if #view.watch.reads > 0 then button(("Watch %d"):format(#view.watch.reads), "watch") end
+if look.inventory then button("Try items", "try", "selected") end
+if #(view.histories[view.device] or {}) > 0 then button("History", "history") end
+button("Look again", "relook")
+rows[#rows + 1] = doc.row(actions, {keep = doc.REQUIRED, name = "look-actions"})
+return rows
+end
+
+
+
+local function callScreen(view, width, height)
+local call = view.call
+
+
+local kind = width >= 40 and {doc.text(call.read and "read" or "may change it",
+{colour = call.read and "good" or "warn", keep = 3, name = "kind"})} or nil
+local rows = {app.header(view, "TEST"), backRow(view, call.method, kind)}
+if call.expects then
+rows[#rows + 1] = doc.text(" needs arguments" .. (type(call.expects) == "string"
+and (": the 1st is a " .. call.expects) or ""), {colour = "dim", keep = 4,
+name = "expects"})
+end
+for i, text in ipairs(call.args) do
+local focused = call.field == i
+rows[#rows + 1] = doc.row({
+doc.text((" arg %d"):format(i), {colour = "label", keep = doc.REQUIRED,
+truncate = doc.TRUNCATED, name = "arg-label:" .. i}),
+doc.gap(1),
+doc.text(" " .. text .. (focused and "_" or ""), {width = "fill",
+colour = focused and "title" or "text", bg = "field",
+truncate = doc.TRUNCATED, action = {kind = "field", field = i},
+keep = doc.REQUIRED, name = "arg:" .. i}),
+doc.gap(1),
+doc.button("x", {colour = "bad", action = {kind = "drop-arg", field = i},
+keep = doc.REQUIRED, name = "drop-arg:" .. i}),
+}, {keep = 800 - i, name = "arg-row:" .. i})
+end
+rows[#rows + 1] = doc.text(" 12  north  \"two words\"  true  nil  {1, 2}",
+{colour = "dim", truncate = doc.TRUNCATED, keep = 2, name = "arg-help"})
+local actions = {doc.gap(1), doc.button("+ arg", {colour = "action",
+action = {kind = "add-arg"}, keep = doc.REQUIRED, name = "add-arg"})}
+actions[#actions + 1] = doc.spacer()
+if call.read then
+actions[#actions + 1] = doc.button("Watch", {colour = "action",
+action = {kind = "watch-this"}, keep = 6, name = "watch-this"})
+actions[#actions + 1] = doc.gap(1)
+end
+if view.sending then
+actions[#actions + 1] = doc.text("calling..", {colour = "dim",
+keep = doc.REQUIRED, name = "calling"})
+else
+actions[#actions + 1] = doc.button("Call", {key = "enter", colour = "good",
+action = {kind = "call"}, keep = doc.REQUIRED, name = "call"})
+end
+actions[#actions + 1] = doc.gap(1)
+rows[#rows + 1] = doc.row(actions, {keep = doc.REQUIRED, name = "call-actions"})
+if call.confirm then
+rows[#rows + 1] = doc.text((" %s may change the block. Call it?"):format(
+call.method), {colour = "warn", wrap = true, keep = doc.REQUIRED,
+name = "confirm"})
+rows[#rows + 1] = doc.row({doc.gap(1),
+doc.button("Call it", {colour = "bad", action = {kind = "call-yes"},
+keep = doc.REQUIRED, name = "call-yes"}),
+doc.gap(1),
+doc.button("No", {colour = "action", action = {kind = "call-no"},
+keep = doc.REQUIRED, name = "call-no"}),
+}, {keep = doc.REQUIRED, name = "confirm-actions"})
+end
+local said = saidRow(view)
+if said then rows[#rows + 1] = said end
+local result = view.result
+if result and result.method == call.method then
+rows[#rows + 1] = doc.rule({keep = 3, name = "result-rule"})
+local head = result.ok and ("ok in %d ms: %d value%s"):format(
+tonumber(result.took) or 0, result.count or 0,
+(result.count or 0) == 1 and "" or "s") or "it raised an error"
+if result.cut then head = head .. ", cut short" end
+if result.readAs and #result.readAs > 0 then
+head = head .. "  args: " .. table.concat(result.readAs, ", ")
+end
+rows[#rows + 1] = doc.row({
+doc.text(" " .. head, {colour = result.ok and "good" or "bad",
+truncate = doc.TRUNCATED, width = "fill", keep = 700, name = "result-head"}),
+doc.gap(1),
+doc.button("All", {colour = "action", action = {kind = "result"},
+keep = 699, name = "result-all"}),
+}, {keep = 700, name = "result-head-row"})
+local moved = changed(view)
+for i, line in ipairs(test.lines(result)) do
+rows[#rows + 1] = doc.text(" " .. line.text, {colour = moved[line.path]
+and "warn" or "text", truncate = doc.TRUNCATED,
+keep = 600 - i, name = "result:" .. i})
+end
+end
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+local function resultScreen(view, width, height)
+local rows = {app.header(view, "TEST"), backRow(view, view.call and view.call.method
+or "result")}
+local moved = changed(view)
+local entries = {}
+for _, line in ipairs(test.lines(view.result)) do
+entries[#entries + 1] = {value = line.text, label = line.text,
+note = moved[line.path] and "changed" or nil}
+end
+listing(view, rows, view.resultList, entries, "res", height)
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+local function historyScreen(view, width, height)
+local rows = {app.header(view, "TEST"), backRow(view, "History: " .. label(view))}
+local entries = {}
+for i, entry in ipairs(view.histories[view.device] or {}) do
+local args = #(entry.args or {}) > 0 and table.concat(entry.args, ", ") or ""
+local text = ("%s(%s) -> %s"):format(entry.method, args, entry.text)
+entries[#entries + 1] = {value = text, label = text,
+note = timeOf(view, entry.at), act = {kind = "again", index = i}}
+end
+listing(view, rows, view.historyList, entries, "hist", height,
+" nothing called yet")
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+
+
+local function watchScreen(view, width, height)
+local watch = view.watch
+local every = {}
+for _, n in ipairs(test.WATCH_EVERY) do
+every[#every + 1] = doc.button(n .. "s", {colour = watch.every == n and "selected"
+or "action", action = {kind = "watch-every", every = n}, keep = 4,
+name = "every:" .. n})
+end
+local rows = {app.header(view, "TEST"), backRow(view, "Watch", every)}
+if #watch.reads == 0 then
+rows[#rows + 1] = doc.text(" nothing watched: open a read and press Watch, or "
+.. "pick slots, tanks or energy on the look", {colour = "dim", wrap = true,
+keep = doc.REQUIRED, name = "watch-none"})
+end
+for i, read in ipairs(watch.reads) do
+rows[#rows + 1] = doc.row({
+doc.text((" %s = %s"):format(read.label, watch.values[i] or ".."),
+{width = "fill", truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+name = "watched:" .. i}),
+doc.gap(1),
+doc.button("x", {colour = "bad", action = {kind = "watch-drop", index = i},
+keep = doc.REQUIRED, name = "watch-drop:" .. i}),
+}, {keep = doc.REQUIRED, name = "watched-row:" .. i})
+end
+local said = saidRow(view)
+if said then rows[#rows + 1] = said end
+rows[#rows + 1] = doc.row({
+doc.text(" What changed", {colour = "label", width = "fill", keep = 5,
+name = "log-title"}),
+doc.button("Clear", {colour = "action", action = {kind = "watch-clear"},
+keep = 4, name = "watch-clear"}),
+doc.gap(1),
+}, {keep = 5, name = "log-head"})
+local entries = {}
+for _, change in ipairs(watch.log) do
+local text = ("%s  %s -> %s"):format(change.label, change.from, change.to)
+entries[#entries + 1] = {value = text, label = text, note = timeOf(view, change.at)}
+end
+listing(view, rows, view.watchList, entries, "log", height, " nothing yet")
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+
+
+
+
+local KEEP_WRAPPED = app.KEEP_STATUS - 200
+
+local function wrapped(buttons, width, name)
+local rows, row, used = {}, {doc.gap(1)}, 1
+for _, button in ipairs(buttons) do
+local cells = #button.label + 2
+if used > 1 and used + 1 + cells > width then
+rows[#rows + 1] = doc.row(row, {keep = KEEP_WRAPPED, name = name .. #rows})
+row, used = {doc.gap(1)}, 1
+end
+if used > 1 then
+row[#row + 1] = doc.gap(1)
+used = used + 1
+end
+row[#row + 1] = button
+used = used + cells
+end
+rows[#rows + 1] = doc.row(row, {keep = KEEP_WRAPPED, name = name .. #rows})
+return rows
+end
+
+local function tryScreen(view, width, height)
+local try = view.try
+local size = view.look and view.look.inventory and view.look.inventory.size or 0
+local rows = {app.header(view, "TEST"), backRow(view, "Try items: " .. label(view))}
+local names = try.names or {}
+local chosen = try.item and (names[try.item] and names[try.item].name
+or itemWords(try.item)) or "pick one below"
+rows[#rows + 1] = doc.row({
+doc.text(" Item ", {colour = "label", truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "item-label"}),
+doc.text(chosen, {colour = try.item and "title" or "dim", width = "fill",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "item"}),
+}, {keep = doc.REQUIRED, name = "item-row"})
+
+
+local slotLabel = doc.text(" Slot", {colour = "label", truncate = doc.TRUNCATED, keep = doc.REQUIRED,
+name = "slot-label"})
+if size <= test.SLOT_BUTTONS then
+local buttons = {doc.button("any", {colour = try.slot == nil and "selected"
+or "action", action = {kind = "slot"}, keep = doc.REQUIRED, name = "slot:any"})}
+for slot = 1, size do
+buttons[#buttons + 1] = doc.button(tostring(slot), {colour = try.slot == slot
+and "selected" or "action", action = {kind = "slot", slot = slot},
+keep = doc.REQUIRED, name = "slot:" .. slot})
+end
+rows[#rows + 1] = doc.row({slotLabel}, {keep = doc.REQUIRED, name = "slot-head"})
+for _, row in ipairs(wrapped(buttons, width, "slots")) do rows[#rows + 1] = row end
+else
+rows[#rows + 1] = doc.row({slotLabel, doc.gap(1),
+doc.button("-", {action = {kind = "slot-step", n = -1}, keep = doc.REQUIRED,
+name = "slot-less"}),
+doc.text((" %s "):format(try.slot and tostring(try.slot) or "any"),
+{colour = "title", keep = doc.REQUIRED, name = "slot-value"}),
+doc.button("+", {action = {kind = "slot-step", n = 1}, keep = doc.REQUIRED,
+name = "slot-more"}),
+doc.gap(1),
+doc.button("any", {colour = try.slot == nil and "selected" or "action",
+action = {kind = "slot"}, keep = doc.REQUIRED, name = "slot:any"}),
+}, {keep = doc.REQUIRED, name = "slot-row"})
+end
+rows[#rows + 1] = app.quantityRow(try.count, true, "Count", 1)
+local busy = view.sending ~= nil
+rows[#rows + 1] = doc.row({doc.gap(1),
+doc.button("Put", {colour = (try.item and not busy) and "good" or "dim",
+action = {kind = "put"}, keep = doc.REQUIRED, name = "put"}),
+doc.gap(1),
+doc.button("Take back", {colour = busy and "dim" or "action",
+action = {kind = "take"}, keep = doc.REQUIRED, name = "take"}),
+doc.spacer(),
+doc.text(busy and "moving.. " or "", {colour = "dim", keep = 2, name = "moving"}),
+}, {keep = doc.REQUIRED, name = "try-actions"})
+local said = saidRow(view)
+if said then rows[#rows + 1] = said end
+
+
+local parts = {}
+for slot = 1, size do
+local stack = try.slots and try.slots[slot]
+if type(stack) == "table" then
+parts[#parts + 1] = ("%d: %s x%d"):format(slot, itemWords(stack.name),
+stack.count or 0)
+end
+end
+rows[#rows + 1] = doc.text(" Now  " .. (try.slots and (#parts > 0
+and table.concat(parts, "  ") or "empty") or ".."), {colour = "text", wrap = true,
+keep = 650, name = "now"})
+
+local entries = {}
+for item, record in pairs(try.items or {}) do
+local free = type(record) == "table" and record.free or 0
+if free > 0 then
+local known = names[item]
+entries[#entries + 1] = {value = item, label = known and known.name
+or itemWords(item), note = tostring(free), selected = try.item == item,
+chip = app.chipFor(item), act = {kind = "item", item = item}}
+end
+end
+table.sort(entries, function(a, b) return a.label:lower() < b.label:lower() end)
+listing(view, rows, view.itemList, entries, "item", height,
+try.items and " nothing in the pool is free" or " reading the pool..")
+rows[#rows + 1] = doc.spacer()
+return rows
+end
+
+function test.document(view, width, height)
+local rows
+local screen = view.screen
+if screen == "find" then
+rows = findScreen(view)
+elseif screen == "look" and view.device then
+rows = lookScreen(view, width, height)
+elseif screen == "call" and view.call then
+rows = callScreen(view, width, height)
+elseif screen == "result" and view.result then
+rows = resultScreen(view, width, height)
+elseif screen == "history" and view.device then
+rows = historyScreen(view, width, height)
+elseif screen == "watch" and view.device then
+rows = watchScreen(view, width, height)
+elseif screen == "try" and view.try then
+rows = tryScreen(view, width, height)
+else
+view.screen = "list"
+rows = listScreen(view, width, height)
+end
+return doc.stack(rows, {name = "test"})
+end
+
+return test

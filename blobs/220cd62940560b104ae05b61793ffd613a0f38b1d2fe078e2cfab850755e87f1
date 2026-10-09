@@ -1,0 +1,156 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local lex = {}
+
+lex.KEYWORDS = {}
+for word in ([[machine input output volume level flag safe every when on start stop
+    if else supply stock collect trash move set pulse wait until within repeat let alarm
+    clear to with from for in count free and or not off slots makes yields
+    max do fail fault]]):gmatch("%S+") do
+lex.KEYWORDS[word] = true
+end
+
+local OPS = {"<=", ">=", "!=", "<", ">", "=", "(", ")", ":", ",", "-"}
+
+
+local function splitComment(text)
+local inString = false
+for i = 1, #text do
+local c = text:sub(i, i)
+if c == '"' then
+inString = not inString
+elseif not inString and text:sub(i, i + 1) == "--" then
+return text:sub(1, i - 1), text:sub(i + 2)
+end
+end
+return text, nil
+end
+
+
+local function tokens(code, lineNo)
+local out = {}
+local i = 1
+while i <= #code do
+local c = code:sub(i, i)
+if c == " " or c == "\t" then
+i = i + 1
+elseif c == '"' then
+local close = code:find('"', i + 1, true)
+if not close then
+return nil, {line = lineNo, col = i, message = "text is not closed with \""}
+end
+out[#out + 1] = {t = "text", v = code:sub(i + 1, close - 1), col = i}
+i = close + 1
+else
+local tag = code:match("^#[a-z0-9_.%-]+:[a-z0-9_./%-]+", i)
+local filter = code:match("^@[a-z_][a-z0-9_]*", i)
+local item = code:match("^[a-z0-9_.%-]+:[a-z0-9_./%-]+", i)
+local dur = code:match("^%d+[tsm]", i)
+local num = code:match("^%d+", i)
+local word = code:match("^[a-z_][a-z0-9_]*", i)
+if tag or filter then
+out[#out + 1] = {t = "item", v = tag or filter, col = i,
+sel = tag and "tag" or "filter"}
+i = i + #(tag or filter)
+elseif item then
+out[#out + 1] = {t = "item", v = item, col = i}
+i = i + #item
+elseif dur and not code:sub(i + #dur, i + #dur):match("[%w_]") then
+out[#out + 1] = {t = "dur", v = tonumber(dur:sub(1, -2)),
+unit = dur:sub(-1), col = i}
+i = i + #dur
+elseif num then
+if code:sub(i + #num, i + #num):match("[%a_]") then
+return nil, {line = lineNo, col = i,
+message = "a number runs into letters: " .. code:match("^%S+", i)}
+end
+out[#out + 1] = {t = "num", v = tonumber(num), col = i}
+i = i + #num
+elseif word then
+out[#out + 1] = {t = "word", v = word, col = i}
+i = i + #word
+else
+local op = nil
+for _, candidate in ipairs(OPS) do
+if code:sub(i, i + #candidate - 1) == candidate then
+op = candidate
+break
+end
+end
+if not op then
+local what = code:match("^%S+", i)
+local message = what:match("%u")
+and ("keywords and names are lowercase: %s"):format(what)
+or ("not something a script can say: %s"):format(what)
+return nil, {line = lineNo, col = i, message = message}
+end
+out[#out + 1] = {t = "op", v = op, col = i}
+i = i + #op
+end
+end
+end
+return out
+end
+
+
+
+function lex.steps(lead)
+local _, tabs = lead:gsub("\t", "")
+local spaces = #lead - tabs
+if spaces % 4 ~= 0 then return nil end
+return tabs + math.floor(spaces / 4)
+end
+
+
+
+
+function lex.lines(source)
+local out, errors = {}, {}
+local lineNo = 0
+source = (source or ""):gsub("\r\n", "\n")
+if source:sub(-1) ~= "\n" then source = source .. "\n" end
+for text in source:gmatch("([^\n]*)\n") do
+lineNo = lineNo + 1
+local lead = text:match("^[ \t]*")
+local steps = lex.steps(lead)
+local record = {line = lineNo, indent = steps or 0, tokens = {}}
+if not steps and text:find("%S") then
+errors[#errors + 1] = {line = lineNo, col = 1,
+message = "indent with tabs, one per step (four spaces also count as one)"}
+record.bad = true
+else
+local code, comment = splitComment(text:sub(#lead + 1))
+record.comment = comment
+local toks, err = tokens(code, lineNo)
+if toks then
+for _, tok in ipairs(toks) do tok.col = tok.col + #lead end
+record.tokens = toks
+else
+err.col = err.col + #lead
+errors[#errors + 1] = err
+record.bad = true
+end
+end
+record.blank = (not record.bad) and #record.tokens == 0 and record.comment == nil
+out[#out + 1] = record
+end
+return out, errors
+end
+
+return lex

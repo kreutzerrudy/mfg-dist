@@ -1,0 +1,713 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local hal = require("mfg.common.hal")
+local mount = require("mfg.storage.mount")
+
+local tester = {}
+
+
+
+tester.EQUIPMENT = {
+computer = "another computer: shutdown and reboot are among its methods",
+turtle = "a turtle: shutdown and reboot are among its methods",
+command = "a command computer",
+modem = "a modem: the network itself",
+drive = "a disk drive: minting writes a node's secrets through it",
+printer = "the printer: it prints bind pages and markers",
+monitor = "a monitor: dashboards draw on it",
+}
+
+
+
+tester.READ_PREFIXES = {"get", "is", "has", "list", "read", "count"}
+tester.READ_NAMES = {size = true, tanks = true, list = true}
+
+tester.MAX_READS = 32
+tester.READ_BUDGET = 5000
+tester.LIMIT_SLOTS = 18
+tester.MAX_ARGS = 8
+
+
+tester.LIMITS = {depth = 6, entries = 200, text = 200, bytes = 8192}
+
+function tester.clock() return os.epoch("utc") end
+
+
+
+
+function tester.equipment(types)
+for _, kind in ipairs(types or {}) do
+if tester.EQUIPMENT[kind] then return tester.EQUIPMENT[kind] end
+end
+return nil
+end
+
+local function set(list)
+local out = {}
+for _, v in ipairs(list or {}) do out[v] = true end
+return out
+end
+
+
+function tester.words(kind)
+kind = tostring(kind or "peripheral")
+return ((kind:match(":(.+)$") or kind):gsub("_", " "))
+end
+
+local function article(words)
+return (words:match("^[aeiou]") and "an " or "a ") .. words
+end
+
+
+
+local function groupOf(device, types)
+local has = set(types)
+if has.inventory then return "inventory" end
+if hal.redstone().isPresent(device) then return "redstone" end
+return "other"
+end
+
+
+local SURFACES = {inventory = "inventory", fluid_storage = "fluids",
+energy_storage = "energy"}
+
+local function surfaces(types)
+local out = {}
+for _, kind in ipairs(types or {}) do
+if SURFACES[kind] then out[#out + 1] = SURFACES[kind] end
+end
+return out
+end
+
+
+
+
+
+function tester.check(device)
+if type(device) ~= "string" or device == "" then return nil, "no device named" end
+local types = hal.peripherals().list()[device]
+if not types then return nil, "it isn't on the network any more" end
+local equipment = tester.equipment(types)
+if equipment then
+return nil, ("that is %s: the Test app never touches the system's own "
+.. "equipment"):format(equipment)
+end
+local path = mount.claimed()[device]
+if path then
+return nil, ("it is bound to %s now: the Test app reaches only blocks nobody "
+.. "has bound"):format(path)
+end
+return types
+end
+
+local function strings(value, out, seen)
+if type(value) == "string" then
+out[#out + 1] = value
+elseif type(value) == "table" and not seen[value] then
+seen[value] = true
+for k, v in pairs(value) do
+strings(k, out, seen)
+strings(v, out, seen)
+end
+end
+return out
+end
+
+
+function tester.checkArgs(args)
+local claimed = mount.claimed()
+local all = hal.peripherals().list()
+for _, text in ipairs(strings(args, {}, {})) do
+if claimed[text] then
+return nil, ("an argument names %s, which is bound to %s: a test can't "
+.. "reach a bound block"):format(text, claimed[text])
+end
+local equipment = all[text] and tester.equipment(all[text])
+if equipment then
+return nil, ("an argument names %s, %s: a test can't reach the system's "
+.. "own equipment"):format(text, equipment)
+end
+end
+return true
+end
+
+
+
+function tester.isRead(method)
+if type(method) ~= "string" then return false end
+if tester.READ_NAMES[method] then return true end
+for _, prefix in ipairs(tester.READ_PREFIXES) do
+if method:sub(1, #prefix) == prefix then
+local after = method:sub(#prefix + 1, #prefix + 1)
+if after == "" or after:match("[%u%d_]") then return true end
+end
+end
+return false
+end
+
+
+
+
+
+
+
+local function reader(s)
+local pos = 1
+local function skip()
+pos = s:find("[^%s]", pos) or (#s + 1)
+end
+local function peek() return s:sub(pos, pos) end
+local value
+
+local function quoted(q)
+pos = pos + 1
+local out = {}
+while pos <= #s do
+local c = s:sub(pos, pos)
+if c == "\\" then
+local n = s:sub(pos + 1, pos + 1)
+out[#out + 1] = ({n = "\n", t = "\t"})[n] or n
+pos = pos + 2
+elseif c == q then
+pos = pos + 1
+return table.concat(out)
+else
+out[#out + 1] = c
+pos = pos + 1
+end
+end
+error("a string with no closing " .. q, 0)
+end
+
+local function tableOf()
+pos = pos + 1
+local out, i = {}, 1
+while true do
+skip()
+local c = peek()
+if c == "" then error("a { with no closing }", 0) end
+if c == "}" then
+pos = pos + 1
+return out
+end
+if c == "[" then
+pos = pos + 1
+local key = value()
+skip()
+if peek() ~= "]" then error("a [key] with no closing ]", 0) end
+pos = pos + 1
+skip()
+if peek() ~= "=" then error("a [key] with no = after it", 0) end
+pos = pos + 1
+if key == nil then error("a table key can't be nil", 0) end
+out[key] = value()
+else
+local word, after = s:match("^([%a_][%w_]*)%s*=()", pos)
+if word and s:sub(after, after) ~= "=" then
+pos = after
+out[word] = value()
+else
+out[i] = value()
+i = i + 1
+end
+end
+skip()
+c = peek()
+if c == "" then error("a { with no closing }", 0) end
+if c == "," or c == ";" then
+pos = pos + 1
+elseif c ~= "}" then
+error(("expected , or } at %q"):format(s:sub(pos, pos + 7)), 0)
+end
+end
+end
+
+value = function()
+skip()
+local c = peek()
+if c == "" then error("a value is missing", 0) end
+if c == '"' or c == "'" then return quoted(c) end
+if c == "{" then return tableOf() end
+local hex = s:match("^%-?0[xX]%x+", pos)
+local num = hex or s:match("^%-?%d+%.?%d*[eE][%-+]?%d+", pos)
+or s:match("^%-?%d+%.?%d*", pos) or s:match("^%-?%.%d+", pos)
+if num then
+pos = pos + #num
+return tonumber(num)
+end
+local word = s:match("^[%a_][%w_%.:%-/]*", pos)
+if word then
+pos = pos + #word
+if word == "true" then return true end
+if word == "false" then return false end
+if word == "nil" then return nil end
+return word
+end
+error(("can't read %q"):format(s:sub(pos, pos + 7)), 0)
+end
+
+return function()
+local v = value()
+skip()
+if pos <= #s then
+error(("something after the value: %q"):format(s:sub(pos, pos + 7)), 0)
+end
+return v
+end
+end
+
+local function entries(t)
+local n = 0
+for _ in pairs(t) do n = n + 1 end
+return n
+end
+
+
+local function readAs(text, value)
+if value == nil then return "nil" end
+if type(value) == "table" then
+local n = entries(value)
+return ("a table of %d"):format(n)
+end
+if type(value) == "boolean" then return tostring(value) .. " (flag)" end
+if type(value) == "number" then return tostring(value) .. " (number)" end
+return ("%s (text)"):format(value == text and value or ("%q"):format(value))
+end
+
+
+
+function tester.literal(text)
+if type(text) ~= "string" then return nil, "an argument is not text" end
+local trimmed = text:match("^%s*(.-)%s*$")
+if trimmed == "" then return nil, "it is empty: type nil for nothing" end
+local first = trimmed:sub(1, 1)
+local isLiteral = first == '"' or first == "'" or first == "{"
+or trimmed == "true" or trimmed == "false" or trimmed == "nil"
+or trimmed:match("^%-?%d") or trimmed:match("^%-?%.%d")
+if not isLiteral then return trimmed, nil, true end
+local ok, value = pcall(reader(trimmed))
+if not ok then return nil, tostring(value) end
+return value, nil, true
+end
+
+
+
+function tester.parse(texts)
+texts = texts or {}
+if type(texts) ~= "table" then return nil, "the arguments are not a list" end
+if #texts > tester.MAX_ARGS then
+return nil, ("at most %d arguments"):format(tester.MAX_ARGS)
+end
+local args, said = {n = #texts}, {}
+for i, text in ipairs(texts) do
+local value, why, ok = tester.literal(text)
+if not ok then return nil, ("argument %d: %s"):format(i, tostring(why)) end
+args[i] = value
+said[i] = readAs(text, value)
+end
+return args, said
+end
+
+
+
+local function keyOrder(a, b)
+local ta, tb = type(a), type(b)
+if ta == "number" and tb == "number" then return a < b end
+if ta == "number" then return true end
+if tb == "number" then return false end
+return tostring(a) < tostring(b)
+end
+
+
+
+
+function tester.shape(value)
+local limits = tester.LIMITS
+local budget = {entries = 0, bytes = 0, cut = false}
+local seen = {}
+
+local function shape(v, depth)
+local kind = type(v)
+if kind == "string" then
+budget.bytes = budget.bytes + #v
+if #v > limits.text then
+budget.cut = true
+return v:sub(1, limits.text) .. ("..(+%d)"):format(#v - limits.text)
+end
+return v
+elseif kind == "number" or kind == "boolean" or kind == "nil" then
+budget.bytes = budget.bytes + 8
+return v
+elseif kind ~= "table" then
+return "<" .. kind .. ">"
+end
+if seen[v] then return "<a loop>" end
+if depth >= limits.depth then
+budget.cut = true
+return {["..."] = ("%d more"):format(entries(v))}
+end
+seen[v] = true
+local keys = {}
+for k in pairs(v) do keys[#keys + 1] = k end
+table.sort(keys, keyOrder)
+local out = {}
+for i, k in ipairs(keys) do
+if budget.entries >= limits.entries or budget.bytes >= limits.bytes then
+budget.cut = true
+out["..."] = ("%d more"):format(#keys - i + 1)
+break
+end
+budget.entries = budget.entries + 1
+local key = k
+if type(k) ~= "number" and type(k) ~= "string" then key = tostring(k) end
+budget.bytes = budget.bytes + 8
+out[key] = shape(v[k], depth + 1)
+end
+seen[v] = nil
+return out
+end
+
+local shaped = shape(value, 0)
+return shaped, budget.cut
+end
+
+
+
+local ORDINAL = {"1st", "2nd", "3rd"}
+
+
+
+function tester.hint(err)
+if type(err) ~= "string" then return nil end
+local index = tonumber(err:match("bad argument #(%d+)"))
+if not index then return nil end
+local expects = err:match("%((%a+) expected") or err:match("%(expected (%a+)")
+local ordinal = ORDINAL[index] or (index .. "th")
+local text = expects and ("needs arguments: the %s is a %s"):format(ordinal, expects)
+or ("needs arguments: at least %d"):format(index)
+return {arg = index, expects = expects, text = text}
+end
+
+
+
+local busy = {}
+
+
+
+local function callOne(device, method, args)
+if busy[device] then
+return {ok = false, error = "another call on it is still running"}
+end
+busy[device] = true
+local ok, result, took = hal.peripherals().call(device, method, args)
+busy[device] = nil
+if not ok then
+return {ok = false, error = tostring(result), hint = tester.hint(result),
+took = took}
+end
+local values, cut = {}, false
+for i = 1, result.n do
+local shaped, wasCut = tester.shape(result[i])
+values[i] = shaped
+cut = cut or wasCut
+end
+return {ok = true, count = result.n, values = values, cut = cut, took = took}
+end
+
+
+local function first(device, method, args)
+local ok, result = hal.peripherals().call(device, method, args or {n = 0})
+if ok and result.n > 0 then return result[1] end
+return nil
+end
+
+local function hasMethod(device, method)
+for _, m in ipairs(hal.peripherals().methods(device) or {}) do
+if m == method then return true end
+end
+return false
+end
+
+
+
+function tester.call(device, method, texts)
+local types, why = tester.check(device)
+if not types then return nil, why end
+if not hasMethod(device, method) then
+return nil, ("it has no method %s"):format(tostring(method))
+end
+local args, said = tester.parse(texts)
+if not args then return nil, said end
+local fine, refused = tester.checkArgs(args)
+if not fine then return nil, refused end
+local result = callOne(device, method, args)
+result.method, result.readAs = method, said
+return result
+end
+
+
+
+function tester.read(device, reads)
+local types, why = tester.check(device)
+if not types then return nil, why end
+local out = {}
+for i, read in ipairs(reads or {}) do
+local method = type(read) == "table" and read.method or nil
+if not tester.isRead(method) then
+out[i] = {ok = false, method = method, error = ("%s doesn't read by its "
+.. "name: call it by hand"):format(tostring(method))}
+elseif not hasMethod(device, method) then
+out[i] = {ok = false, method = method,
+error = ("it has no method %s"):format(tostring(method))}
+else
+local args, said = tester.parse(read.args)
+local fine, refused = true, nil
+if args then fine, refused = tester.checkArgs(args) end
+if not args then
+out[i] = {ok = false, method = method, error = said}
+elseif not fine then
+out[i] = {ok = false, method = method, error = refused}
+else
+out[i] = callOne(device, method, args)
+out[i].method, out[i].readAs = method, said
+end
+end
+end
+return {results = out}
+end
+
+
+
+
+
+function tester.can(device, types)
+local has, lines = set(types), {}
+local kind = types and types[1]
+if has.inventory then
+if mount.isStorage(kind) then
+lines[#lines + 1] = {ok = true, text = "storage: a pool chest, a store, an "
+.. "interface chest, /io/in or /io/out"}
+else
+lines[#lines + 1] = {ok = true, text = "a machine's own slots (a slots "
+.. "port): Try items shows which slot does what"}
+end
+end
+if hal.redstone().isPresent(device) then
+lines[#lines + 1] = {ok = true, text = "signal ports: inputs and outputs on its "
+.. "faces"}
+end
+if has.rsBridge or has.meBridge then
+lines[#lines + 1] = {ok = true, text = "a storage network in the pool ("
+.. (has.meBridge and "AE2" or "Refined Storage") .. ")"}
+end
+if has.inventoryManager then
+lines[#lines + 1] = {ok = true, text = "a player's inventory"}
+end
+if has.fluid_storage then
+lines[#lines + 1] = {ok = false, text = "fluids: scripts can't move them yet"}
+end
+if has.energy_storage then
+lines[#lines + 1] = {ok = false, text = "energy: readable here, nothing in the "
+.. "system uses it yet"}
+end
+if #lines == 0 then
+lines[#lines + 1] = {ok = false, text = "only its methods drive it, and scripts "
+.. "can't call methods yet; a comparator on it can be read as a level"}
+end
+return lines
+end
+
+
+local function faces(device)
+local rs = hal.redstone()
+if not rs.isPresent(device) then return nil end
+local out = {}
+for face in pairs(mount.FACES) do
+local okIn, input = pcall(rs.getAnalogInput, device, face)
+local okOut, output = pcall(rs.getAnalogOutput, device, face)
+out[face] = {input = okIn and input or nil, output = okOut and output or nil}
+end
+return out
+end
+
+
+
+local function inventory(device)
+local size = tonumber(first(device, "size")) or 0
+local listing = first(device, "list") or {}
+local slots = {}
+for slot = 1, size do
+local stack = listing[slot]
+if stack or size <= tester.LIMIT_SLOTS then
+local entry = {slot = slot}
+if type(stack) == "table" then
+entry.item, entry.count = stack.name, stack.count
+end
+if size <= tester.LIMIT_SLOTS then
+entry.limit = tonumber(first(device, "getItemLimit", {n = 1, slot}))
+end
+slots[#slots + 1] = entry
+end
+end
+return {size = size, slots = slots}
+end
+
+
+function tester.look(device)
+local types, why = tester.check(device)
+if not types then return nil, why end
+local has = set(types)
+local kind = types[1]
+local out = {
+device = device,
+kind = kind,
+mod = tostring(kind):match("^([^:]+):") or nil,
+label = article(tester.words(kind)),
+types = types,
+group = groupOf(device, types),
+surfaces = surfaces(types),
+can = tester.can(device, types),
+reads = {}, others = {}, readings = {}, rest = {},
+}
+
+
+
+local covered = {}
+if has.inventory then
+out.inventory = inventory(device)
+covered.size, covered.list = true, true
+end
+if has.fluid_storage then
+out.tanks = tester.shape(first(device, "tanks") or {})
+covered.tanks = true
+end
+if has.energy_storage then
+out.energy = {stored = first(device, "getEnergy"),
+capacity = first(device, "getEnergyCapacity")}
+covered.getEnergy, covered.getEnergyCapacity = true, true
+end
+out.faces = faces(device)
+
+
+
+local methods = hal.peripherals().methods(device) or {}
+for _, method in ipairs(methods) do
+if tester.isRead(method) then
+out.reads[#out.reads + 1] = method
+else
+out.others[#out.others + 1] = method
+end
+end
+local started, called = tester.clock(), 0
+for _, method in ipairs(out.reads) do
+if not covered[method] then
+if called >= tester.MAX_READS
+or tester.clock() - started > tester.READ_BUDGET then
+out.rest[#out.rest + 1] = method
+else
+called = called + 1
+local result = callOne(device, method, {n = 0})
+result.method = method
+out.readings[#out.readings + 1] = result
+end
+end
+end
+return out
+end
+
+
+
+local GROUP_ORDER = {inventory = 1, redstone = 2, other = 3}
+
+
+
+
+function tester.devices()
+local claimed = mount.claimed()
+local out = {}
+for device, types in pairs(hal.peripherals().list()) do
+if not claimed[device] and not tester.equipment(types) then
+out[#out + 1] = {device = device, kind = types[1], types = types,
+label = article(tester.words(types[1])),
+group = groupOf(device, types), surfaces = surfaces(types)}
+end
+end
+table.sort(out, function(a, b)
+if a.group ~= b.group then return GROUP_ORDER[a.group] < GROUP_ORDER[b.group] end
+if a.label ~= b.label then return a.label < b.label end
+return a.device < b.device
+end)
+return out
+end
+
+
+
+local function pool()
+return require("mfg.common.config").setting("source")
+end
+
+
+
+function tester.put(device, item, count, slot)
+local types, why = tester.check(device)
+if not types then return nil, why end
+if not set(types).inventory then return nil, "it isn't an inventory" end
+local size = tonumber(first(device, "size")) or 0
+if slot and (slot < 1 or slot > size) then
+return nil, ("it has slots 1 to %d"):format(size)
+end
+local from = pool()
+local available, breakdown = require("mfg.controller.supervisor").available(from)
+if not available then return nil, tostring(breakdown) end
+local free = available[item] or 0
+local take = math.min(count, free)
+if take <= 0 then
+return {moved = 0, short = count, reason = ("no %s is free in %s"):format(
+tester.words(item), from)}
+end
+local store = require("mfg.storage")
+local moved, err = store.intoLoose(from, device, item, take, slot)
+local reason = nil
+if moved == 0 then
+reason = slot and ("slot %d took none of it"):format(slot)
+or ("it took none of it")
+if err then reason = reason .. " (" .. tostring(err) .. ")" end
+elseif moved < count then
+reason = err or (take < count and ("only %d free"):format(free)) or nil
+end
+return {moved = moved, short = count - moved, reason = reason}
+end
+
+
+
+function tester.take(device)
+local types, why = tester.check(device)
+if not types then return nil, why end
+if not set(types).inventory then return nil, "it isn't an inventory" end
+local store = require("mfg.storage")
+local moved, err = store.outOfLoose(device, pool())
+local left = 0
+for _, stack in pairs(first(device, "list") or {}) do
+if type(stack) == "table" then left = left + (stack.count or 0) end
+end
+return {moved = moved, left = left, reason = left > 0 and (err or "the pool is full")
+or nil}
+end
+
+function tester._reset() busy = {} end
+
+return tester

@@ -1,0 +1,22 @@
+local rpc = require("mfg.common.rpc")
+local tester = require("mfg.controller.tester")
+
+
+
+
+
+return {
+name        = "test_devices",
+label       = "Peripherals to test",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {},
+
+returns = {devices = "table"},
+
+run = function()
+return rpc.COMPLETED, {devices = tester.devices()}
+end,
+}

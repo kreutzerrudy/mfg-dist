@@ -1,0 +1,29 @@
+local rpc = require("mfg.common.rpc")
+local tester = require("mfg.controller.tester")
+
+
+
+
+
+
+return {
+name        = "test_read",
+label       = "Read a peripheral",
+tier        = "node",
+destructive = false,
+quiet       = true,
+
+parameters = {
+{name = "device", label = "Peripheral", type = "text", required = true},
+{name = "reads", label = "Reads", type = "table", required = true,
+help = "A list of {method, args}; tester.read checks each one."},
+},
+
+returns = {results = "table"},
+
+run = function(params)
+local out, why = tester.read(params.device, params.reads)
+if not out then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, out
+end,
+}

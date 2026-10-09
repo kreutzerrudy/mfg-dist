@@ -1,0 +1,34 @@
+local rpc = require("mfg.common.rpc")
+local tester = require("mfg.controller.tester")
+
+
+
+
+
+
+
+return {
+name        = "test_put",
+label       = "Try an item in a peripheral",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "device", label = "Peripheral", type = "text", required = true},
+{name = "item", label = "Item", type = "item", required = true},
+{name = "count", label = "Count", type = "number", integer = true,
+min = 1, max = 64, required = true},
+{name = "slot", label = "Slot", type = "number", integer = true, min = 1,
+required = false},
+},
+
+returns = {moved = "number", short = "number"},
+
+run = function(params)
+local result, why = tester.put(params.device, params.item, params.count,
+params.slot)
+if not result then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, result
+end,
+}

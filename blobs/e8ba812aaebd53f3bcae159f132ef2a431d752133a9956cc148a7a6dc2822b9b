@@ -1,0 +1,112 @@
+local rpc = require("mfg.common.rpc")
+local actions = require("mfg.common.actions")
+local mint = require("mfg.controller.mint")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function granted(policy)
+if type(policy) ~= "string" then return nil end
+local decl = actions.get(policy:match("^[^:]+"))
+if not decl or type(decl.mints) ~= "table" then return nil end
+local out = {}
+for _, role in ipairs(decl.mints) do out[role] = true end
+return out
+end
+
+return {
+name        = "provision",
+label       = "Mint a node",
+tier        = "orchestrated",
+uses        = {"mint_node"},
+manual      = false,
+destructive = false,
+
+parameters = {
+{name = "drive", label = "Drive", type = "text", required = true},
+{name = "role", label = "Role", type = "text", required = false},
+{name = "name", label = "Name", type = "text", required = false},
+{name = "owner", label = "A pocket for", type = "text", required = false},
+{name = "again", label = "Mint over a minted computer", type = "flag",
+required = false},
+},
+
+returns = {name = "text", role = "text", address = "text", fetch = "number"},
+
+run = function(params, ctx)
+local operator = ctx.operator == true
+if not operator and not ctx.policy then
+return rpc.REJECTED, {reason = "an operator or a policy must ask to mint"}
+end
+
+local role, owner = mint.check(params.role, params.owner)
+if not role then return rpc.REJECTED, {reason = owner} end
+
+if not operator then
+local grant = granted(ctx.policy)
+if not grant then
+return rpc.REJECTED, {reason = ("%s names no roles it may mint -- a policy "
+.. "that mints declares `mints`"):format(ctx.policy)}
+end
+if not grant[role] then
+return rpc.REJECTED, {reason = ("%s may not mint a %s"):format(ctx.policy, role)}
+end
+if params.again then
+return rpc.REJECTED, {reason = "a policy mints only blank computers, never "
+.. "over one"}
+end
+end
+
+local drive
+for _, d in ipairs(mint.drives()) do
+if d.name == params.drive then drive = d end
+end
+if not drive then
+return rpc.REJECTED, {reason = "no such drive: " .. tostring(params.drive)}
+end
+local seen = mint.inspect(drive)
+if seen.state == "empty" then
+return rpc.REJECTED, {reason = "the drive is empty"}
+elseif seen.state == "no-disk" then
+return rpc.REJECTED, {reason = "it has no disk yet: place it and turn it on once"}
+elseif seen.state == "minted" and not operator then
+return rpc.REJECTED, {reason = ("it is already minted, as %s -- a policy mints "
+.. "only blank computers"):format(tostring(seen.minted and seen.minted.name))}
+end
+
+local want = mint.platformFor(role, owner)
+if seen.platform and want and seen.platform ~= want then
+return rpc.REJECTED, {reason = ("%s runs on a %s, and the drive holds a %s")
+:format(owner and "a pocket" or ("a " .. role), want, seen.platform)}
+end
+
+local published, why = require("mfg.controller.repository").published(role)
+if not published then
+return rpc.REJECTED, {reason = ("the %s firmware is not published (%s) -- run: "
+.. "mfgctl publish %s"):format(role, tostring(why), role)}
+end
+
+return actions.invoke("mint_node", {drive = params.drive, role = role,
+name = params.name, owner = owner, again = params.again}, ctx)
+end,
+}

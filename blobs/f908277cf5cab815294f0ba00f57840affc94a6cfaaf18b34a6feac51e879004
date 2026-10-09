@@ -1,0 +1,34 @@
+local rpc = require("mfg.common.rpc")
+local mint = require("mfg.controller.mint")
+
+
+
+
+
+
+return {
+name        = "mint_drive",
+label       = "Eject a minting drive",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "eject", label = "Eject the drive", type = "text", required = true},
+},
+
+returns = {drives = "table", players = "table", roles = "table", names = "table",
+platforms = "table"},
+
+run = function(params)
+local found = false
+for _, drive in ipairs(mint.drives()) do
+if drive.name == params.eject then found = true end
+end
+if not found then
+return rpc.REJECTED, {reason = "no such drive: " .. tostring(params.eject)}
+end
+mint.eject(params.eject)
+return rpc.COMPLETED, mint.listing()
+end,
+}

@@ -1,0 +1,25 @@
+local rpc = require("mfg.common.rpc")
+local tester = require("mfg.controller.tester")
+
+
+
+
+return {
+name        = "test_take",
+label       = "Take back what a peripheral holds",
+tier        = "node",
+manual      = true,
+destructive = false,
+
+parameters = {
+{name = "device", label = "Peripheral", type = "text", required = true},
+},
+
+returns = {moved = "number", left = "number"},
+
+run = function(params)
+local result, why = tester.take(params.device)
+if not result then return rpc.REJECTED, {reason = why} end
+return rpc.COMPLETED, result
+end,
+}

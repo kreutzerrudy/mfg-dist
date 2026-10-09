@@ -1,0 +1,962 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local doc = require("mfg.hmi.doc")
+local input = require("mfg.hmi.input")
+local app = require("mfg.hmi.app")
+local pattern = require("mfg.common.pattern")
+local validate = require("mfg.common.actions.validate")
+
+local panel = {}
+
+
+
+panel.ACTION = "run_batch"
+
+
+
+panel.COMPLETED = "completed"
+panel.REJECTED = "rejected"
+panel.TIMED_OUT = "timed_out"
+
+
+
+panel.OFFER_RETRY = 5
+
+
+
+
+
+
+panel.READ = {timeout = 3, attempts = 2}
+panel.RUN = {timeout = 60, attempts = 1}
+
+
+
+function panel.new(opts)
+opts = opts or {}
+return {
+
+
+action = opts.action or panel.ACTION,
+verb = opts.verb or "Run",
+title = opts.title or "CRAFT",
+note = opts.note,
+
+host = opts.host or "mfg",
+
+
+
+
+source = opts.source or require("mfg.common.config").setting("source"),
+display = opts.display,
+transport = opts.transport,
+now = opts.now,
+
+offer = nil,
+offerWhy = nil,
+offerAskedAt = nil,
+nodes = {},
+target = nil,
+
+stock = nil,
+stockWhy = nil,
+
+names = opts.names or {},
+stockAsked = false,
+
+cells = {},
+amount = 1,
+output = nil,
+
+
+list = app.newList(),
+chosen = nil,
+carry = nil,
+hint = nil,
+
+confirming = nil,
+running = nil,
+result = nil,
+
+
+
+
+link = {state = "unknown"},
+
+queue = {},
+}
+end
+
+local function clock(view)
+if view.now then return view.now() end
+return os.epoch("utc")
+end
+
+
+
+function panel.parameter(view, name)
+if not view.offer then return nil end
+for _, param in ipairs(view.offer.parameters or {}) do
+if param.name == name then return param end
+end
+return nil
+end
+
+
+function panel.amountRange(view)
+local param = panel.parameter(view, "amount")
+if not param then return nil end
+return param.min or 1, param.max or param.min or 1
+end
+
+local function clampAmount(view, value)
+local min, max = panel.amountRange(view)
+if not min then return value end
+value = math.floor(tonumber(value) or min)
+if value < min then value = min end
+if value > max then value = max end
+return value
+end
+
+
+
+
+
+function panel.slotOf(cell)
+return pattern.GRID[cell]
+end
+
+function panel.pattern(view)
+local out, any = {}, false
+for cell = 1, 9 do
+local item = view.cells[cell]
+if item then
+out[panel.slotOf(cell)] = item
+any = true
+end
+end
+if not any then return nil end
+return out
+end
+
+local function sortedSlots(slots)
+local out = {}
+for slot in pairs(slots) do out[#out + 1] = slot end
+table.sort(out)
+return out
+end
+
+
+
+local function shortName(item)
+if type(item) ~= "string" then return "" end
+return item:match("[^:]+$") or item
+end
+
+
+function panel.nameOf(view, item)
+local known = view.names and view.names[item]
+return (known and known.name) or shortName(item)
+end
+
+
+
+
+
+function panel.params(view)
+if not view.offer then
+return nil, "the controller has not said what it offers"
+end
+if not view.target then return nil, "pick a node" end
+local slots = panel.pattern(view)
+if not slots then return nil, "the grid is empty" end
+
+
+
+
+local params = {target = view.target, pattern = slots}
+if panel.parameter(view, "pattern_id") then params.pattern_id = pattern.id(slots) end
+if panel.parameter(view, "amount") then params.amount = view.amount end
+if panel.parameter(view, "source") then params.source = view.source end
+if panel.parameter(view, "output") and view.output then params.output = view.output end
+local checked, why = validate.check(view.offer, params)
+if not checked then return nil, why end
+return checked
+end
+
+
+function panel.blocked(view)
+if view.running then return "a batch is running" end
+local _, why = panel.params(view)
+return why
+end
+
+
+
+
+
+function panel.ask(view, job)
+for _, queued in ipairs(view.queue) do
+if queued.kind == job.kind then return false end
+end
+view.queue[#view.queue + 1] = job
+return true
+end
+
+function panel.offerDue(view)
+if view.offer then return false end
+if not view.offerAskedAt then return true end
+return (clock(view) - view.offerAskedAt) >= panel.OFFER_RETRY * 1000
+end
+
+
+
+
+
+
+local function header(view)
+return app.header(view, view.title)
+end
+
+local function nodeRow(view)
+local children = {
+doc.text("Node", {colour = "label", truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "node-label"}),
+doc.gap(1),
+}
+
+if not view.offer then
+children[#children + 1] = doc.text(view.offerWhy
+and ("the controller refused: " .. tostring(view.offerWhy))
+or "asking the controller what it offers..",
+{colour = view.offerWhy and "bad" or "dim", truncate = doc.TRUNCATED,
+keep = doc.REQUIRED, name = "offer-state"})
+elseif #view.nodes == 0 then
+children[#children + 1] = doc.text("no nodes registered",
+{colour = "warn", keep = doc.REQUIRED, name = "no-nodes"})
+else
+for index, node in ipairs(view.nodes) do
+if index > 1 then children[#children + 1] = doc.gap(1) end
+local selected = view.target == node.value
+children[#children + 1] = doc.button(node.label or node.value, {
+colour = selected and "selected" or "action",
+action = {kind = "node", node = node.value},
+
+
+
+keep = selected and doc.REQUIRED or (9 - index),
+identity = 8,
+elsewhere = (not selected) and "next node cycles to it" or nil,
+name = "node:" .. node.value,
+})
+end
+children[#children + 1] = doc.spacer({min = 1})
+
+children[#children + 1] = doc.button("next node", {key = "]",
+action = {kind = "cycle-node"}, colour = "dim", keep = doc.REQUIRED,
+short = "next", name = "cycle-node"})
+end
+
+return doc.row(children, {keep = doc.REQUIRED, name = "nodes"})
+end
+
+
+
+
+local function cellButton(view, cell)
+local item = view.cells[cell]
+local usable = view.offer ~= nil and not view.running
+local over = view.carry and view.carry.over and view.carry.over.cell == cell
+return doc.button(item and panel.nameOf(view, item) or "", {
+width = "fill",
+colour = not usable and "dim" or (over and "selected")
+or (item and "action" or "dim"),
+action = usable and {kind = "cell", cell = cell, drop = {cell = cell},
+drag = item and {from = "cell", cell = cell, item = item} or nil,
+alt = item and {kind = "empty", cell = cell} or nil} or nil,
+key = usable and tostring(cell) or nil,
+name = "cell:" .. cell,
+
+style = "slot",
+})
+end
+
+
+
+
+local function gridRows(view)
+local rows = {}
+for r = 0, 2 do
+rows[#rows + 1] = doc.row({
+cellButton(view, r * 3 + 1), doc.gap(1),
+cellButton(view, r * 3 + 2), doc.gap(1),
+cellButton(view, r * 3 + 3),
+}, {keep = doc.REQUIRED, name = "grid-row-" .. (r + 1)})
+end
+return rows
+end
+
+local function sliderRow(view)
+local min, max = panel.amountRange(view)
+local usable = min ~= nil and not view.running
+return doc.row({
+doc.text("Sets", {colour = "label", truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "sets-label"}),
+doc.gap(1),
+doc.button("-", {key = usable and "-" or nil,
+colour = usable and "action" or "dim",
+action = usable and {kind = "delta", n = -1} or nil, name = "less",
+keep = doc.REQUIRED}),
+doc.gap(1),
+doc.slider({min = min or 1, max = max or 1, value = view.amount,
+action = usable and {kind = "amount"} or nil,
+colour = usable and "selected" or "dim", name = "amount-bar"}),
+doc.gap(1),
+doc.button("+", {key = usable and "+" or nil,
+colour = usable and "action" or "dim",
+action = usable and {kind = "delta", n = 1} or nil, name = "more",
+keep = doc.REQUIRED}),
+doc.gap(1),
+
+
+doc.text(tostring(view.amount), {width = #tostring(max or 1),
+align = "right", colour = usable and "text" or "dim",
+truncate = doc.TRUNCATED, keep = doc.REQUIRED, name = "amount"}),
+}, {keep = doc.REQUIRED, name = "sets"})
+end
+
+local function actionRow(view)
+local blocked = panel.blocked(view)
+local label = view.verb
+if view.offer and panel.amountRange(view) then
+label = ("%s %d sets"):format(view.verb, view.amount)
+elseif view.output then
+label = ("%s as %s"):format(view.verb, shortName(view.output))
+end
+return doc.row({
+
+
+doc.button(label, {key = (not blocked) and "enter" or nil,
+colour = blocked and "dim" or "good",
+action = (not blocked) and {kind = "run"} or nil,
+keep = doc.REQUIRED, name = "run"}),
+doc.spacer(),
+
+doc.button("Clear", {key = "delete", action = {kind = "clear"},
+keep = 5, name = "clear"}),
+}, {keep = doc.REQUIRED, name = "actions"})
+end
+
+
+
+
+local function listRows(view, height)
+local rows = {}
+if not view.stock then
+rows[#rows + 1] = doc.text(" " .. (view.stockWhy or ("reading " .. view.source
+.. "..")), {colour = view.stockWhy and "bad" or "dim", truncate = doc.TRUNCATED,
+keep = 10, name = "list-state"})
+return rows
+end
+
+local items = {}
+for item in pairs(view.stock) do items[#items + 1] = item end
+table.sort(items, function(a, b)
+local na, nb = panel.nameOf(view, a):lower(), panel.nameOf(view, b):lower()
+if na ~= nb then return na < nb end
+return a < b
+end)
+if #items == 0 then
+rows[#rows + 1] = doc.text(" " .. view.source .. " holds nothing",
+{colour = "warn", keep = 10, name = "list-empty"})
+return rows
+end
+
+local entries = {}
+for _, item in ipairs(items) do
+entries[#entries + 1] = {value = item, label = panel.nameOf(view, item),
+note = tostring(view.stock[item]), selected = view.chosen == item,
+chip = app.chipFor(item)}
+end
+for _, row in ipairs(app.listRows(view.list, entries, "pick",
+function(entry) return {kind = "choose", item = entry.value,
+drag = {from = "list", item = entry.value}} end,
+{limit = height, pickKeys = false, arrows = true})) do
+rows[#rows + 1] = row
+end
+return rows
+end
+
+
+local function confirmRows(view)
+local params = view.confirming
+local parts = {}
+for _, slot in ipairs(sortedSlots(params.pattern)) do
+parts[#parts + 1] = ("%d=%s"):format(slot, shortName(params.pattern[slot]))
+end
+
+local question = params.amount
+and ("%s %d sets on %s?"):format(view.verb, params.amount, params.target)
+or ("%s on %s?"):format(view.verb, params.target)
+local rows = {
+doc.text(question,
+{colour = "title", wrap = true, keep = doc.REQUIRED, name = "confirm"}),
+doc.text(table.concat(parts, " "), {colour = "text", wrap = true, keep = 6,
+name = "confirm-pattern"}),
+}
+if view.note then
+rows[#rows + 1] = doc.text(view.note, {colour = "text", wrap = true, keep = 5,
+name = "note"})
+end
+if view.offer and view.offer.destructive then
+rows[#rows + 1] = doc.text("This crafts. Material consumed cannot be "
+.. "uncrafted.", {colour = "warn", wrap = true, keep = 7,
+name = "consequence"})
+end
+rows[#rows + 1] = doc.row({
+doc.button("yes", {key = "y", colour = "good", action = {kind = "yes"},
+keep = doc.REQUIRED, name = "yes"}),
+doc.gap(1),
+doc.button("no", {key = "n", colour = "bad", action = {kind = "no"},
+keep = doc.REQUIRED, name = "no"}),
+}, {keep = doc.REQUIRED, name = "confirm-actions"})
+return rows
+end
+
+
+
+local function statusRow(view)
+local function say(text, colour)
+return doc.text(text, {colour = colour, wrap = true, keep = app.KEEP_STATUS,
+name = "status"})
+end
+local carry = view.carry
+if carry and carry.drag then
+local name = panel.nameOf(view, carry.drag.item)
+if carry.drag.from == "cell" then
+return say(("moving %s: let go on a slot, or off the grid to empty it")
+:format(name), "warn")
+end
+return say(("carrying %s: let go on a slot, or sweep across several")
+:format(name), "warn")
+end
+if view.hint then return say(view.hint, "dim") end
+if view.running then
+local seconds = math.floor((clock(view) - view.running.since) / 1000)
+local params = view.running.params
+local doing = params.amount and ("running %d sets"):format(params.amount)
+or (view.verb:lower() .. "ing")
+return doc.text(("%s on %s.. %ds"):format(doing, params.target, seconds),
+{colour = "warn", wrap = true, keep = app.KEEP_STATUS, name = "status"})
+end
+
+local result = view.result
+if not result then
+if view.chosen and not view.confirming then
+return say(("%s chosen: click a slot, or press its digit"):format(
+panel.nameOf(view, view.chosen)), "dim")
+end
+return doc.text("", {colour = "dim", keep = 1, name = "status"})
+end
+
+if result.status == panel.COMPLETED and result.fields.recipe then
+local recipe = result.fields.recipe
+return doc.text(("registered %s: %d %s a set"):format(recipe.label,
+recipe.output.count, shortName(recipe.output.item)),
+{colour = "good", wrap = true, keep = app.KEEP_STATUS, name = "status"})
+elseif result.status == panel.COMPLETED then
+local made = {}
+for item, count in pairs(result.fields.produced or {}) do
+made[#made + 1] = ("%d %s"):format(count, shortName(item))
+end
+table.sort(made)
+return doc.text(("done: %s from %d sets on %s"):format(
+#made > 0 and table.concat(made, ", ") or "nothing",
+result.params.amount, result.params.target),
+{colour = "good", wrap = true, keep = app.KEEP_STATUS, name = "status"})
+elseif result.status == panel.TIMED_OUT then
+return doc.text(("no answer from %s -- the batch may or may not have "
+.. "run: %s"):format(view.host, tostring(result.reason)),
+{colour = "warn", wrap = true, keep = app.KEEP_STATUS, name = "status"})
+end
+
+local refused = doc.text("refused: " .. tostring(result.reason),
+{colour = "bad", wrap = true, keep = app.KEEP_STATUS, name = "status"})
+if not (result.fields and result.fields.ambiguous) then return refused end
+
+
+
+local kinds = {}
+for item in pairs(result.fields.produced or {}) do kinds[#kinds + 1] = item end
+table.sort(kinds)
+local choices = {doc.text("output:", {colour = "label", keep = doc.REQUIRED,
+name = "output-label"})}
+for index, item in ipairs(kinds) do
+choices[#choices + 1] = doc.gap(1)
+choices[#choices + 1] = doc.button(shortName(item), {
+colour = (view.output == item) and "selected" or "action",
+action = {kind = "output", item = item}, keep = 10 - index,
+name = "output:" .. index})
+end
+return doc.stack({refused, doc.row(choices, {keep = app.KEEP_STATUS - 1, name = "outputs"})},
+{keep = app.KEEP_STATUS, name = "status-stack"})
+end
+
+
+function panel.document(view, width, height)
+local rows = {header(view)}
+
+
+if view.above then rows[#rows + 1] = view.above(width) end
+rows[#rows + 1] = nodeRow(view)
+rows[#rows + 1] = doc.rule({keep = 2})
+
+local body
+if view.confirming then
+body = confirmRows(view)
+body[#body + 1] = doc.spacer()
+else
+body = gridRows(view)
+
+
+body[#body + 1] = doc.text("", {keep = 1, name = "breath"})
+
+
+if not view.offer or panel.amountRange(view) then
+body[#body + 1] = sliderRow(view)
+end
+body[#body + 1] = actionRow(view)
+body[#body + 1] = app.whyRow(panel.blocked(view))
+body[#body + 1] = doc.rule({keep = 2, name = "list-rule"})
+
+for _, row in ipairs(listRows(view, height)) do body[#body + 1] = row end
+body[#body + 1] = doc.spacer()
+end
+for _, row in ipairs(body) do rows[#rows + 1] = row end
+
+rows[#rows + 1] = statusRow(view)
+return doc.stack(rows, {name = "panel"})
+end
+
+
+
+
+
+
+
+function panel.settle(view, report)
+if view.confirming then return false end
+return app.settle(view.list, report, "pick")
+end
+
+
+
+
+
+
+
+function panel.render(view)
+local display = view.display
+local width, height = display.size()
+local opts = {keys = not display.touchable(), colour = display.colour()}
+
+local document = panel.document(view, width, height)
+local grid, report = doc.render(document, width, height, opts)
+
+if grid and panel.settle(view, report) then
+
+grid, report = doc.render(panel.document(view, width, height),
+width, height, opts)
+end
+
+if not grid then
+
+
+
+local diagnostic = doc.text("screen too small: " .. doc.explain(report),
+{colour = "bad", wrap = true, keep = doc.REQUIRED, name = "diagnostic"})
+grid = doc.render(diagnostic, width, height, opts)
+view.lastReport = report
+if grid then display.paint(grid) end
+return grid
+end
+
+view.lastReport = report
+display.paint(grid)
+return grid
+end
+
+
+
+
+
+function panel.searching(view)
+return (not view.confirming) and view.list or nil
+end
+
+
+
+function panel.refresh(view)
+panel.ask(view, {kind = "stock"})
+end
+
+
+local function place(view, cell, item)
+view.cells[cell] = item
+view.output = nil
+end
+
+
+function panel.act(view, action)
+local kind = action and action.kind
+if kind ~= "carry" then view.hint = nil end
+if app.page(view.list, kind, action) then return true end
+
+if kind == "node" then
+view.target = action.node
+return true
+
+elseif kind == "cycle-node" then
+if #view.nodes == 0 then return false end
+local at = 0
+for index, node in ipairs(view.nodes) do
+if node.value == view.target then at = index end
+end
+view.target = view.nodes[(at % #view.nodes) + 1].value
+return true
+
+elseif kind == "choose" then
+view.chosen = action.item
+return true
+
+elseif kind == "cell" then
+
+
+local item = view.cells[action.cell]
+if view.chosen then
+place(view, action.cell, item ~= view.chosen and view.chosen or nil)
+elseif item then
+view.chosen = item
+else
+view.hint = "choose an item in the list below, or drag one here"
+end
+return true
+
+elseif kind == "empty" then
+place(view, action.cell, nil)
+app.sound(view, "click")
+return true
+
+elseif kind == "carry" then
+
+
+view.carry = {drag = action.drag, over = action.over}
+local drag, over = action.drag or {}, action.over
+if drag.from == "list" and over and over.cell
+and view.cells[over.cell] ~= drag.item then
+place(view, over.cell, drag.item)
+app.sound(view, "click")
+end
+return true
+
+elseif kind == "drop" then
+view.carry = nil
+local drag, over = action.drag or {}, action.over
+if drag.from == "cell" then
+if over and over.cell then
+
+if over.cell ~= drag.cell then
+local there = view.cells[over.cell]
+place(view, over.cell, view.cells[drag.cell])
+place(view, drag.cell, there)
+end
+else
+place(view, drag.cell, nil)
+end
+app.sound(view, "click")
+elseif drag.from == "list" and over and over.cell then
+place(view, over.cell, drag.item)
+end
+return true
+
+elseif kind == "amount" then
+view.amount = clampAmount(view, action.value)
+return true
+
+elseif kind == "delta" then
+view.amount = clampAmount(view, view.amount + (action.n or 0))
+return true
+
+elseif kind == "clear" then
+view.cells = {}
+view.result = nil
+view.output = nil
+return true
+
+elseif kind == "output" then
+view.output = action.item
+return true
+
+elseif kind == "run" then
+local params, why = panel.params(view)
+if not params then
+view.result = {status = panel.REJECTED, reason = why, at = clock(view)}
+return true
+end
+if view.offer.destructive then
+view.confirming = params
+else
+panel.ask(view, {kind = "run", params = params})
+end
+return true
+
+elseif kind == "yes" then
+local params = view.confirming
+view.confirming = nil
+if params then panel.ask(view, {kind = "run", params = params}) end
+return true
+
+elseif kind == "no" then
+view.confirming = nil
+return true
+end
+
+return false
+end
+
+
+
+
+
+
+
+
+function panel.handle(view, event, grid)
+if not event then return false end
+
+if event.kind == "act" then return panel.act(view, event.action) end
+if event.kind == "carry" or event.kind == "drop" then
+return panel.act(view, {kind = event.kind, drag = event.drag, over = event.over})
+end
+local list = panel.searching(view)
+if list then
+local took, chose = app.type(list, event)
+if took then
+if chose then panel.act(view, chose) end
+return true
+end
+end
+if not input.heard(event) then return false end
+local action = input.actionFor(grid, event)
+if not action then return false end
+return panel.act(view, action)
+end
+
+
+
+
+
+
+
+
+
+function panel.exchange(view, job)
+local body, opts
+
+if job.kind == "offer" then
+view.offerAskedAt = clock(view)
+body = {command = "offer", name = view.action}
+opts = panel.READ
+elseif job.kind == "stock" then
+body = {command = "stock", path = view.source}
+opts = panel.READ
+elseif job.kind == "run" then
+body = {command = view.action, operator = true}
+for key, value in pairs(job.params) do body[key] = value end
+opts = panel.RUN
+view.running = {params = job.params, since = clock(view)}
+view.result = nil
+else
+return false
+end
+
+local answer = view.transport.request(body, opts) or {}
+panel.apply(view, job, answer)
+return true
+end
+
+
+function panel.apply(view, job, answer)
+local now = clock(view)
+
+if answer.src then
+view.link = {state = "ok", at = now}
+elseif answer.status == panel.TIMED_OUT or answer.status == panel.REJECTED then
+view.link = {state = "down", reason = answer.reason, at = now}
+end
+
+if job.kind == "offer" then
+local decl = answer.status == panel.COMPLETED
+and type(answer.actions) == "table" and answer.actions[1]
+if not decl then
+view.offerWhy = answer.reason or answer.status or "no answer"
+return
+end
+view.offer = decl
+view.offerWhy = nil
+
+local target = panel.parameter(view, "target")
+view.nodes = {}
+if target and type(target.choices) == "table" and not target.choices.source then
+for _, entry in ipairs(target.choices) do
+if type(entry) == "table" then
+view.nodes[#view.nodes + 1] = {value = entry.value,
+label = entry.label or entry.value}
+else
+view.nodes[#view.nodes + 1] = {value = entry, label = entry}
+end
+end
+end
+
+local stillThere = false
+for _, node in ipairs(view.nodes) do
+if node.value == view.target then stillThere = true end
+end
+if not stillThere then view.target = nil end
+if not view.target and #view.nodes == 1 then
+view.target = view.nodes[1].value
+end
+view.amount = clampAmount(view, view.amount)
+
+elseif job.kind == "stock" then
+if answer.status == panel.COMPLETED and type(answer.stock) == "table" then
+view.stock = answer.stock
+view.stockWhy = nil
+else
+view.stockWhy = ("%s: %s"):format(view.source,
+tostring(answer.reason or answer.status or "no answer"))
+end
+
+elseif job.kind == "run" then
+view.running = nil
+panel.ask(view, {kind = "stock"})
+view.result = {
+status = answer.status or panel.REJECTED,
+reason = answer.reason,
+fields = answer,
+params = job.params,
+at = now,
+}
+app.sound(view, answer.status == panel.COMPLETED and "done" or "refused")
+end
+end
+
+
+
+function panel.nextJob(view)
+local job = table.remove(view.queue, 1)
+if not job and panel.offerDue(view) then job = {kind = "offer"} end
+
+if not job and view.offer and not view.stockAsked then
+view.stockAsked = true
+job = {kind = "stock"}
+end
+return job
+end
+
+
+function panel.serve(view, opts)
+opts = opts or {}
+while true do
+local job = panel.nextJob(view)
+if job then
+panel.exchange(view, job)
+else
+sleep(opts.idle or 0.2)
+end
+end
+end
+
+
+
+
+
+
+
+
+
+
+function panel.transport(host)
+local actions = require("mfg.common.actions")
+return {
+request = function(body, opts)
+local status, fields = actions.invoke("transmit", {
+target = host,
+protocol = "mfg-scada",
+content = textutils.serialize(body),
+timeout = opts and opts.timeout,
+attempts = opts and opts.attempts,
+}, {by = "hmi"})
+
+local reply = fields and fields.reply
+if type(reply) ~= "table" then
+
+
+
+reply = {status = status, reason = fields and fields.reason}
+end
+return reply
+end,
+}
+end
+
+
+
+
+function panel.run(view, opts)
+opts = opts or {}
+parallel.waitForAny(
+function() panel.serve(view, opts) end,
+function()
+input.drive(view.display,
+function() return panel.render(view) end,
+function(event, grid) return panel.handle(view, event, grid) end,
+{wait = opts.wait or 1})
+end)
+end
+
+return panel

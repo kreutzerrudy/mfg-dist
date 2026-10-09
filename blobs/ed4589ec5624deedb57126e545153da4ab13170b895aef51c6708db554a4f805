@@ -1,0 +1,130 @@
+
+
+
+
+
+
+
+
+
+
+
+
+local runs = {}
+
+runs.KEEP = 32
+
+local queue = {}
+local ran = {}
+local supplied = {}
+local done = {}
+local order = {}
+local nextId = 0
+
+
+
+
+function runs.request(machine, req)
+if queue[machine] then return nil, "it is already asked for a run" end
+nextId = nextId + 1
+req.id, req.machine, req.state = nextId, machine, "queued"
+queue[machine] = req
+return req.id
+end
+
+
+function runs.take(machine)
+local req = queue[machine]
+if not req or req.state ~= "queued" then return nil end
+req.state = "running"
+return req
+end
+
+
+function runs.busy(machine)
+return queue[machine] ~= nil
+end
+
+
+function runs.finish(machine, result)
+local req = queue[machine]
+if not req then return nil end
+queue[machine] = nil
+for k, v in pairs(result or {}) do req[k] = v end
+req.state = "done"
+
+
+
+
+local counts = req.status ~= "cancelled" and req.status ~= "failed"
+if req.job and counts then ran[req.job] = (ran[req.job] or 0) + 1 end
+if req.job and req.status ~= "failed" then
+supplied[req.job] = (supplied[req.job] or 0) + (req.supplied or 0)
+end
+done[req.id] = req
+order[#order + 1] = req.id
+while #order > runs.KEEP do done[table.remove(order, 1)] = nil end
+return req
+end
+
+
+function runs.cancel(machine, reason)
+if queue[machine] then
+return runs.finish(machine, {status = "cancelled", reason = reason})
+end
+end
+
+
+function runs.get(id)
+for _, req in pairs(queue) do
+if req.id == id then return req end
+end
+return done[id]
+end
+
+
+function runs.forJob(jobId)
+local n = 0
+for _, req in pairs(queue) do
+if req.job == jobId then n = n + (req.recipe and req.recipe.cycles or 1) end
+end
+return n
+end
+
+
+
+
+function runs.committed(jobId)
+local n = supplied[jobId] or 0
+for _, req in pairs(queue) do
+if req.job == jobId then n = n + (req.recipe and req.recipe.cycles or 1) end
+end
+return n
+end
+
+
+function runs.ranFor(jobId)
+return ran[jobId] or 0
+end
+
+
+function runs.dropJob(jobId)
+for machine, req in pairs(queue) do
+if req.job == jobId and req.state == "queued" then
+runs.finish(machine, {status = "cancelled", reason = "its job was cancelled"})
+end
+end
+ran[jobId] = nil
+supplied[jobId] = nil
+end
+
+
+function runs.open()
+return queue
+end
+
+function runs._reset()
+queue, done, order, nextId, ran, supplied = {}, {}, {}, 0, {}, {}
+end
+
+return runs
